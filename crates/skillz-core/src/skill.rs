@@ -22,6 +22,12 @@ pub struct InstallationLock {
     /// Non-main Library branch when using a Branch Lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Overlay Fork provenance: original Library name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_from_library: Option<String>,
+    /// Overlay Fork provenance: original Catalog Entry / source identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_from_entry: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

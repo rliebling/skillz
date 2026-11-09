@@ -461,6 +461,8 @@ impl App {
                     source: None,
                     rev: None,
                     branch: None,
+                    overlay_from_library: None,
+                    overlay_from_entry: None,
                 };
                 lock.installations
                     .insert(name.to_string(), install.clone());
@@ -510,6 +512,8 @@ impl App {
             source: None,
             rev: None,
             branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
@@ -626,6 +630,8 @@ impl App {
             source: None,
             rev: None,
             branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
@@ -634,6 +640,9 @@ impl App {
     }
 
     /// Edit path: push Installation into Library on a branch and Lock to that rev.
+    ///
+    /// If the desired Library is read-only, performs an Overlay Fork into the first
+    /// writable Binding instead (unless `force_overlay_into` selects one).
     pub fn libcommit_branch(
         &self,
         name: &str,
@@ -644,7 +653,7 @@ impl App {
         let config = self.require_managed()?;
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         let existing = lock.installations.get(name).cloned();
-        let library_name = library_name
+        let desired = library_name
             .map(|s| s.to_string())
             .or_else(|| existing.as_ref().map(|e| e.library.clone()))
             .ok_or_else(|| {
@@ -652,7 +661,7 @@ impl App {
                     "skill `{name}` has no Lock; pass --library or libcommit --as first"
                 ))
             })?;
-        let (_config, lib_path) = self.writable_library_path(&library_name)?;
+
         let project_skill = skill::skill_dir(&self.skills_root(&config), name);
         if !project_skill.is_dir() {
             return Err(SkillzError::Message(format!(
@@ -660,6 +669,20 @@ impl App {
                 config.skills_dir
             )));
         }
+
+        let (target_library, overlay_from) = match self.writable_library_path(&desired) {
+            Ok(_) => (desired.clone(), None),
+            Err(_) => {
+                let writable = self.first_writable_binding(&config)?.to_string();
+                let provenance = existing
+                    .as_ref()
+                    .and_then(|e| e.source.clone())
+                    .unwrap_or_else(|| format!("{desired}/{name}"));
+                (writable, Some((desired.clone(), provenance)))
+            }
+        };
+
+        let (_config, lib_path) = self.writable_library_path(&target_library)?;
         let hash = skill::content_hash(&project_skill)?;
         let owned = lib_path.join(crate::library::SKILLS_DIR).join(name);
         skill::copy_skill_tree(&project_skill, &owned)?;
@@ -668,20 +691,41 @@ impl App {
         let msg = message.unwrap_or("skillz libcommit Branch Lock");
         let commit = vcs_ops::commit_on_branch(&lib_path, &branch, msg, &[&owned])?;
 
+        let (overlay_from_library, overlay_from_entry) = match overlay_from {
+            Some((lib, entry)) => (Some(lib), Some(entry)),
+            None => (None, None),
+        };
+
         let install = InstallationLock {
-            library: library_name,
-            entry_kind: existing
-                .as_ref()
-                .map(|e| e.entry_kind)
-                .unwrap_or(EntryKind::Owned),
+            library: target_library,
+            entry_kind: EntryKind::Owned,
             content_hash: hash,
             source: existing.and_then(|e| e.source),
             rev: Some(commit.rev),
             branch: Some(commit.branch),
+            overlay_from_library,
+            overlay_from_entry,
         };
         lock.installations.insert(name.to_string(), install.clone());
         lock.save(&self.paths.cwd)?;
         Ok(install)
+    }
+
+    fn first_writable_binding<'a>(&self, config: &'a ProjectConfig) -> Result<&'a str> {
+        let registry = self.load_registry()?;
+        for binding in &config.bindings {
+            if binding.read_only {
+                continue;
+            }
+            if let Some(rec) = registry.libraries.get(&binding.name) {
+                if !rec.read_only {
+                    return Ok(binding.name.as_str());
+                }
+            }
+        }
+        Err(SkillzError::Message(
+            "no writable Library Binding available for Overlay Fork".into(),
+        ))
     }
 
     /// Merge a Branch Lock into the Library main line.
@@ -739,6 +783,8 @@ impl App {
             source: install.source,
             rev: Some(main_rev),
             branch: None,
+            overlay_from_library: install.overlay_from_library,
+            overlay_from_entry: install.overlay_from_entry,
         };
         lock.installations.insert(name.to_string(), updated.clone());
         lock.save(&self.paths.cwd)?;
@@ -810,6 +856,8 @@ impl App {
             source: Some(source),
             rev: None,
             branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
@@ -1156,6 +1204,59 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn overlay_fork_when_library_read_only() {
+        let fx = Fixture::new();
+        let company = fx.libs_dir.join("company");
+        let personal = fx.libs_dir.join("personal");
+        fx.app().library_init(&company, "company").unwrap();
+        fx.app().library_init(&personal, "personal").unwrap();
+        vcs_ops::init_git_repo(&personal).unwrap();
+        std::process::Command::new("git")
+            .args(["-C", personal.to_str().unwrap(), "add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", personal.to_str().unwrap(), "commit", "-m", "init lib"])
+            .status()
+            .unwrap();
+
+        // Mark company read-only in registry.
+        let mut reg = fx.app().load_registry().unwrap();
+        reg.libraries.get_mut("company").unwrap().read_only = true;
+        fx.app().save_registry(&reg).unwrap();
+
+        // Put an Owned Entry in company and bind both libraries.
+        fs::create_dir_all(company.join("skills/grilling")).unwrap();
+        fs::write(
+            company.join("skills/grilling/SKILL.md"),
+            "---\nname: grilling\n---\n# g\n",
+        )
+        .unwrap();
+        fx.app()
+            .project_init(&["company:ro".into(), "personal".into()], None)
+            .unwrap();
+        fx.app()
+            .add_skill("grilling", Some("company"))
+            .unwrap();
+
+        let skill_md = fx
+            .project_dir
+            .join(".agents/skills/grilling/SKILL.md");
+        let mut body = fs::read_to_string(&skill_md).unwrap();
+        body.push_str("forked edit\n");
+        fs::write(&skill_md, body).unwrap();
+
+        let lock = fx
+            .app()
+            .libcommit_branch("grilling", Some("company"), Some("overlay"))
+            .unwrap();
+        assert_eq!(lock.library, "personal");
+        assert_eq!(lock.overlay_from_library.as_deref(), Some("company"));
+        assert!(lock.overlay_from_entry.is_some());
+        assert!(personal.join("skills/grilling/SKILL.md").is_file());
     }
 
     #[test]
