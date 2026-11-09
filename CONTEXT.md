@@ -20,6 +20,10 @@ _Avoid_: prompt, rule (unless a specific product uses that name)
 A label on a Catalog Entry used for discovery and filtering within a Library (e.g. listing by topic or toolchain).
 _Avoid_: label (when meaning skill discovery), category
 
+**Availability**:
+Where a skill's files are already present for the current scope—Project `skills_dir`, user-global `~/.agents/skills`, and/or other agent skill roots agents may load (e.g. `.cursor/skills`, `.claude/skills`)—surfaced by discovery and add so the user knows what the agent can already see.
+_Avoid_: installed (alone), on disk
+
 **Authored Skill**:
 A skill whose content originated with the library owner.
 _Avoid_: custom skill, my skill
