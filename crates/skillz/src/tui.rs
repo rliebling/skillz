@@ -88,7 +88,11 @@ struct DriftRow {
 }
 
 enum Modal {
-    ConfirmRemove { index: usize },
+    ConfirmRemove {
+        index: usize,
+        /// Soft warn: retained skills that appear to depend on this one.
+        dependants: Vec<String>,
+    },
 }
 
 /// Scrollable Drift board: set an action per skill, then apply.
@@ -204,13 +208,26 @@ pub fn run_drift_board(app: &App) -> Result<()> {
 
                 if show_help {
                     draw_help_modal(frame, area, "drift keys", DRIFT_HELP);
-                } else if let Some(Modal::ConfirmRemove { index }) = &modal {
+                } else if let Some(Modal::ConfirmRemove {
+                    index,
+                    dependants,
+                }) = &modal
+                {
                     let name = &rows[*index].item.name;
+                    let body = if dependants.is_empty() {
+                        "Deletes the Installation and Lock. The Library Catalog Entry is kept."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Deletes the Installation and Lock. The Library Catalog Entry is kept.\nWarning: referenced by retained skill(s): {}.",
+                            dependants.join(", ")
+                        )
+                    };
                     draw_confirm_modal(
                         frame,
                         area,
                         &format!("Remove `{name}` from this Project?"),
-                        "Deletes the Installation and Lock. The Library Catalog Entry is kept.",
+                        &body,
                     );
                 }
             })
@@ -229,7 +246,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                 continue;
             }
 
-            if let Some(Modal::ConfirmRemove { index }) = modal {
+            if let Some(Modal::ConfirmRemove { index, .. }) = modal {
                 match key.code {
                     KeyCode::Char('?') => {
                         show_help = true;
@@ -269,7 +286,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     if let Some(i) = state.selected() {
                         let next = rows[i].action.next();
                         if next == DriftAction::Remove {
-                            modal = Some(Modal::ConfirmRemove { index: i });
+                            modal = Some(confirm_remove_modal(app, &rows, i)?);
                         } else {
                             rows[i].action = next;
                             rows[i].outcome = None;
@@ -280,7 +297,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     if let Some(i) = state.selected() {
                         let prev = rows[i].action.prev();
                         if prev == DriftAction::Remove {
-                            modal = Some(Modal::ConfirmRemove { index: i });
+                            modal = Some(confirm_remove_modal(app, &rows, i)?);
                         } else {
                             rows[i].action = prev;
                             rows[i].outcome = None;
@@ -307,7 +324,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                 }
                 KeyCode::Char('r') => {
                     if let Some(i) = state.selected() {
-                        modal = Some(Modal::ConfirmRemove { index: i });
+                        modal = Some(confirm_remove_modal(app, &rows, i)?);
                     }
                 }
                 KeyCode::Enter => {
@@ -378,14 +395,27 @@ fn draw_help_modal(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, line
     );
 }
 
+fn confirm_remove_modal(app: &App, rows: &[DriftRow], index: usize) -> Result<Modal> {
+    let name = &rows[index].item.name;
+    let also_removing: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| *i == index || r.action == DriftAction::Remove)
+        .map(|(_, r)| r.item.name.clone())
+        .collect();
+    let dependants = app.reverse_deps_for_remove(name, &also_removing)?;
+    Ok(Modal::ConfirmRemove { index, dependants })
+}
+
 fn draw_confirm_modal(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     title: &str,
     body: &str,
 ) {
-    let width = area.width.min(64).max(40);
-    let height = 7;
+    let width = area.width.min(72).max(40);
+    let extra_lines = body.lines().count().saturating_sub(1) as u16;
+    let height = (7 + extra_lines).min(area.height.saturating_sub(2)).max(7);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let modal = Rect {
@@ -401,21 +431,28 @@ fn draw_confirm_modal(
         .border_style(Style::default().fg(Color::Red));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
-    let text = Paragraph::new(vec![
+    let mut lines = vec![
         Line::from(Span::styled(title, Style::default().add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(body),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" yes   "),
-            Span::styled("[n]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(" cancel   "),
-            Span::styled("[?]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(" help"),
-        ]),
-    ])
-    .wrap(Wrap { trim: true });
+    ];
+    for part in body.split('\n') {
+        let style = if part.starts_with("Warning:") {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(part.to_string(), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(" yes   "),
+        Span::styled("[n]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw(" cancel   "),
+        Span::styled("[?]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" help"),
+    ]));
+    let text = Paragraph::new(lines).wrap(Wrap { trim: true });
     frame.render_widget(text, inner);
 }
 

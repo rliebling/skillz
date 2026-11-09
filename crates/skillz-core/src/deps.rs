@@ -88,6 +88,32 @@ fn push_unique(out: &mut Vec<String>, items: Vec<String>) {
     }
 }
 
+/// Find retained skills that appear to depend on `target_name` (reverse of
+/// [`detect_sibling_deps`]).
+pub fn find_dependants(
+    skills_root: &Path,
+    target_name: &str,
+    retained_names: &[String],
+) -> Result<Vec<String>> {
+    let mut dependants = Vec::new();
+    let known = vec![target_name.to_string()];
+    for name in retained_names {
+        if name == target_name {
+            continue;
+        }
+        let path = skills_root.join(name);
+        if !path.join("SKILL.md").is_file() {
+            continue;
+        }
+        let deps = detect_sibling_deps(&path, &known)?;
+        if deps.iter().any(|d| d == target_name) {
+            push_unique(&mut dependants, vec![name.clone()]);
+        }
+    }
+    dependants.sort();
+    Ok(dependants)
+}
+
 pub fn list_skill_names(skills_root: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     if !skills_root.is_dir() {
@@ -147,5 +173,32 @@ See `/grilling` and `../domain-modeling/` for prerequisites.
         assert!(deps.contains(&"grilling".to_string()));
         assert!(deps.contains(&"domain-modeling".to_string()));
         assert!(!deps.contains(&"unrelated".to_string()));
+    }
+
+    #[test]
+    fn find_dependants_respects_retained_set() {
+        let root = tempfile::tempdir().unwrap();
+        let grilling = root.path().join("grilling");
+        let docs = root.path().join("grill-with-docs");
+        let other = root.path().join("other");
+        fs::create_dir_all(&grilling).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(grilling.join("SKILL.md"), "---\nname: grilling\n---\n").unwrap();
+        fs::write(
+            docs.join("SKILL.md"),
+            "---\nname: grill-with-docs\ndepends: [grilling]\n---\n",
+        )
+        .unwrap();
+        fs::write(other.join("SKILL.md"), "---\nname: other\n---\n").unwrap();
+
+        let retained = vec!["grill-with-docs".into(), "other".into()];
+        let deps = find_dependants(root.path(), "grilling", &retained).unwrap();
+        assert_eq!(deps, vec!["grill-with-docs".to_string()]);
+
+        // Both queued for remove → no warn about the pair.
+        let retained_neither = vec!["other".into()];
+        let deps = find_dependants(root.path(), "grilling", &retained_neither).unwrap();
+        assert!(deps.is_empty());
     }
 }

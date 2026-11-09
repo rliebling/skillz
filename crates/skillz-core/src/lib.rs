@@ -513,8 +513,28 @@ impl App {
     }
 
     /// Remove a skill Installation + Lock from the current scope (Library untouched).
+    ///
+    /// Soft-warns on stderr when retained Installations appear to depend on `name`.
+    /// Pass other names also being removed in this batch as `also_removing` so
+    /// mutual pairs do not warn.
     pub fn remove_skill(&self, name: &str) -> Result<()> {
+        self.remove_skill_with_context(name, &[])
+    }
+
+    pub fn remove_skill_with_context(&self, name: &str, also_removing: &[String]) -> Result<()> {
         skill::validate_skill_name(name)?;
+        let dependants = self.reverse_deps_for_remove(name, also_removing)?;
+        if !dependants.is_empty() {
+            eprintln!(
+                "warning: `{}` is referenced by retained skill(s): {}",
+                name,
+                dependants.join(", ")
+            );
+        }
+        self.remove_skill_files(name)
+    }
+
+    fn remove_skill_files(&self, name: &str) -> Result<()> {
         let config = self.load_scope_config()?;
         let root = self.scope_skills_root(&config);
         let path = skill::skill_dir(&root, name);
@@ -532,7 +552,29 @@ impl App {
         Ok(())
     }
 
+    /// Retained Installations that appear to depend on `name` (best-effort).
+    ///
+    /// Names in `also_removing` (and `name` itself) are excluded from the
+    /// retained set so bulk removes of a dependant+dependency pair stay quiet.
+    pub fn reverse_deps_for_remove(
+        &self,
+        name: &str,
+        also_removing: &[String],
+    ) -> Result<Vec<String>> {
+        let config = self.load_scope_config()?;
+        let root = self.scope_skills_root(&config);
+        let all = deps::list_skill_names(&root)?;
+        let retained: Vec<String> = all
+            .into_iter()
+            .filter(|n| n != name && !also_removing.iter().any(|r| r == n))
+            .collect();
+        deps::find_dependants(&root, name, &retained)
+    }
+
     /// Apply one Drift review action to a skill in the current scope.
+    ///
+    /// Remove does not re-print reverse-dep warnings (shown at confirm /
+    /// [`Self::remove_skill`]); it only deletes Installation + Lock.
     pub fn apply_drift_action(&self, name: &str, action: DriftAction) -> Result<&'static str> {
         match action {
             DriftAction::Skip => Ok("skipped"),
@@ -545,7 +587,7 @@ impl App {
                 Ok("promoted")
             }
             DriftAction::Remove => {
-                self.remove_skill(name)?;
+                self.remove_skill_files(name)?;
                 Ok("removed")
             }
         }
@@ -1810,6 +1852,42 @@ mod tests {
             .libs_dir
             .join("personal/skills/demo/SKILL.md")
             .is_file());
+    }
+
+    #[test]
+    fn reverse_deps_for_remove_skips_also_removing() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        let skills = fx.project_dir.join(".agents/skills");
+        fs::create_dir_all(skills.join("grilling")).unwrap();
+        fs::write(
+            skills.join("grilling/SKILL.md"),
+            "---\nname: grilling\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(skills.join("grill-with-docs")).unwrap();
+        fs::write(
+            skills.join("grill-with-docs/SKILL.md"),
+            "---\nname: grill-with-docs\ndepends: [grilling]\n---\n",
+        )
+        .unwrap();
+
+        let deps = fx
+            .app()
+            .reverse_deps_for_remove("grilling", &[])
+            .unwrap();
+        assert_eq!(deps, vec!["grill-with-docs".to_string()]);
+
+        let deps = fx
+            .app()
+            .reverse_deps_for_remove("grilling", &["grill-with-docs".into()])
+            .unwrap();
+        assert!(deps.is_empty());
     }
 
     #[test]
