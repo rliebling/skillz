@@ -51,6 +51,54 @@ pub struct DriftItem {
     pub reason: DriftReason,
 }
 
+impl DriftReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DriftReason::Unlocked => "unlocked",
+            DriftReason::MissingFiles => "missing files",
+            DriftReason::HashMismatch { .. } => "hash mismatch",
+        }
+    }
+}
+
+/// Planned / applied action for an interactive Drift review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftAction {
+    Skip,
+    Libcommit,
+    Promote,
+    Remove,
+}
+
+impl DriftAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            DriftAction::Skip => "skip",
+            DriftAction::Libcommit => "libcommit",
+            DriftAction::Promote => "promote",
+            DriftAction::Remove => "remove",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            DriftAction::Skip => DriftAction::Libcommit,
+            DriftAction::Libcommit => DriftAction::Promote,
+            DriftAction::Promote => DriftAction::Remove,
+            DriftAction::Remove => DriftAction::Skip,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            DriftAction::Skip => DriftAction::Remove,
+            DriftAction::Libcommit => DriftAction::Skip,
+            DriftAction::Promote => DriftAction::Libcommit,
+            DriftAction::Remove => DriftAction::Promote,
+        }
+    }
+}
+
 pub fn skill_dir(skills_root: &Path, name: &str) -> PathBuf {
     skills_root.join(name)
 }

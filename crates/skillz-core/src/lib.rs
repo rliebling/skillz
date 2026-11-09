@@ -28,7 +28,7 @@ pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
-pub use skill::{DriftItem, DriftReason, EntryKind, InstallationLock};
+pub use skill::{DriftAction, DriftItem, DriftReason, EntryKind, InstallationLock};
 pub use vcs::{infer_vcs, Vcs};
 
 /// Filesystem roots skillz resolves against for a given invocation.
@@ -471,15 +471,50 @@ impl App {
         ProjectConfig::load(&self.paths.cwd)
     }
 
-    fn skills_root(&self, config: &ProjectConfig) -> PathBuf {
-        self.paths.cwd.join(&config.skills_dir)
-    }
-
     /// Scaffold a new Authored skill in the Project skills dir (Drift until libcommit).
     pub fn skill_new(&self, name: &str, tags: &[String]) -> Result<PathBuf> {
         let config = self.load_scope_config()?;
         let root = self.scope_skills_root(&config);
         skill::scaffold_skill(&root, name, tags)
+    }
+
+    /// Remove a skill Installation + Lock from the current scope (Library untouched).
+    pub fn remove_skill(&self, name: &str) -> Result<()> {
+        skill::validate_skill_name(name)?;
+        let config = self.load_scope_config()?;
+        let root = self.scope_skills_root(&config);
+        let path = skill::skill_dir(&root, name);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| {
+                SkillzError::Message(format!(
+                    "failed to remove {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        let mut lock = self.load_scope_lock()?;
+        lock.installations.remove(name);
+        self.save_scope_lock(&lock)?;
+        Ok(())
+    }
+
+    /// Apply one Drift review action to a skill in the current scope.
+    pub fn apply_drift_action(&self, name: &str, action: DriftAction) -> Result<&'static str> {
+        match action {
+            DriftAction::Skip => Ok("skipped"),
+            DriftAction::Libcommit => {
+                self.libcommit_branch(name, None, Some("interactive libcommit"))?;
+                Ok("libcommitted")
+            }
+            DriftAction::Promote => {
+                self.promote_skill(name)?;
+                Ok("promoted")
+            }
+            DriftAction::Remove => {
+                self.remove_skill(name)?;
+                Ok("removed")
+            }
+        }
     }
 
     /// Detect Drift for skills present under skills_dir vs the Lock (current scope).
@@ -682,7 +717,7 @@ impl App {
 
     fn availability_for(&self, config: &ProjectConfig, name: &str) -> Availability {
         let mut avail = Availability::default();
-        let project_skill = skill::skill_dir(&self.skills_root(config), name);
+        let project_skill = skill::skill_dir(&self.scope_skills_root(config), name);
         avail.project = project_skill.join("SKILL.md").is_file();
         avail.user = self
             .paths
@@ -1541,6 +1576,36 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn remove_skill_deletes_installation_and_lock_keeps_library() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("demo", &[]).unwrap();
+        fx.app().libcommit_authored("demo", "personal").unwrap();
+        assert!(fx
+            .libs_dir
+            .join("personal/skills/demo/SKILL.md")
+            .is_file());
+        assert!(fx
+            .project_dir
+            .join(".agents/skills/demo/SKILL.md")
+            .is_file());
+
+        fx.app().remove_skill("demo").unwrap();
+        assert!(!fx.project_dir.join(".agents/skills/demo").exists());
+        let lock = ProjectLock::load(&fx.project_dir).unwrap();
+        assert!(!lock.installations.contains_key("demo"));
+        assert!(fx
+            .libs_dir
+            .join("personal/skills/demo/SKILL.md")
+            .is_file());
     }
 
     #[test]

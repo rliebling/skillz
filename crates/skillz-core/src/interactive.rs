@@ -1,7 +1,9 @@
 //! `-i` orchestration over [`crate::ui::Prompter`] (testable without Ratatui).
+//!
+//! Drift review uses a dedicated board UI in the CLI crate; add/import still use Prompter.
 
 use crate::ui::Prompter;
-use crate::{AdoptAs, App, DriftReason, Result, SkillzError};
+use crate::{AdoptAs, App, Result};
 
 impl App {
     /// Interactive add-by-tag: multi-select among matching Catalog Entries.
@@ -58,45 +60,5 @@ impl App {
             results.extend(one);
         }
         Ok(results)
-    }
-
-    /// Interactive drift next-actions for the current scope.
-    pub fn interactive_drift(&self, prompler: &mut dyn Prompter) -> Result<()> {
-        let items = self.detect_drift()?;
-        if items.is_empty() {
-            return Ok(());
-        }
-        let options = vec![
-            "libcommit (branch/overlay)".to_string(),
-            "promote".to_string(),
-            "skip".to_string(),
-        ];
-        for item in items {
-            let title = format!(
-                "Drift `{}` ({})",
-                item.name,
-                match item.reason {
-                    DriftReason::Unlocked => "unlocked",
-                    DriftReason::MissingFiles => "missing",
-                    DriftReason::HashMismatch { .. } => "hash mismatch",
-                }
-            );
-            let choice = prompler.choose(&title, &options)?;
-            match choice {
-                0 => {
-                    let _ = self.libcommit_branch(&item.name, None, Some("interactive libcommit"))?;
-                }
-                1 => {
-                    let _ = self.promote_skill(&item.name).map_err(|e| {
-                        SkillzError::Message(format!(
-                            "promote `{}` failed: {e}",
-                            item.name
-                        ))
-                    });
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 }
