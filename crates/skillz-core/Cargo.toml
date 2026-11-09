@@ -1,0 +1,12 @@
+[package]
+name = "skillz-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Application command API for the skillz skills manager"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

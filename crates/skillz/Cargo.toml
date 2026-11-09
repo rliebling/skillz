@@ -1,0 +1,14 @@
+[package]
+name = "skillz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for managing agent skill Libraries and Managed Projects"
+
+[[bin]]
+name = "skillz"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+skillz-core = { workspace = true }
