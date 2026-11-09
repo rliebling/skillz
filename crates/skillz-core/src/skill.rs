@@ -185,7 +185,12 @@ fn list_files_inner(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()
                     root.display()
                 ))
             })?;
-            out.push(rel.to_string_lossy().replace('\\', "/"));
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            // Sidecar used by fetch → libcommit; not part of skill content.
+            if rel == ".skillz-source" || rel.ends_with("/.skillz-source") {
+                continue;
+            }
+            out.push(rel);
         }
     }
     Ok(())

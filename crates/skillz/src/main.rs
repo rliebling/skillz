@@ -32,6 +32,13 @@ enum Commands {
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
+    /// Fetch an Upstream skill into the Project skills dir (Drift until libcommit)
+    Fetch {
+        /// Filesystem path or `github:owner/repo[/path][@rev]`
+        source: String,
+        /// Skill name for nested lookup (`github:owner/repo NAME`)
+        skill_name: Option<String>,
+    },
     /// Formalize a tested Installation into a Library Catalog Entry + Lock
     Libcommit {
         /// Skill name under the Project skills dir
@@ -42,6 +49,9 @@ enum Commands {
         /// How to record the Catalog Entry
         #[arg(long = "as", value_name = "KIND")]
         as_kind: LibcommitKind,
+        /// Upstream source string (defaults to fetch sidecar)
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Report Installation Drift against Locks
     Drift,
@@ -193,10 +203,20 @@ fn run() -> skillz_core::Result<()> {
             println!("(Drift until `skillz libcommit`)");
             Ok(())
         }
+        Some(Commands::Fetch { source, skill_name }) => {
+            let (dest, pinned) = app.fetch_skill(&source, skill_name.as_deref())?;
+            println!("fetched skill into {}", dest.display());
+            if let Some(src) = pinned {
+                println!("source: {src}");
+            }
+            println!("(Drift until `skillz libcommit`)");
+            Ok(())
+        }
         Some(Commands::Libcommit {
             name,
             library,
             as_kind,
+            source,
         }) => match as_kind {
             LibcommitKind::Authored => {
                 let lock = app.libcommit_authored(&name, &library)?;
@@ -206,9 +226,17 @@ fn run() -> skillz_core::Result<()> {
                 );
                 Ok(())
             }
-            LibcommitKind::Upstream => Err(skillz_core::SkillzError::Message(
-                "`libcommit --as upstream` is not implemented yet".into(),
-            )),
+            LibcommitKind::Upstream => {
+                let lock = app.libcommit_upstream(&name, &library, source.as_deref())?;
+                println!(
+                    "libcommit `{name}` → library `{library}` as upstream ({})",
+                    lock.content_hash
+                );
+                if let Some(src) = &lock.source {
+                    println!("source: {src}");
+                }
+                Ok(())
+            }
         },
         Some(Commands::Drift) => {
             let items = app.detect_drift()?;

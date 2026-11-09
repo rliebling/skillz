@@ -10,10 +10,19 @@ use crate::{Result, SkillzError};
 pub const LIBRARY_TOML: &str = "library.toml";
 pub const SKILLS_DIR: &str = "skills";
 
+/// Upstream Catalog Entry recorded in `library.toml` (reference, not Owned tree).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamEntry {
+    pub name: String,
+    pub source: String,
+}
+
 /// Versioned Library metadata stored in the Library repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryMeta {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream: Vec<UpstreamEntry>,
 }
 
 impl LibraryMeta {
@@ -39,6 +48,14 @@ impl LibraryMeta {
             SkillzError::Message(format!("failed to write {}: {e}", path.display()))
         })?;
         Ok(())
+    }
+
+    pub fn upsert_upstream(&mut self, entry: UpstreamEntry) {
+        if let Some(existing) = self.upstream.iter_mut().find(|e| e.name == entry.name) {
+            *existing = entry;
+        } else {
+            self.upstream.push(entry);
+        }
     }
 }
 
@@ -81,6 +98,7 @@ pub fn init_library_skeleton(path: &Path, name: &str) -> Result<()> {
 
     LibraryMeta {
         name: name.to_string(),
+        upstream: Vec::new(),
     }
     .save(path)?;
 
@@ -118,6 +136,7 @@ pub fn ensure_library_meta(path: &Path, name: &str) -> Result<LibraryMeta> {
     }
     let meta = LibraryMeta {
         name: name.to_string(),
+        upstream: Vec::new(),
     };
     meta.save(path)?;
     Ok(meta)

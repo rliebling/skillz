@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod catalog;
+pub mod fetch;
 pub mod library;
 pub mod project;
 pub mod registry;
 pub mod skill;
+pub mod source;
 pub mod vcs;
 
 pub use catalog::{Availability, CatalogEntry};
@@ -449,13 +451,7 @@ impl App {
         Ok(install)
     }
 
-    /// Formalize a tested Installation into a writable Library as an Owned Entry.
-    pub fn libcommit_authored(
-        &self,
-        name: &str,
-        library_name: &str,
-    ) -> Result<InstallationLock> {
-        skill::validate_skill_name(name)?;
+    fn writable_library_path(&self, library_name: &str) -> Result<(ProjectConfig, PathBuf)> {
         let config = self.require_managed()?;
         let binding = config
             .bindings
@@ -471,7 +467,6 @@ impl App {
                 "library `{library_name}` is read-only; choose a writable Binding"
             )));
         }
-
         let registry = self.load_registry()?;
         let record = registry.libraries.get(library_name).ok_or_else(|| {
             SkillzError::Message(format!(
@@ -483,6 +478,69 @@ impl App {
                 "library `{library_name}` is marked read-only in the registry"
             )));
         }
+        Ok((config, record.path.clone()))
+    }
+
+    /// Fetch an Upstream skill into the Project skills dir (Drift until libcommit).
+    ///
+    /// `source` is a filesystem path or `github:owner/repo…`. Optional `skill_name`
+    /// enables nested name lookup (`skillz fetch github:owner/repo NAME`).
+    pub fn fetch_skill(
+        &self,
+        source: &str,
+        skill_name: Option<&str>,
+    ) -> Result<(PathBuf, Option<String>)> {
+        let config = self.require_managed()?;
+        let skills_root = self.skills_root(&config);
+        std::fs::create_dir_all(&skills_root).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to create {}: {e}",
+                skills_root.display()
+            ))
+        })?;
+
+        if source.starts_with("github:") {
+            let parsed = source::GithubSource::parse(source)?;
+            let cache = self.paths.config_dir.join("cache");
+            let (skill_path, pinned) =
+                fetch::resolve_github_skill(&cache, &parsed, skill_name)?;
+            let dest = fetch::stage_skill(&skills_root, &skill_path, skill_name)?;
+            // Stash pinned source beside the skill for libcommit (sidecar).
+            let sidecar = dest.join(".skillz-source");
+            std::fs::write(&sidecar, pinned.render()).map_err(|e| {
+                SkillzError::Message(format!("failed to write {}: {e}", sidecar.display()))
+            })?;
+            Ok((dest, Some(pinned.render())))
+        } else {
+            let path = PathBuf::from(source);
+            let skill_path = if let Some(name) = skill_name {
+                // Treat `source` as a repo/tree root for name lookup.
+                let root = if path.is_absolute() {
+                    path
+                } else {
+                    self.paths.cwd.join(path)
+                };
+                fetch::find_skill_by_name(&root, name)?
+            } else {
+                fetch::resolve_local_skill_path(&if path.is_absolute() {
+                    path
+                } else {
+                    self.paths.cwd.join(path)
+                })?
+            };
+            let dest = fetch::stage_skill(&skills_root, &skill_path, skill_name)?;
+            Ok((dest, None))
+        }
+    }
+
+    /// Formalize a tested Installation into a writable Library as an Owned Entry.
+    pub fn libcommit_authored(
+        &self,
+        name: &str,
+        library_name: &str,
+    ) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let (config, lib_path) = self.writable_library_path(library_name)?;
 
         let project_skill = skill::skill_dir(&self.skills_root(&config), name);
         if !project_skill.is_dir() {
@@ -492,7 +550,7 @@ impl App {
             )));
         }
         let hash = skill::content_hash(&project_skill)?;
-        let owned = record.path.join(crate::library::SKILLS_DIR).join(name);
+        let owned = lib_path.join(crate::library::SKILLS_DIR).join(name);
         skill::copy_skill_tree(&project_skill, &owned)?;
 
         let install = InstallationLock {
@@ -500,6 +558,76 @@ impl App {
             entry_kind: EntryKind::Owned,
             content_hash: hash,
             source: None,
+        };
+        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        lock.installations.insert(name.to_string(), install.clone());
+        lock.save(&self.paths.cwd)?;
+        Ok(install)
+    }
+
+    /// Formalize a fetched Installation as an Upstream Catalog Entry + Lock.
+    pub fn libcommit_upstream(
+        &self,
+        name: &str,
+        library_name: &str,
+        source: Option<&str>,
+    ) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let (config, lib_path) = self.writable_library_path(library_name)?;
+        let project_skill = skill::skill_dir(&self.skills_root(&config), name);
+        if !project_skill.is_dir() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found under {}",
+                config.skills_dir
+            )));
+        }
+
+        let source = match source {
+            Some(s) => s.to_string(),
+            None => {
+                let sidecar = project_skill.join(".skillz-source");
+                if sidecar.is_file() {
+                    std::fs::read_to_string(&sidecar).map_err(|e| {
+                        SkillzError::Message(format!(
+                            "failed to read {}: {e}",
+                            sidecar.display()
+                        ))
+                    })?
+                    .trim()
+                    .to_string()
+                } else {
+                    return Err(SkillzError::Message(
+                        "upstream libcommit requires a source string (pass --source or fetch via github:…)"
+                            .into(),
+                    ));
+                }
+            }
+        };
+        // Validate grammar when it looks like github.
+        if source.starts_with("github:") {
+            let parsed = source::GithubSource::parse(&source)?;
+            if parsed.rev.is_none() {
+                return Err(SkillzError::Message(
+                    "upstream Lock source must include @rev".into(),
+                ));
+            }
+        }
+
+        // Upstream Catalog Entry is a reference — do not vendor into Library skills/.
+        let mut meta = LibraryMeta::load(&lib_path)?;
+        meta.upsert_upstream(crate::library::UpstreamEntry {
+            name: name.to_string(),
+            source: source.clone(),
+        });
+        meta.save(&lib_path)?;
+
+        let hash = skill::content_hash(&project_skill)?;
+
+        let install = InstallationLock {
+            library: library_name.to_string(),
+            entry_kind: EntryKind::Upstream,
+            content_hash: hash,
+            source: Some(source),
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
@@ -845,6 +973,57 @@ mod tests {
     }
 
     #[test]
+    fn fetch_local_nested_then_libcommit_upstream() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        // Nested "Pocock-style" layout on disk.
+        let upstream_root = fx.libs_dir.join("upstream-repo");
+        let nested = upstream_root.join("skills").join("ecto-thinking");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: ecto-thinking\ndescription: x\n---\n# ecto\n",
+        )
+        .unwrap();
+
+        let (dest, _) = fx
+            .app()
+            .fetch_skill(upstream_root.to_str().unwrap(), Some("ecto-thinking"))
+            .unwrap();
+        assert!(dest.join("SKILL.md").is_file());
+        let drift = fx.app().detect_drift().unwrap();
+        assert!(drift.iter().any(|d| d.name == "ecto-thinking"));
+
+        let lock = fx
+            .app()
+            .libcommit_upstream(
+                "ecto-thinking",
+                "personal",
+                Some("github:acme/skills/skills/ecto-thinking@deadbeef"),
+            )
+            .unwrap();
+        assert_eq!(lock.entry_kind, EntryKind::Upstream);
+        assert_eq!(
+            lock.source.as_deref(),
+            Some("github:acme/skills/skills/ecto-thinking@deadbeef")
+        );
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert_eq!(meta.upstream.len(), 1);
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+        // Upstream is a reference — not vendored under Library skills/.
+        assert!(!fx
+            .libs_dir
+            .join("personal/skills/ecto-thinking")
+            .exists());
+    }
+
+    #[test]
     fn list_and_add_from_library_with_tags_and_second_project() {
         let fx = Fixture::new();
         fx.app()
@@ -945,6 +1124,7 @@ mod tests {
         fs::create_dir_all(lib_path.join(".git")).unwrap();
         LibraryMeta {
             name: "company".into(),
+            upstream: Vec::new(),
         }
         .save(&lib_path)
         .unwrap();
