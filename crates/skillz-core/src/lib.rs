@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+pub mod catalog;
 pub mod library;
 pub mod project;
 pub mod registry;
 pub mod skill;
 pub mod vcs;
 
+pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
@@ -21,22 +23,38 @@ pub use vcs::{infer_vcs, Vcs};
 /// Filesystem roots skillz resolves against for a given invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillzPaths {
-    /// Overridden home / config root (tests inject a temp dir).
+    /// Overridden config root (tests inject a temp dir).
     pub config_dir: PathBuf,
     /// Current working directory used for Project discovery.
     pub cwd: PathBuf,
+    /// User home (for `~/.agents/skills` Availability).
+    pub home_dir: PathBuf,
 }
 
 impl SkillzPaths {
     pub fn new(config_dir: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+        let home_dir = dirs_home().unwrap_or_else(|| PathBuf::from("/"));
+        Self::with_home(config_dir, cwd, home_dir)
+    }
+
+    pub fn with_home(
+        config_dir: impl Into<PathBuf>,
+        cwd: impl Into<PathBuf>,
+        home_dir: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             config_dir: config_dir.into(),
             cwd: cwd.into(),
+            home_dir: home_dir.into(),
         }
     }
 
     pub fn registry_path(&self) -> PathBuf {
         self.config_dir.join("registry.toml")
+    }
+
+    pub fn user_skills_dir(&self) -> PathBuf {
+        self.home_dir.join(".agents").join("skills")
     }
 }
 
@@ -68,6 +86,29 @@ pub struct LibraryListEntry {
     pub path: PathBuf,
     pub read_only: bool,
     pub vcs: Option<Vcs>,
+}
+
+/// A list row including Availability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRow {
+    pub entry: CatalogEntry,
+    pub availability: Availability,
+}
+
+/// Result of [`App::add_skill`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddOutcome {
+    Installed(InstallationLock),
+    Refreshed(InstallationLock),
+    AlreadyPresent(InstallationLock),
+}
+
+impl AddOutcome {
+    pub fn lock(&self) -> &InstallationLock {
+        match self {
+            AddOutcome::Installed(l) | AddOutcome::Refreshed(l) | AddOutcome::AlreadyPresent(l) => l,
+        }
+    }
 }
 
 /// Application command API — the test seam for CLI and TUI.
@@ -234,6 +275,178 @@ impl App {
         }
         items.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(items)
+    }
+
+    /// List Catalog Entries from bound Libraries (or a single `--library`).
+    pub fn list_skills(
+        &self,
+        library_filter: Option<&str>,
+        tags: &[String],
+        dedupe: bool,
+    ) -> Result<Vec<ListRow>> {
+        let config = self.require_managed()?;
+        let registry = self.load_registry()?;
+        let tag_filters = catalog::normalize_tag_filters(tags);
+
+        let bindings: Vec<&Binding> = if let Some(name) = library_filter {
+            let b = config
+                .bindings
+                .iter()
+                .find(|b| b.name == name)
+                .ok_or_else(|| {
+                    SkillzError::Message(format!(
+                        "library `{name}` is not a Binding on this Managed Project"
+                    ))
+                })?;
+            vec![b]
+        } else {
+            config.bindings.iter().collect()
+        };
+
+        let mut rows = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for binding in bindings {
+            let Some(record) = registry.libraries.get(&binding.name) else {
+                return Err(SkillzError::Message(format!(
+                    "library `{}` is not in the local registry",
+                    binding.name
+                )));
+            };
+            for entry in catalog::list_owned_entries(&binding.name, &record.path)? {
+                if !catalog::entry_matches_tags(&entry, &tag_filters) {
+                    continue;
+                }
+                if dedupe && !seen.insert(entry.name.clone()) {
+                    continue;
+                }
+                let availability = self.availability_for(&config, &entry.name);
+                rows.push(ListRow {
+                    entry,
+                    availability,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    fn availability_for(&self, config: &ProjectConfig, name: &str) -> Availability {
+        let mut avail = Availability::default();
+        let project_skill = skill::skill_dir(&self.skills_root(config), name);
+        avail.project = project_skill.join("SKILL.md").is_file();
+        avail.user = self
+            .paths
+            .user_skills_dir()
+            .join(name)
+            .join("SKILL.md")
+            .is_file();
+        for rel in [".agents/skills", ".cursor/skills", ".claude/skills"] {
+            if rel == config.skills_dir {
+                continue;
+            }
+            let path = self.paths.cwd.join(rel).join(name).join("SKILL.md");
+            if path.is_file() {
+                avail.other_roots.push(rel.to_string());
+            }
+        }
+        avail
+    }
+
+    /// Install a Catalog Entry into the Managed Project (copy + Lock).
+    pub fn add_skill(
+        &self,
+        name: &str,
+        library_filter: Option<&str>,
+    ) -> Result<(AddOutcome, Option<String>)> {
+        skill::validate_skill_name(name)?;
+        let config = self.require_managed()?;
+        let rows = self.list_skills(library_filter, &[], false)?;
+        let matches: Vec<_> = rows.into_iter().filter(|r| r.entry.name == name).collect();
+        if matches.is_empty() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found in bound Libraries"
+            )));
+        }
+        if matches.len() > 1 && library_filter.is_none() {
+            let libs: Vec<_> = matches.iter().map(|m| m.entry.library.as_str()).collect();
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` found in multiple Libraries ({}); pass --library",
+                libs.join(", ")
+            )));
+        }
+        let row = &matches[0];
+        let warn = if !row.availability.project
+            && (row.availability.user || !row.availability.other_roots.is_empty())
+        {
+            Some(format!(
+                "skill `{name}` exists in {} but not in this Project; installing for collaborators",
+                row.availability.summary()
+            ))
+        } else {
+            None
+        };
+
+        let dest = skill::skill_dir(&self.skills_root(&config), name);
+        let outcome = if dest.join("SKILL.md").is_file() {
+            let existing = skill::content_hash(&dest)?;
+            if existing == row.entry.content_hash {
+                let mut lock = ProjectLock::load(&self.paths.cwd)?;
+                let install = InstallationLock {
+                    library: row.entry.library.clone(),
+                    entry_kind: EntryKind::Owned,
+                    content_hash: row.entry.content_hash.clone(),
+                    source: None,
+                };
+                lock.installations
+                    .insert(name.to_string(), install.clone());
+                lock.save(&self.paths.cwd)?;
+                AddOutcome::AlreadyPresent(install)
+            } else {
+                skill::copy_skill_tree(&row.entry.skill_path, &dest)?;
+                let install = self.write_owned_lock(name, &row.entry)?;
+                AddOutcome::Refreshed(install)
+            }
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    SkillzError::Message(format!(
+                        "failed to create {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            skill::copy_skill_tree(&row.entry.skill_path, &dest)?;
+            let install = self.write_owned_lock(name, &row.entry)?;
+            AddOutcome::Installed(install)
+        };
+        Ok((outcome, warn))
+    }
+
+    /// Add every Catalog Entry matching tag filters.
+    pub fn add_skills_by_tag(
+        &self,
+        tags: &[String],
+        library_filter: Option<&str>,
+    ) -> Result<Vec<(String, AddOutcome, Option<String>)>> {
+        let rows = self.list_skills(library_filter, tags, true)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (outcome, warn) = self.add_skill(&row.entry.name, Some(&row.entry.library))?;
+            out.push((row.entry.name, outcome, warn));
+        }
+        Ok(out)
+    }
+
+    fn write_owned_lock(&self, name: &str, entry: &CatalogEntry) -> Result<InstallationLock> {
+        let install = InstallationLock {
+            library: entry.library.clone(),
+            entry_kind: EntryKind::Owned,
+            content_hash: entry.content_hash.clone(),
+            source: None,
+        };
+        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        lock.installations.insert(name.to_string(), install.clone());
+        lock.save(&self.paths.cwd)?;
+        Ok(install)
     }
 
     /// Formalize a tested Installation into a writable Library as an Owned Entry.
@@ -454,6 +667,7 @@ mod tests {
         pub config_dir: PathBuf,
         pub project_dir: PathBuf,
         pub libs_dir: PathBuf,
+        pub home_dir: PathBuf,
     }
 
     impl Fixture {
@@ -462,19 +676,34 @@ mod tests {
             let config_dir = root.path().join("config");
             let project_dir = root.path().join("project");
             let libs_dir = root.path().join("libs");
+            let home_dir = root.path().join("home");
             fs::create_dir_all(&config_dir).unwrap();
             fs::create_dir_all(&project_dir).unwrap();
             fs::create_dir_all(&libs_dir).unwrap();
+            fs::create_dir_all(&home_dir).unwrap();
             Self {
                 _root: root,
                 config_dir,
                 project_dir,
                 libs_dir,
+                home_dir,
             }
         }
 
         pub fn app(&self) -> App {
-            App::new(SkillzPaths::new(&self.config_dir, &self.project_dir))
+            App::new(SkillzPaths::with_home(
+                &self.config_dir,
+                &self.project_dir,
+                &self.home_dir,
+            ))
+        }
+
+        pub fn app_at(&self, project_dir: &Path) -> App {
+            App::new(SkillzPaths::with_home(
+                &self.config_dir,
+                project_dir,
+                &self.home_dir,
+            ))
         }
     }
 
@@ -605,10 +834,80 @@ mod tests {
     fn ensure_config_dir_creates_registry_parent() {
         let fx = Fixture::new();
         let nested = fx.config_dir.join("nested");
-        let app = App::new(SkillzPaths::new(&nested, &fx.project_dir));
+        let app = App::new(SkillzPaths::with_home(
+            &nested,
+            &fx.project_dir,
+            &fx.home_dir,
+        ));
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn list_and_add_from_library_with_tags_and_second_project() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app()
+            .skill_new("demo-skill", &["elixir".into(), "phoenix".into()])
+            .unwrap();
+        fx.app()
+            .libcommit_authored("demo-skill", "personal")
+            .unwrap();
+
+        // Remove project install to simulate a fresh project consuming the Library.
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/demo-skill")).unwrap();
+        let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
+        lock.installations.clear();
+        lock.save(&fx.project_dir).unwrap();
+
+        let listed = fx
+            .app()
+            .list_skills(None, &["elixir".into()], false)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].entry.name, "demo-skill");
+        assert!(!listed[0].availability.project);
+
+        // Warn path: present only in user skills.
+        fs::create_dir_all(fx.home_dir.join(".agents/skills/demo-skill")).unwrap();
+        fs::write(
+            fx.home_dir.join(".agents/skills/demo-skill/SKILL.md"),
+            "---\nname: demo-skill\n---\n",
+        )
+        .unwrap();
+
+        let (outcome, warn) = fx.app().add_skill("demo-skill", None).unwrap();
+        assert!(matches!(outcome, AddOutcome::Installed(_)));
+        assert!(warn.unwrap().contains("user"));
+        assert!(fx
+            .project_dir
+            .join(".agents/skills/demo-skill/SKILL.md")
+            .is_file());
+
+        // Second Managed Project can add the same Catalog Entry.
+        let project2 = fx.libs_dir.join("project2");
+        fs::create_dir_all(&project2).unwrap();
+        fx.app_at(&project2)
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        let (outcome2, _) = fx
+            .app_at(&project2)
+            .add_skill("demo-skill", Some("personal"))
+            .unwrap();
+        assert!(matches!(outcome2, AddOutcome::Installed(_)));
+        assert!(project2
+            .join(".agents/skills/demo-skill/SKILL.md")
+            .is_file());
+
+        // Already present → no-op/refresh.
+        let (again, _) = fx.app().add_skill("demo-skill", None).unwrap();
+        assert!(matches!(again, AddOutcome::AlreadyPresent(_)));
     }
 
     #[test]

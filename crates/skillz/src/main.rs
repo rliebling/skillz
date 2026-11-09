@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use skillz_core::{default_config_dir, App, DriftReason, SkillzPaths};
+use skillz_core::{default_config_dir, AddOutcome, App, DriftReason, SkillzPaths};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,6 +45,29 @@ enum Commands {
     },
     /// Report Installation Drift against Locks
     Drift,
+    /// List Catalog Entries from bound Libraries
+    List {
+        /// Restrict to one Library Binding
+        #[arg(long)]
+        library: Option<String>,
+        /// Filter by tag (repeatable; comma-separated allowed; AND)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Keep only the first Binding match per skill name
+        #[arg(long)]
+        dedupe: bool,
+    },
+    /// Install Catalog Entries into this Managed Project
+    Add {
+        /// Skill name to install (omit when using --tag)
+        name: Option<String>,
+        /// Restrict / disambiguate Library Binding
+        #[arg(long)]
+        library: Option<String>,
+        /// Add all Catalog Entries matching tags (AND)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
     /// Manage Libraries in the user registry
     Library {
         #[command(subcommand)]
@@ -99,6 +122,14 @@ enum ProjectCommands {
         #[arg(long, default_value = ".agents/skills")]
         skills_dir: String,
     },
+}
+
+fn format_add_outcome(outcome: &AddOutcome) -> String {
+    match outcome {
+        AddOutcome::Installed(l) => format!("installed ({})", l.content_hash),
+        AddOutcome::Refreshed(l) => format!("refreshed ({})", l.content_hash),
+        AddOutcome::AlreadyPresent(l) => format!("already present ({})", l.content_hash),
+    }
 }
 
 fn main() -> ExitCode {
@@ -195,6 +226,63 @@ fn run() -> skillz_core::Result<()> {
                 };
                 println!("{}\t{reason}", item.name);
             }
+            Ok(())
+        }
+        Some(Commands::List {
+            library,
+            tags,
+            dedupe,
+        }) => {
+            let rows = app.list_skills(library.as_deref(), &tags, dedupe)?;
+            if rows.is_empty() {
+                println!("(no matching skills)");
+                return Ok(());
+            }
+            for row in rows {
+                let tags = if row.entry.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    row.entry.tags.join(",")
+                };
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    row.entry.name,
+                    row.entry.library,
+                    tags,
+                    row.availability.summary()
+                );
+            }
+            Ok(())
+        }
+        Some(Commands::Add {
+            name,
+            library,
+            tags,
+        }) => {
+            if !tags.is_empty() {
+                let results = app.add_skills_by_tag(&tags, library.as_deref())?;
+                if results.is_empty() {
+                    println!("(no matching skills to add)");
+                    return Ok(());
+                }
+                for (skill_name, outcome, warn) in results {
+                    if let Some(w) = warn {
+                        eprintln!("warning: {w}");
+                    }
+                    println!("{}: {}", skill_name, format_add_outcome(&outcome));
+                }
+                return Ok(());
+            }
+            let Some(name) = name else {
+                return Err(skillz_core::SkillzError::Message(
+                    "provide a skill name or --tag".into(),
+                ));
+            };
+            let (outcome, warn) = app.add_skill(&name, library.as_deref())?;
+            if let Some(w) = warn {
+                eprintln!("warning: {w}");
+            }
+            println!("{name}: {}", format_add_outcome(&outcome));
             Ok(())
         }
         Some(Commands::Library { command }) => match command {
