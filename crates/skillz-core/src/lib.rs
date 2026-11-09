@@ -115,6 +115,32 @@ pub struct LibraryListEntry {
     pub vcs: Option<Vcs>,
 }
 
+/// Outcome for one discovered skill during [`App::library_import`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryImportAction {
+    Add,
+    Update,
+    SkipIdentical,
+    SkipCollision { existing_source: String },
+    SkipOwned,
+}
+
+/// One planned/applied row from [`App::library_import`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryImportItem {
+    pub name: String,
+    pub source: String,
+    pub action: LibraryImportAction,
+}
+
+/// Report from [`App::library_import`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryImportReport {
+    pub library: String,
+    pub dry_run: bool,
+    pub items: Vec<LibraryImportItem>,
+}
+
 /// A list row including Availability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRow {
@@ -1292,6 +1318,136 @@ impl App {
         Ok(entries)
     }
 
+    /// Resolve a registered Library by name; must be writable.
+    pub fn writable_registry_library(&self, library_name: &str) -> Result<PathBuf> {
+        let registry = self.load_registry()?;
+        let record = registry.libraries.get(library_name).ok_or_else(|| {
+            SkillzError::Message(format!(
+                "library `{library_name}` is not in the local registry"
+            ))
+        })?;
+        if record.read_only {
+            return Err(SkillzError::Message(format!(
+                "library `{library_name}` is marked read-only in the registry"
+            )));
+        }
+        Ok(record.path.clone())
+    }
+
+    /// Discover skills in a GitHub repo and upsert Upstream Catalog Entries.
+    ///
+    /// Does not materialize Project/`--user` Installations. Works against a
+    /// registered writable Library by name (no Managed Project required).
+    pub fn library_import(
+        &self,
+        source: &str,
+        library_name: &str,
+        path_filter: Option<&str>,
+        dry_run: bool,
+    ) -> Result<LibraryImportReport> {
+        let lib_path = self.writable_registry_library(library_name)?;
+        let parsed = source::GithubSource::parse_input(source)?;
+        let cache = self.paths.config_dir.join("cache");
+        let repo = fetch::ensure_github_checkout(&cache, &parsed)?;
+        let rev = fetch::git_head_rev(&repo)?.unwrap_or_else(|| "HEAD".into());
+
+        let search_rel = parsed.join_path_prefix(path_filter);
+        let search_root = match &search_rel {
+            Some(rel) => {
+                let p = repo.join(rel);
+                if !p.is_dir() {
+                    return Err(SkillzError::Message(format!(
+                        "path `{rel}` not found in github:{}/{}",
+                        parsed.owner, parsed.repo
+                    )));
+                }
+                p
+            }
+            None => repo.clone(),
+        };
+
+        let discovered = fetch::discover_skills(&repo, &search_root)?;
+        let mut meta = LibraryMeta::load(&lib_path)?;
+        let owned_names: std::collections::BTreeSet<String> =
+            catalog::list_owned_entries(library_name, &lib_path)?
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+
+        let mut items = Vec::new();
+        let mut seen_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        for skill in discovered {
+            let pinned = source::GithubSource {
+                owner: parsed.owner.clone(),
+                repo: parsed.repo.clone(),
+                path: if skill.rel_path.is_empty() {
+                    None
+                } else {
+                    Some(skill.rel_path.clone())
+                },
+                rev: Some(rev.clone()),
+            };
+            let source_str = pinned.render();
+            let action = if owned_names.contains(&skill.name) {
+                LibraryImportAction::SkipOwned
+            } else if seen_names.contains(&skill.name) {
+                LibraryImportAction::SkipCollision {
+                    existing_source: format!("(earlier discovery of `{}`)", skill.name),
+                }
+            } else if let Some(existing) = meta.upstream.iter().find(|e| e.name == skill.name) {
+                let existing_parsed = source::GithubSource::parse(&existing.source).ok();
+                match existing_parsed {
+                    Some(ex) if ex.identity_key() == pinned.identity_key() => {
+                        if existing.source == source_str {
+                            LibraryImportAction::SkipIdentical
+                        } else {
+                            LibraryImportAction::Update
+                        }
+                    }
+                    _ => LibraryImportAction::SkipCollision {
+                        existing_source: existing.source.clone(),
+                    },
+                }
+            } else {
+                LibraryImportAction::Add
+            };
+
+            match &action {
+                LibraryImportAction::Add | LibraryImportAction::Update => {
+                    if !dry_run {
+                        meta.upsert_upstream(crate::library::UpstreamEntry {
+                            name: skill.name.clone(),
+                            source: source_str.clone(),
+                        });
+                    }
+                    seen_names.insert(skill.name.clone());
+                }
+                LibraryImportAction::SkipIdentical => {
+                    seen_names.insert(skill.name.clone());
+                }
+                LibraryImportAction::SkipCollision { .. } | LibraryImportAction::SkipOwned => {}
+            }
+
+            items.push(LibraryImportItem {
+                name: skill.name,
+                source: source_str,
+                action,
+            });
+        }
+
+        if !dry_run {
+            meta.save(&lib_path)?;
+        }
+
+        Ok(LibraryImportReport {
+            library: library_name.to_string(),
+            dry_run,
+            items,
+        })
+    }
+
     fn register_library(
         &self,
         name: &str,
@@ -2079,5 +2235,182 @@ mod tests {
             .library_init(&fx.libs_dir.join("b"), "personal")
             .unwrap_err();
         assert!(err.to_string().contains("already registered"));
+    }
+
+    /// Seed skillz github cache with a local git repo (avoids network).
+    fn seed_github_cache(fx: &Fixture, owner: &str, repo: &str) -> String {
+        let dest = fx
+            .config_dir
+            .join("cache")
+            .join("github")
+            .join(owner)
+            .join(repo);
+        fs::create_dir_all(dest.join("skills/engineering/grilling")).unwrap();
+        fs::create_dir_all(dest.join("skills/productivity/focus")).unwrap();
+        fs::write(
+            dest.join("skills/engineering/grilling/SKILL.md"),
+            "---\nname: grilling\n---\n# g\n",
+        )
+        .unwrap();
+        fs::write(
+            dest.join("skills/productivity/focus/SKILL.md"),
+            "---\nname: focus\n---\n# f\n",
+        )
+        .unwrap();
+        // Duplicate name under another tree for collision-within-batch coverage.
+        fs::create_dir_all(dest.join("skills/other/grilling")).unwrap();
+        fs::write(
+            dest.join("skills/other/grilling/SKILL.md"),
+            "---\nname: grilling\n---\n# other\n",
+        )
+        .unwrap();
+
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&dest)
+            .args(["init"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&dest)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&dest)
+            .args(["config", "user.name", "test"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&dest)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&dest)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap();
+        fetch::git_head_rev(&dest)
+            .unwrap()
+            .expect("rev")
+    }
+
+    #[test]
+    fn library_import_discovers_upserts_dry_run_path_and_collision() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        let rev = seed_github_cache(&fx, "mattpocock", "skills");
+
+        // Dry-run leaves library.toml unchanged.
+        let before = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
+        let dry = fx
+            .app()
+            .library_import("github:mattpocock/skills", "personal", None, true)
+            .unwrap();
+        assert!(dry.dry_run);
+        assert!(dry.items.iter().any(|i| i.name == "grilling"));
+        assert!(dry.items.iter().any(|i| i.name == "focus"));
+        let after_dry = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
+        assert_eq!(before, after_dry);
+
+        // HTTPS form + path filter.
+        let filtered = fx
+            .app()
+            .library_import(
+                "https://github.com/mattpocock/skills",
+                "personal",
+                Some("skills/engineering"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            filtered
+                .items
+                .iter()
+                .filter(|i| matches!(i.action, LibraryImportAction::Add))
+                .count(),
+            1
+        );
+        assert_eq!(filtered.items[0].name, "grilling");
+        assert_eq!(
+            filtered.items[0].source,
+            format!("github:mattpocock/skills/skills/engineering/grilling@{rev}")
+        );
+
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert_eq!(meta.upstream.len(), 1);
+        assert_eq!(meta.upstream[0].name, "grilling");
+
+        // Full import: focus added; other grilling collides with existing / earlier.
+        let full = fx
+            .app()
+            .library_import("github:mattpocock/skills", "personal", None, false)
+            .unwrap();
+        let focus = full.items.iter().find(|i| i.name == "focus").unwrap();
+        assert!(matches!(focus.action, LibraryImportAction::Add));
+        let grilling_actions: Vec<_> = full
+            .items
+            .iter()
+            .filter(|i| i.name == "grilling")
+            .map(|i| i.action.clone())
+            .collect();
+        assert!(grilling_actions.iter().any(|a| matches!(
+            a,
+            LibraryImportAction::SkipIdentical | LibraryImportAction::Update
+        )));
+        assert!(grilling_actions
+            .iter()
+            .any(|a| matches!(a, LibraryImportAction::SkipCollision { .. })));
+
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert_eq!(meta.upstream.len(), 2);
+
+        // No Project / user skills materialization.
+        assert!(!fx.project_dir.join(".agents/skills").exists());
+        assert!(!fx.home_dir.join(".agents/skills").exists());
+
+        // Name collision with different source skips.
+        let mut meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        meta.upsert_upstream(crate::library::UpstreamEntry {
+            name: "focus".into(),
+            source: "github:other/repo/focus@abc".into(),
+        });
+        meta.save(&fx.libs_dir.join("personal")).unwrap();
+        let collide = fx
+            .app()
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                Some("skills/productivity"),
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            collide.items[0].action,
+            LibraryImportAction::SkipCollision { .. }
+        ));
+    }
+
+    #[test]
+    fn library_import_does_not_require_managed_project() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        let _ = seed_github_cache(&fx, "acme", "skills");
+        // cwd project is unmanaged — import still works.
+        assert!(!fx.project_dir.join(".skillz/skillz.toml").is_file());
+        let report = fx
+            .app()
+            .library_import("github:acme/skills", "personal", None, false)
+            .unwrap();
+        assert!(!report.items.is_empty());
     }
 }

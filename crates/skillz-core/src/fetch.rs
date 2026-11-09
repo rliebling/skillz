@@ -8,6 +8,15 @@ use crate::skill;
 use crate::source::GithubSource;
 use crate::{Result, SkillzError};
 
+/// A skill directory discovered by walking for `SKILL.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSkill {
+    pub name: String,
+    pub abs_path: PathBuf,
+    /// Path relative to the walk root's repo root, using `/` separators.
+    pub rel_path: String,
+}
+
 /// Locate a skill directory by name under `root` (nested layouts OK).
 pub fn find_skill_by_name(root: &Path, skill_name: &str) -> Result<PathBuf> {
     let mut matches = Vec::new();
@@ -49,6 +58,67 @@ fn find_skill_inner(dir: &Path, skill_name: &str, out: &mut Vec<PathBuf>) -> Res
         find_skill_inner(&path, skill_name, out)?;
     }
     Ok(())
+}
+
+/// Walk `search_root` for directories containing `SKILL.md`.
+///
+/// `repo_root` is used only to compute `rel_path` (must be an ancestor of each hit).
+pub fn discover_skills(repo_root: &Path, search_root: &Path) -> Result<Vec<DiscoveredSkill>> {
+    let mut out = Vec::new();
+    discover_skills_inner(repo_root, search_root, &mut out)?;
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(out)
+}
+
+fn discover_skills_inner(
+    repo_root: &Path,
+    dir: &Path,
+    out: &mut Vec<DiscoveredSkill>,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            SkillzError::Message(format!("failed to read {}: {e}", dir.display()))
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" || name == ".jj" {
+            continue;
+        }
+        if path.join("SKILL.md").is_file() {
+            let rel = path
+                .strip_prefix(repo_root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| name.clone());
+            out.push(DiscoveredSkill {
+                name: name.clone(),
+                abs_path: path.clone(),
+                rel_path: rel,
+            });
+        }
+        discover_skills_inner(repo_root, &path, out)?;
+    }
+    Ok(())
+}
+
+pub fn git_head_rev(repo: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| SkillzError::Message(format!("git rev-parse failed: {e}")))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if rev.is_empty() { None } else { Some(rev) })
 }
 
 /// Resolve a local filesystem path to a skill directory.
@@ -169,20 +239,6 @@ pub fn resolve_github_skill(
     Ok((skill_path, pinned))
 }
 
-fn git_head_rev(repo: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["-C"])
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|e| SkillzError::Message(format!("git rev-parse failed: {e}")))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if rev.is_empty() { None } else { Some(rev) })
-}
-
 /// Copy a resolved skill into the Project skills dir using the skill's directory name.
 pub fn stage_skill(project_skills: &Path, skill_path: &Path, name_override: Option<&str>) -> Result<PathBuf> {
     let name = name_override
@@ -197,4 +253,33 @@ pub fn stage_skill(project_skills: &Path, skill_path: &Path, name_override: Opti
     let dest = skill::skill_dir(project_skills, &name);
     skill::copy_skill_tree(skill_path, &dest)?;
     Ok(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_skills_finds_nested_and_respects_search_root() {
+        let root = tempfile::tempdir().unwrap();
+        let eng = root.path().join("skills/engineering/grilling");
+        let prod = root.path().join("skills/productivity/focus");
+        fs::create_dir_all(&eng).unwrap();
+        fs::create_dir_all(&prod).unwrap();
+        fs::write(eng.join("SKILL.md"), "# g\n").unwrap();
+        fs::write(prod.join("SKILL.md"), "# f\n").unwrap();
+
+        let all = discover_skills(root.path(), root.path()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name, "grilling");
+        assert_eq!(all[0].rel_path, "skills/engineering/grilling");
+
+        let filtered = discover_skills(
+            root.path(),
+            &root.path().join("skills/engineering"),
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "grilling");
+    }
 }

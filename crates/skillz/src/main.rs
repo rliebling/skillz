@@ -4,7 +4,9 @@ use std::process::ExitCode;
 mod tui;
 
 use clap::{Parser, Subcommand};
-use skillz_core::{default_config_dir, AddOutcome, App, DriftReason, Scope, SkillzPaths};
+use skillz_core::{
+    default_config_dir, AddOutcome, App, DriftReason, LibraryImportAction, Scope, SkillzPaths,
+};
 use tui::RatatuiPrompter;
 
 #[derive(Debug, Parser)]
@@ -174,6 +176,20 @@ enum LibraryCommands {
     },
     /// List registered Libraries
     List,
+    /// Bulk-add Upstream Catalog Entries from a GitHub skills repo
+    Import {
+        /// `github:owner/repo[/path][@rev]` or `https://github.com/owner/repo…`
+        source: String,
+        /// Target registered Library name (must be writable)
+        #[arg(long)]
+        library: String,
+        /// Limit discovery to this subtree (after any path in `source`)
+        #[arg(long)]
+        path: Option<String>,
+        /// List what would be added/updated/skipped; write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -585,6 +601,67 @@ fn run() -> skillz_core::Result<()> {
                     let ro = if e.read_only { "ro" } else { "rw" };
                     println!("{}\t{ro}\t{vcs}\t{}", e.name, e.path.display());
                 }
+                Ok(())
+            }
+            LibraryCommands::Import {
+                source,
+                library,
+                path,
+                dry_run,
+            } => {
+                let report =
+                    app.library_import(&source, &library, path.as_deref(), dry_run)?;
+                let prefix = if report.dry_run { "dry-run " } else { "" };
+                if report.items.is_empty() {
+                    println!("{prefix}no skills discovered");
+                    return Ok(());
+                }
+                for item in &report.items {
+                    match &item.action {
+                        LibraryImportAction::Add => {
+                            println!("{prefix}add\t{}\t{}", item.name, item.source);
+                        }
+                        LibraryImportAction::Update => {
+                            println!("{prefix}update\t{}\t{}", item.name, item.source);
+                        }
+                        LibraryImportAction::SkipIdentical => {
+                            println!("{prefix}skip\t{}\t{} (identical)", item.name, item.source);
+                        }
+                        LibraryImportAction::SkipCollision { existing_source } => {
+                            eprintln!(
+                                "warning: skip `{}` — name collision with existing source `{existing_source}`",
+                                item.name
+                            );
+                            println!(
+                                "{prefix}skip\t{}\t{} (collision)",
+                                item.name, item.source
+                            );
+                        }
+                        LibraryImportAction::SkipOwned => {
+                            eprintln!(
+                                "warning: skip `{}` — Owned Entry already exists in library",
+                                item.name
+                            );
+                            println!("{prefix}skip\t{}\t{} (owned)", item.name, item.source);
+                        }
+                    }
+                }
+                let added = report
+                    .items
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            i.action,
+                            LibraryImportAction::Add | LibraryImportAction::Update
+                        )
+                    })
+                    .count();
+                println!(
+                    "{prefix}{} skill(s) planned; {} add/update for library `{}`",
+                    report.items.len(),
+                    added,
+                    report.library
+                );
                 Ok(())
             }
         },
