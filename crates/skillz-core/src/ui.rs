@@ -24,3 +24,36 @@ impl Prompter for SelectAllPrompter {
         Ok(0)
     }
 }
+
+/// Test prompler that selects only the first N items (or cancels with empty).
+#[derive(Debug)]
+pub struct SelectFirstNPrompter {
+    pub n: usize,
+}
+
+impl Prompter for SelectFirstNPrompter {
+    fn multi_select(&mut self, _title: &str, items: &[String]) -> Result<Vec<usize>> {
+        Ok((0..self.n.min(items.len())).collect())
+    }
+
+    fn choose(&mut self, _title: &str, options: &[String]) -> Result<usize> {
+        if options.is_empty() {
+            return Err(SkillzError::Message("no options".into()));
+        }
+        Ok(0)
+    }
+}
+
+/// Test prompler that cancels multi-select (same as TUI quit).
+#[derive(Debug, Default)]
+pub struct CancelPrompter;
+
+impl Prompter for CancelPrompter {
+    fn multi_select(&mut self, _title: &str, _items: &[String]) -> Result<Vec<usize>> {
+        Err(SkillzError::Message("cancelled".into()))
+    }
+
+    fn choose(&mut self, _title: &str, _options: &[String]) -> Result<usize> {
+        Err(SkillzError::Message("cancelled".into()))
+    }
+}

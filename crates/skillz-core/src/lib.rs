@@ -22,7 +22,7 @@ pub mod vcs;
 pub mod vcs_ops;
 
 pub use import::{AdoptAs, ImportPlan, SkillfileEntry};
-pub use ui::{Prompter, SelectAllPrompter};
+pub use ui::{CancelPrompter, Prompter, SelectAllPrompter, SelectFirstNPrompter};
 
 pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
@@ -139,6 +139,14 @@ pub struct LibraryImportReport {
     pub library: String,
     pub dry_run: bool,
     pub items: Vec<LibraryImportItem>,
+}
+
+/// A discovered skill candidate before catalog upsert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryImportCandidate {
+    pub name: String,
+    pub rel_path: String,
+    pub source: String,
 }
 
 /// A list row including Availability.
@@ -1334,18 +1342,14 @@ impl App {
         Ok(record.path.clone())
     }
 
-    /// Discover skills in a GitHub repo and upsert Upstream Catalog Entries.
-    ///
-    /// Does not materialize Project/`--user` Installations. Works against a
-    /// registered writable Library by name (no Managed Project required).
-    pub fn library_import(
+    /// Discover skills in a GitHub repo for Library import (no catalog writes).
+    pub fn library_import_discover(
         &self,
         source: &str,
         library_name: &str,
         path_filter: Option<&str>,
-        dry_run: bool,
-    ) -> Result<LibraryImportReport> {
-        let lib_path = self.writable_registry_library(library_name)?;
+    ) -> Result<Vec<LibraryImportCandidate>> {
+        let _ = self.writable_registry_library(library_name)?;
         let parsed = source::GithubSource::parse_input(source)?;
         let cache = self.paths.config_dir.join("cache");
         let repo = fetch::ensure_github_checkout(&cache, &parsed)?;
@@ -1367,17 +1371,7 @@ impl App {
         };
 
         let discovered = fetch::discover_skills(&repo, &search_root)?;
-        let mut meta = LibraryMeta::load(&lib_path)?;
-        let owned_names: std::collections::BTreeSet<String> =
-            catalog::list_owned_entries(library_name, &lib_path)?
-                .into_iter()
-                .map(|e| e.name)
-                .collect();
-
-        let mut items = Vec::new();
-        let mut seen_names: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-
+        let mut out = Vec::new();
         for skill in discovered {
             let pinned = source::GithubSource {
                 owner: parsed.owner.clone(),
@@ -1389,7 +1383,61 @@ impl App {
                 },
                 rev: Some(rev.clone()),
             };
-            let source_str = pinned.render();
+            out.push(LibraryImportCandidate {
+                name: skill.name,
+                rel_path: skill.rel_path,
+                source: pinned.render(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Discover skills in a GitHub repo and upsert Upstream Catalog Entries.
+    ///
+    /// Does not materialize Project/`--user` Installations. Works against a
+    /// registered writable Library by name (no Managed Project required).
+    ///
+    /// When `only_sources` is `Some`, only candidates whose canonical source
+    /// strings appear in that list are considered (order follows discovery).
+    pub fn library_import(
+        &self,
+        source: &str,
+        library_name: &str,
+        path_filter: Option<&str>,
+        dry_run: bool,
+    ) -> Result<LibraryImportReport> {
+        self.library_import_filtered(source, library_name, path_filter, dry_run, None)
+    }
+
+    pub fn library_import_filtered(
+        &self,
+        source: &str,
+        library_name: &str,
+        path_filter: Option<&str>,
+        dry_run: bool,
+        only_sources: Option<&[String]>,
+    ) -> Result<LibraryImportReport> {
+        let lib_path = self.writable_registry_library(library_name)?;
+        let mut candidates = self.library_import_discover(source, library_name, path_filter)?;
+        if let Some(only) = only_sources {
+            let want: std::collections::BTreeSet<&str> = only.iter().map(|s| s.as_str()).collect();
+            candidates.retain(|c| want.contains(c.source.as_str()));
+        }
+
+        let mut meta = LibraryMeta::load(&lib_path)?;
+        let owned_names: std::collections::BTreeSet<String> =
+            catalog::list_owned_entries(library_name, &lib_path)?
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+
+        let mut items = Vec::new();
+        let mut seen_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        for skill in candidates {
+            let pinned = source::GithubSource::parse(&skill.source)?;
+            let source_str = skill.source.clone();
             let action = if owned_names.contains(&skill.name) {
                 LibraryImportAction::SkipOwned
             } else if seen_names.contains(&skill.name) {
@@ -2412,5 +2460,49 @@ mod tests {
             .library_import("github:acme/skills", "personal", None, false)
             .unwrap();
         assert!(!report.items.is_empty());
+    }
+
+    #[test]
+    fn interactive_library_import_selects_subset_and_cancel() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        let _ = seed_github_cache(&fx, "mattpocock", "skills");
+
+        let before = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
+        let err = fx
+            .app()
+            .interactive_library_import(
+                "github:mattpocock/skills",
+                "personal",
+                None,
+                &mut CancelPrompter,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
+        assert_eq!(
+            before,
+            fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap()
+        );
+
+        // Path filter + select first only (grilling under engineering).
+        let mut ui = SelectFirstNPrompter { n: 1 };
+        let report = fx
+            .app()
+            .interactive_library_import(
+                "github:mattpocock/skills",
+                "personal",
+                Some("skills/engineering"),
+                &mut ui,
+            )
+            .unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].name, "grilling");
+        assert!(matches!(report.items[0].action, LibraryImportAction::Add));
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert_eq!(meta.upstream.len(), 1);
+        assert_eq!(meta.upstream[0].name, "grilling");
+        assert!(!fx.project_dir.join(".agents/skills").exists());
     }
 }

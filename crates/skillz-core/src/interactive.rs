@@ -3,7 +3,7 @@
 //! Drift review uses a dedicated board UI in the CLI crate; add/import still use Prompter.
 
 use crate::ui::Prompter;
-use crate::{AdoptAs, App, Result};
+use crate::{AdoptAs, App, LibraryImportReport, Result};
 
 impl App {
     /// Interactive add-by-tag: multi-select among matching Catalog Entries.
@@ -29,6 +29,47 @@ impl App {
             added.push(row.entry.name.clone());
         }
         Ok(added)
+    }
+
+    /// Interactive Library import: multi-select discovered skills, then upsert.
+    pub fn interactive_library_import(
+        &self,
+        source: &str,
+        library_name: &str,
+        path_filter: Option<&str>,
+        prompler: &mut dyn Prompter,
+    ) -> Result<LibraryImportReport> {
+        let candidates = self.library_import_discover(source, library_name, path_filter)?;
+        if candidates.is_empty() {
+            return Ok(LibraryImportReport {
+                library: library_name.to_string(),
+                dry_run: false,
+                items: Vec::new(),
+            });
+        }
+        let labels: Vec<String> = candidates
+            .iter()
+            .map(|c| {
+                if c.rel_path.is_empty() {
+                    c.name.clone()
+                } else {
+                    format!("{}  {}", c.name, c.rel_path)
+                }
+            })
+            .collect();
+        let selected = prompler.multi_select("Import Upstream skills", &labels)?;
+        let sources: Vec<String> = selected
+            .into_iter()
+            .filter_map(|i| candidates.get(i).map(|c| c.source.clone()))
+            .collect();
+        if sources.is_empty() {
+            return Ok(LibraryImportReport {
+                library: library_name.to_string(),
+                dry_run: false,
+                items: Vec::new(),
+            });
+        }
+        self.library_import_filtered(source, library_name, path_filter, false, Some(&sources))
     }
 
     /// Interactive import adopt for leftovers.

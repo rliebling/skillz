@@ -189,6 +189,9 @@ enum LibraryCommands {
         /// List what would be added/updated/skipped; write nothing
         #[arg(long)]
         dry_run: bool,
+        /// Interactive multi-select of discovered skills (Ratatui)
+        #[arg(short = 'i', long)]
+        interactive: bool,
     },
 }
 
@@ -608,9 +611,24 @@ fn run() -> skillz_core::Result<()> {
                 library,
                 path,
                 dry_run,
+                interactive,
             } => {
-                let report =
-                    app.library_import(&source, &library, path.as_deref(), dry_run)?;
+                if interactive && dry_run {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`library import` refuses --dry-run with -i; omit one of them".into(),
+                    ));
+                }
+                let report = if interactive {
+                    let mut ui = RatatuiPrompter;
+                    app.interactive_library_import(
+                        &source,
+                        &library,
+                        path.as_deref(),
+                        &mut ui,
+                    )?
+                } else {
+                    app.library_import(&source, &library, path.as_deref(), dry_run)?
+                };
                 let prefix = if report.dry_run { "dry-run " } else { "" };
                 if report.items.is_empty() {
                     println!("{prefix}no skills discovered");
