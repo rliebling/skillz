@@ -1,0 +1,6 @@
+skills_dir = ".agents/skills"
+
+[[bindings]]
+name = "personal"
+url = "file:///Users/rliebling/code/skillz_library"
+read_only = false
