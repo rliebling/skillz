@@ -24,6 +24,36 @@ struct Cli {
 enum Commands {
     /// Show Managed Project / binding status (stub)
     Status,
+    /// Manage Libraries in the user registry
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LibraryCommands {
+    /// Create a Library skeleton and register it
+    Init {
+        /// Directory for the new Library
+        path: PathBuf,
+        /// Registry name for this Library
+        #[arg(long)]
+        name: String,
+    },
+    /// Register an existing Library checkout
+    Add {
+        /// Path to an existing Library repo
+        path: PathBuf,
+        /// Registry name for this Library
+        #[arg(long)]
+        name: String,
+        /// Mark the Library as read-only in this registry
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// List registered Libraries
+    List,
 }
 
 fn main() -> ExitCode {
@@ -46,8 +76,6 @@ fn run() -> skillz_core::Result<()> {
 
     match cli.command {
         None => {
-            // `skillz` with no subcommand: clap already printed help if `-h`;
-            // otherwise show a short nudge.
             println!(
                 "skillz {}\n\nUse `skillz --help` for commands.",
                 env!("CARGO_PKG_VERSION")
@@ -61,5 +89,46 @@ fn run() -> skillz_core::Result<()> {
             println!("{}", report.message);
             Ok(())
         }
+        Some(Commands::Library { command }) => match command {
+            LibraryCommands::Init { path, name } => {
+                let entry = app.library_init(&path, &name)?;
+                println!(
+                    "initialized library `{}` at {}",
+                    entry.name,
+                    entry.path.display()
+                );
+                Ok(())
+            }
+            LibraryCommands::Add {
+                path,
+                name,
+                read_only,
+            } => {
+                let entry = app.library_add(&path, &name, read_only)?;
+                let ro = if entry.read_only { " (read-only)" } else { "" };
+                println!(
+                    "registered library `{}` at {}{ro}",
+                    entry.name,
+                    entry.path.display()
+                );
+                Ok(())
+            }
+            LibraryCommands::List => {
+                let entries = app.library_list()?;
+                if entries.is_empty() {
+                    println!("(no libraries registered)");
+                    return Ok(());
+                }
+                for e in entries {
+                    let vcs = e
+                        .vcs
+                        .map(|v| v.as_str())
+                        .unwrap_or("-");
+                    let ro = if e.read_only { "ro" } else { "rw" };
+                    println!("{}\t{ro}\t{vcs}\t{}", e.name, e.path.display());
+                }
+                Ok(())
+            }
+        },
     }
 }
