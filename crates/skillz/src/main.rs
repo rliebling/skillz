@@ -66,16 +66,16 @@ enum Commands {
         #[arg(short, long)]
         message: Option<String>,
     },
-    /// Promote a Branch Lock into the Library main line
+    /// Merge a skill's Library Branch Lock into Library main (does not re-Lock the Project)
     Promote {
-        /// Skill name
+        /// Skill name whose Branch Lock should land on Library main
         name: String,
     },
-    /// Re-Lock an Installation to Library main (after promote)
+    /// After promote: point the Project Lock at Library main and refresh the Installation
     Lock {
         /// Skill name
         name: String,
-        /// Lock to Library main line
+        /// Re-Lock to Library main and refresh Installation files from main
         #[arg(long)]
         main: bool,
     },
