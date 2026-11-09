@@ -137,7 +137,7 @@ skillz drift --check                 # non-zero exit for hooks
 skillz hooks install
 ```
 
-In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Remove drops the Project Installation + Lock only; the Library entry stays.
+In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays.
 
 - **git:** pre-commit runs `skillz drift --check` on the Managed Project.
 - **jj:** repo-local alias `jj push-with-checks` (drift check, then `jj git push`). Ordinary `jj git push` stays unwrapped.

@@ -15,6 +15,48 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Terminal;
 use skillz_core::{App, DriftAction, DriftItem, Prompter, Result, SkillzError};
 
+const DRIFT_HELP: &[&str] = &[
+    "Navigate",
+    "  j / ↓          move down",
+    "  k / ↑          move up",
+    "",
+    "Actions (per selected skill)",
+    "  ← → / [ ] / h l   cycle planned action",
+    "  s                 skip",
+    "  c                 libcommit (Branch Lock / Overlay Fork)",
+    "  p                 promote Branch Lock to Library main",
+    "  r                 remove Installation + Lock (asks confirm)",
+    "",
+    "Apply / quit",
+    "  Enter             apply all non-skip actions",
+    "  q / Esc           quit without further applies",
+    "",
+    "Remove keeps the Library Catalog Entry; only Project files + Lock go away.",
+    "",
+    "Press ? or Esc to close this help.",
+];
+
+const LIST_MULTI_HELP: &[&str] = &[
+    "Multi-select",
+    "  j / ↓          move down",
+    "  k / ↑          move up",
+    "  Space          toggle current item",
+    "  Enter          confirm selection",
+    "  q / Esc        cancel",
+    "",
+    "Press ? or Esc to close this help.",
+];
+
+const LIST_CHOOSE_HELP: &[&str] = &[
+    "Choose one",
+    "  j / ↓          move down",
+    "  k / ↑          move up",
+    "  Enter          select highlighted item",
+    "  q / Esc        cancel",
+    "",
+    "Press ? or Esc to close this help.",
+];
+
 pub struct RatatuiPrompter;
 
 impl Prompter for RatatuiPrompter {
@@ -76,8 +118,9 @@ pub fn run_drift_board(app: &App) -> Result<()> {
     let mut state = ListState::default();
     state.select(Some(0));
     let mut modal: Option<Modal> = None;
+    let mut show_help = false;
     let mut status_line = String::from(
-        "j/k move · ←/→ action · r remove · enter apply · q quit",
+        "j/k move · ←/→ action · r remove · enter apply · ? help · q quit",
     );
 
     let result = loop {
@@ -159,7 +202,9 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                 let footer = Paragraph::new(status_line.as_str());
                 frame.render_widget(footer, chunks[2]);
 
-                if let Some(Modal::ConfirmRemove { index }) = &modal {
+                if show_help {
+                    draw_help_modal(frame, area, "drift keys", DRIFT_HELP);
+                } else if let Some(Modal::ConfirmRemove { index }) = &modal {
                     let name = &rows[*index].item.name;
                     draw_confirm_modal(
                         frame,
@@ -178,8 +223,17 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                 continue;
             }
 
+            if show_help {
+                // Any key dismisses help (including ?).
+                show_help = false;
+                continue;
+            }
+
             if let Some(Modal::ConfirmRemove { index }) = modal {
                 match key.code {
+                    KeyCode::Char('?') => {
+                        show_help = true;
+                    }
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         rows[index].action = DriftAction::Remove;
                         rows[index].outcome = None;
@@ -199,6 +253,9 @@ pub fn run_drift_board(app: &App) -> Result<()> {
             }
 
             match key.code {
+                KeyCode::Char('?') => {
+                    show_help = true;
+                }
                 KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                 KeyCode::Down | KeyCode::Char('j') => {
                     let i = state.selected().unwrap_or(0);
@@ -275,11 +332,12 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                         }
                     }
                     status_line = format!(
-                        "applied {applied} action(s), {errors} error(s) — q to quit"
+                        "applied {applied} action(s), {errors} error(s) — ? help · q quit"
                     );
                     if applied == 0 && errors == 0 {
                         status_line =
-                            "nothing to apply (set actions with ←/→ or r) — q to quit".into();
+                            "nothing to apply (set actions with ←/→ or r) — ? help · q quit"
+                                .into();
                     }
                 }
                 _ => {}
@@ -290,6 +348,34 @@ pub fn run_drift_board(app: &App) -> Result<()> {
     disable_raw_mode().ok();
     execute!(io::stdout(), LeaveAlternateScreen).ok();
     result
+}
+
+fn draw_help_modal(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, lines: &[&str]) {
+    let width = area.width.min(72).max(44);
+    let height = (lines.len() as u16)
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" help: {title} "))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    let text: Vec<Line> = lines.iter().map(|l| Line::from(*l)).collect();
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn draw_confirm_modal(
@@ -324,7 +410,9 @@ fn draw_confirm_modal(
             Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::raw(" yes   "),
             Span::styled("[n]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(" cancel"),
+            Span::raw(" cancel   "),
+            Span::styled("[?]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" help"),
         ]),
     ])
     .wrap(Wrap { trim: true });
@@ -343,14 +431,20 @@ fn run_list(title: &str, items: &[String], multi: bool) -> Result<Vec<usize>> {
     let mut state = ListState::default();
     state.select(Some(0));
     let mut checked = vec![false; items.len()];
+    let mut show_help = false;
+    let help_body = if multi {
+        LIST_MULTI_HELP
+    } else {
+        LIST_CHOOSE_HELP
+    };
     let result = loop {
         terminal
             .draw(|frame| {
                 let area = frame.area();
                 let help = if multi {
-                    "space toggle · enter confirm · q cancel"
+                    "space toggle · enter confirm · ? help · q cancel"
                 } else {
-                    "enter select · q cancel"
+                    "enter select · ? help · q cancel"
                 };
                 let header = Paragraph::new(Line::from(format!("{title}  ({help})")));
                 frame.render_widget(header, area);
@@ -380,6 +474,11 @@ fn run_list(title: &str, items: &[String], multi: bool) -> Result<Vec<usize>> {
                     .block(Block::default().borders(Borders::ALL).title("skillz"))
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
                 frame.render_stateful_widget(list, list_area, &mut state);
+
+                if show_help {
+                    let label = if multi { "multi-select" } else { "choose" };
+                    draw_help_modal(frame, area, label, help_body);
+                }
             })
             .map_err(|e| SkillzError::Message(format!("tui: {e}")))?;
 
@@ -389,7 +488,14 @@ fn run_list(title: &str, items: &[String], multi: bool) -> Result<Vec<usize>> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            if show_help {
+                show_help = false;
+                continue;
+            }
             match key.code {
+                KeyCode::Char('?') => {
+                    show_help = true;
+                }
                 KeyCode::Char('q') | KeyCode::Esc => {
                     break Err(SkillzError::Message("cancelled".into()));
                 }
