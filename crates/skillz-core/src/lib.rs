@@ -15,6 +15,7 @@ pub mod registry;
 pub mod skill;
 pub mod source;
 pub mod vcs;
+pub mod vcs_ops;
 
 pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
@@ -458,6 +459,8 @@ impl App {
                     entry_kind: EntryKind::Owned,
                     content_hash: row.entry.content_hash.clone(),
                     source: None,
+                    rev: None,
+                    branch: None,
                 };
                 lock.installations
                     .insert(name.to_string(), install.clone());
@@ -505,6 +508,8 @@ impl App {
             entry_kind: EntryKind::Owned,
             content_hash: entry.content_hash.clone(),
             source: None,
+            rev: None,
+            branch: None,
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
@@ -619,11 +624,125 @@ impl App {
             entry_kind: EntryKind::Owned,
             content_hash: hash,
             source: None,
+            rev: None,
+            branch: None,
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
         lock.save(&self.paths.cwd)?;
         Ok(install)
+    }
+
+    /// Edit path: push Installation into Library on a branch and Lock to that rev.
+    pub fn libcommit_branch(
+        &self,
+        name: &str,
+        library_name: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let config = self.require_managed()?;
+        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let existing = lock.installations.get(name).cloned();
+        let library_name = library_name
+            .map(|s| s.to_string())
+            .or_else(|| existing.as_ref().map(|e| e.library.clone()))
+            .ok_or_else(|| {
+                SkillzError::Message(format!(
+                    "skill `{name}` has no Lock; pass --library or libcommit --as first"
+                ))
+            })?;
+        let (_config, lib_path) = self.writable_library_path(&library_name)?;
+        let project_skill = skill::skill_dir(&self.skills_root(&config), name);
+        if !project_skill.is_dir() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found under {}",
+                config.skills_dir
+            )));
+        }
+        let hash = skill::content_hash(&project_skill)?;
+        let owned = lib_path.join(crate::library::SKILLS_DIR).join(name);
+        skill::copy_skill_tree(&project_skill, &owned)?;
+
+        let branch = format!("skillz/{name}");
+        let msg = message.unwrap_or("skillz libcommit Branch Lock");
+        let commit = vcs_ops::commit_on_branch(&lib_path, &branch, msg, &[&owned])?;
+
+        let install = InstallationLock {
+            library: library_name,
+            entry_kind: existing
+                .as_ref()
+                .map(|e| e.entry_kind)
+                .unwrap_or(EntryKind::Owned),
+            content_hash: hash,
+            source: existing.and_then(|e| e.source),
+            rev: Some(commit.rev),
+            branch: Some(commit.branch),
+        };
+        lock.installations.insert(name.to_string(), install.clone());
+        lock.save(&self.paths.cwd)?;
+        Ok(install)
+    }
+
+    /// Merge a Branch Lock into the Library main line.
+    pub fn promote_skill(&self, name: &str) -> Result<String> {
+        let config = self.require_managed()?;
+        let lock = ProjectLock::load(&self.paths.cwd)?;
+        let install = lock.installations.get(name).ok_or_else(|| {
+            SkillzError::Message(format!("skill `{name}` is not locked"))
+        })?;
+        let branch = install.branch.clone().ok_or_else(|| {
+            SkillzError::Message(format!(
+                "skill `{name}` has no Branch Lock to promote"
+            ))
+        })?;
+        let registry = self.load_registry()?;
+        let record = registry.libraries.get(&install.library).ok_or_else(|| {
+            SkillzError::Message(format!(
+                "library `{}` is not in the local registry",
+                install.library
+            ))
+        })?;
+        let _ = config;
+        vcs_ops::promote_branch_to_main(&record.path, &branch)
+    }
+
+    /// After promote, re-Lock to Library main and refresh the Installation.
+    pub fn lock_main(&self, name: &str) -> Result<InstallationLock> {
+        let config = self.require_managed()?;
+        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let install = lock.installations.get(name).cloned().ok_or_else(|| {
+            SkillzError::Message(format!("skill `{name}` is not locked"))
+        })?;
+        let registry = self.load_registry()?;
+        let record = registry.libraries.get(&install.library).ok_or_else(|| {
+            SkillzError::Message(format!(
+                "library `{}` is not in the local registry",
+                install.library
+            ))
+        })?;
+        let main_rev = vcs_ops::main_rev(&record.path)?;
+        let owned = record.path.join(crate::library::SKILLS_DIR).join(name);
+        if !owned.is_dir() {
+            return Err(SkillzError::Message(format!(
+                "Owned Entry `{name}` missing on Library main at {}",
+                owned.display()
+            )));
+        }
+        let dest = skill::skill_dir(&self.skills_root(&config), name);
+        skill::copy_skill_tree(&owned, &dest)?;
+        let hash = skill::content_hash(&dest)?;
+        let updated = InstallationLock {
+            library: install.library,
+            entry_kind: install.entry_kind,
+            content_hash: hash,
+            source: install.source,
+            rev: Some(main_rev),
+            branch: None,
+        };
+        lock.installations.insert(name.to_string(), updated.clone());
+        lock.save(&self.paths.cwd)?;
+        Ok(updated)
     }
 
     /// Formalize a fetched Installation as an Upstream Catalog Entry + Lock.
@@ -689,6 +808,8 @@ impl App {
             entry_kind: EntryKind::Upstream,
             content_hash: hash,
             source: Some(source),
+            rev: None,
+            branch: None,
         };
         let mut lock = ProjectLock::load(&self.paths.cwd)?;
         lock.installations.insert(name.to_string(), install.clone());
@@ -1035,6 +1156,73 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn edit_libcommit_branch_promote_lock_main() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal").unwrap();
+        vcs_ops::init_git_repo(&lib).unwrap();
+        // library.toml + skills need to be on main before branching.
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&lib)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&lib)
+            .args(["commit", "-m", "library skeleton"])
+            .status()
+            .unwrap();
+
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("grilling", &[]).unwrap();
+        fx.app()
+            .libcommit_authored("grilling", "personal")
+            .unwrap();
+        // Commit authored entry on main.
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&lib)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&lib)
+            .args(["commit", "-m", "add grilling"])
+            .status()
+            .unwrap();
+
+        // Edit installation.
+        let skill_md = fx
+            .project_dir
+            .join(".agents/skills/grilling/SKILL.md");
+        let mut body = fs::read_to_string(&skill_md).unwrap();
+        body.push_str("\nEdited in project.\n");
+        fs::write(&skill_md, body).unwrap();
+        assert!(!fx.app().detect_drift().unwrap().is_empty());
+
+        let branch_lock = fx
+            .app()
+            .libcommit_branch("grilling", None, Some("tweak"))
+            .unwrap();
+        assert!(branch_lock.branch.as_deref().unwrap().contains("grilling"));
+        assert!(branch_lock.rev.is_some());
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+
+        let main_rev = fx.app().promote_skill("grilling").unwrap();
+        assert!(!main_rev.is_empty());
+
+        let locked = fx.app().lock_main("grilling").unwrap();
+        assert_eq!(locked.branch, None);
+        assert_eq!(locked.rev.as_deref(), Some(main_rev.as_str()));
+        assert!(fx.app().detect_drift().unwrap().is_empty());
     }
 
     #[test]

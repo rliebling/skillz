@@ -45,13 +45,29 @@ enum Commands {
         name: String,
         /// Target Library Binding name
         #[arg(long)]
-        library: String,
-        /// How to record the Catalog Entry
+        library: Option<String>,
+        /// How to record the Catalog Entry (`authored` / `upstream`); omit for Branch Lock edit path
         #[arg(long = "as", value_name = "KIND")]
-        as_kind: LibcommitKind,
+        as_kind: Option<LibcommitKind>,
         /// Upstream source string (defaults to fetch sidecar)
         #[arg(long)]
         source: Option<String>,
+        /// Commit message for Branch Lock libcommit
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Promote a Branch Lock into the Library main line
+    Promote {
+        /// Skill name
+        name: String,
+    },
+    /// Re-Lock an Installation to Library main (after promote)
+    Lock {
+        /// Skill name
+        name: String,
+        /// Lock to Library main line
+        #[arg(long)]
+        main: bool,
     },
     /// Report Installation Drift against Locks
     Drift {
@@ -238,8 +254,14 @@ fn run() -> skillz_core::Result<()> {
             library,
             as_kind,
             source,
+            message,
         }) => match as_kind {
-            LibcommitKind::Authored => {
+            Some(LibcommitKind::Authored) => {
+                let library = library.ok_or_else(|| {
+                    skillz_core::SkillzError::Message(
+                        "`libcommit --as authored` requires --library".into(),
+                    )
+                })?;
                 let lock = app.libcommit_authored(&name, &library)?;
                 println!(
                     "libcommit `{name}` → library `{library}` as owned ({})",
@@ -247,7 +269,12 @@ fn run() -> skillz_core::Result<()> {
                 );
                 Ok(())
             }
-            LibcommitKind::Upstream => {
+            Some(LibcommitKind::Upstream) => {
+                let library = library.ok_or_else(|| {
+                    skillz_core::SkillzError::Message(
+                        "`libcommit --as upstream` requires --library".into(),
+                    )
+                })?;
                 let lock = app.libcommit_upstream(&name, &library, source.as_deref())?;
                 println!(
                     "libcommit `{name}` → library `{library}` as upstream ({})",
@@ -258,6 +285,34 @@ fn run() -> skillz_core::Result<()> {
                 }
                 Ok(())
             }
+            None => {
+                let lock =
+                    app.libcommit_branch(&name, library.as_deref(), message.as_deref())?;
+                println!(
+                    "libcommit `{name}` Branch Lock on {}@{}",
+                    lock.branch.as_deref().unwrap_or("?"),
+                    lock.rev.as_deref().unwrap_or("?")
+                );
+                Ok(())
+            }
+        },
+        Some(Commands::Promote { name }) => {
+            let rev = app.promote_skill(&name)?;
+            println!("promoted `{name}` to library main ({rev})");
+            Ok(())
+        }
+        Some(Commands::Lock { name, main }) => {
+            if !main {
+                return Err(skillz_core::SkillzError::Message(
+                    "only `skillz lock --main` is supported".into(),
+                ));
+            }
+            let lock = app.lock_main(&name)?;
+            println!(
+                "locked `{name}` to main ({})",
+                lock.rev.as_deref().unwrap_or("?")
+            );
+            Ok(())
         },
         Some(Commands::Drift {
             check,
