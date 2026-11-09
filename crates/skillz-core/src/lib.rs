@@ -60,6 +60,22 @@ impl SkillzPaths {
     pub fn user_skills_dir(&self) -> PathBuf {
         self.home_dir.join(".agents").join("skills")
     }
+
+    pub fn user_config_path(&self) -> PathBuf {
+        self.config_dir.join("user.toml")
+    }
+
+    pub fn user_lock_path(&self) -> PathBuf {
+        self.config_dir.join("user.lock")
+    }
+}
+
+/// Whether commands operate on the cwd Managed Project or user-global skills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    #[default]
+    Project,
+    User,
 }
 
 /// Errors returned by the application command API.
@@ -126,15 +142,28 @@ impl AddOutcome {
 #[derive(Debug, Clone)]
 pub struct App {
     paths: SkillzPaths,
+    scope: Scope,
 }
 
 impl App {
     pub fn new(paths: SkillzPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            scope: Scope::Project,
+        }
+    }
+
+    pub fn with_scope(mut self, scope: Scope) -> Self {
+        self.scope = scope;
+        self
     }
 
     pub fn paths(&self) -> &SkillzPaths {
         &self.paths
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
     }
 
     pub fn load_registry(&self) -> Result<Registry> {
@@ -148,6 +177,36 @@ impl App {
 
     /// Status for the cwd Managed Project (bindings + installations).
     pub fn status(&self) -> Result<StatusReport> {
+        if self.scope == Scope::User {
+            if !self.paths.user_config_path().is_file() {
+                return Ok(StatusReport {
+                    cwd: self.paths.user_skills_dir(),
+                    config_dir: self.paths.config_dir.clone(),
+                    managed: false,
+                    skills_dir: None,
+                    bindings: Vec::new(),
+                    installations: Vec::new(),
+                    message: "User scope not initialized (no user.toml)".to_string(),
+                });
+            }
+            let config = self.load_scope_config()?;
+            let lock = self.load_scope_lock()?;
+            let installations = lock.installation_names();
+            let message = format!(
+                "User scope; {} binding(s); {} installation(s)",
+                config.bindings.len(),
+                installations.len()
+            );
+            return Ok(StatusReport {
+                cwd: self.paths.user_skills_dir(),
+                config_dir: self.paths.config_dir.clone(),
+                managed: true,
+                skills_dir: Some(config.skills_dir),
+                bindings: config.bindings,
+                installations,
+                message,
+            });
+        }
         let cfg_path = ProjectConfig::path(&self.paths.cwd);
         if !cfg_path.is_file() {
             return Ok(StatusReport {
@@ -161,7 +220,7 @@ impl App {
             });
         }
         let config = ProjectConfig::load(&self.paths.cwd)?;
-        let lock = ProjectLock::load(&self.paths.cwd)?;
+        let lock = self.load_scope_lock()?;
         let installations = lock.installation_names();
         let message = format!(
             "Managed Project; {} binding(s); {} installation(s)",
@@ -177,6 +236,127 @@ impl App {
             installations,
             message,
         })
+    }
+
+    /// Initialize user-global skills scope (`user.toml` / `user.lock`).
+    pub fn user_init(&self, bind_specs: &[String]) -> Result<ProjectConfig> {
+        if self.paths.user_config_path().is_file() {
+            return Err(SkillzError::Message(format!(
+                "user scope already initialized ({})",
+                self.paths.user_config_path().display()
+            )));
+        }
+        let registry = self.load_registry()?;
+        let bindings = project::bindings_from_specs(bind_specs, &registry.libraries)?;
+        let skills_dir = self.paths.user_skills_dir().display().to_string();
+        std::fs::create_dir_all(self.paths.user_skills_dir()).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to create {}: {e}",
+                self.paths.user_skills_dir().display()
+            ))
+        })?;
+        let config = ProjectConfig {
+            skills_dir,
+            bindings,
+        };
+        self.ensure_config_dir()?;
+        let text = toml::to_string_pretty(&config).map_err(|e| {
+            SkillzError::Message(format!("failed to serialize user.toml: {e}"))
+        })?;
+        std::fs::write(self.paths.user_config_path(), text).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to write {}: {e}",
+                self.paths.user_config_path().display()
+            ))
+        })?;
+        let lock = ProjectLock::default();
+        let lock_text = toml::to_string_pretty(&lock).map_err(|e| {
+            SkillzError::Message(format!("failed to serialize user.lock: {e}"))
+        })?;
+        std::fs::write(self.paths.user_lock_path(), lock_text).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to write {}: {e}",
+                self.paths.user_lock_path().display()
+            ))
+        })?;
+        Ok(config)
+    }
+
+    fn load_scope_config(&self) -> Result<ProjectConfig> {
+        match self.scope {
+            Scope::Project => self.require_managed(),
+            Scope::User => {
+                let path = self.paths.user_config_path();
+                if !path.is_file() {
+                    return Err(SkillzError::Message(
+                        "user scope not initialized; run `skillz user init`".into(),
+                    ));
+                }
+                let text = std::fs::read_to_string(&path).map_err(|e| {
+                    SkillzError::Message(format!("failed to read {}: {e}", path.display()))
+                })?;
+                toml::from_str(&text).map_err(|e| {
+                    SkillzError::Message(format!("invalid {}: {e}", path.display()))
+                })
+            }
+        }
+    }
+
+    fn load_scope_lock(&self) -> Result<ProjectLock> {
+        match self.scope {
+            Scope::Project => ProjectLock::load(&self.paths.cwd),
+            Scope::User => {
+                let path = self.paths.user_lock_path();
+                if !path.is_file() {
+                    return Ok(ProjectLock::default());
+                }
+                let text = std::fs::read_to_string(&path).map_err(|e| {
+                    SkillzError::Message(format!("failed to read {}: {e}", path.display()))
+                })?;
+                toml::from_str(&text).map_err(|e| {
+                    SkillzError::Message(format!("invalid {}: {e}", path.display()))
+                })
+            }
+        }
+    }
+
+    fn save_scope_lock(&self, lock: &ProjectLock) -> Result<()> {
+        match self.scope {
+            Scope::Project => lock.save(&self.paths.cwd),
+            Scope::User => {
+                self.ensure_config_dir()?;
+                let text = toml::to_string_pretty(lock).map_err(|e| {
+                    SkillzError::Message(format!("failed to serialize user.lock: {e}"))
+                })?;
+                std::fs::write(self.paths.user_lock_path(), text).map_err(|e| {
+                    SkillzError::Message(format!(
+                        "failed to write {}: {e}",
+                        self.paths.user_lock_path().display()
+                    ))
+                })?;
+                Ok(())
+            }
+        }
+    }
+
+    fn scope_skills_root(&self, config: &ProjectConfig) -> PathBuf {
+        match self.scope {
+            Scope::Project => self.paths.cwd.join(&config.skills_dir),
+            Scope::User => {
+                if Path::new(&config.skills_dir).is_absolute() {
+                    PathBuf::from(&config.skills_dir)
+                } else {
+                    self.paths.user_skills_dir()
+                }
+            }
+        }
+    }
+
+    fn scope_root_for_errors(&self) -> PathBuf {
+        match self.scope {
+            Scope::Project => self.paths.cwd.clone(),
+            Scope::User => self.paths.user_skills_dir(),
+        }
     }
 
     /// Initialize cwd as a Managed Project with ordered Library Bindings.
@@ -230,14 +410,17 @@ impl App {
 
     /// Scaffold a new Authored skill in the Project skills dir (Drift until libcommit).
     pub fn skill_new(&self, name: &str, tags: &[String]) -> Result<PathBuf> {
-        let config = self.require_managed()?;
-        let root = self.skills_root(&config);
+        let config = self.load_scope_config()?;
+        let root = self.scope_skills_root(&config);
         skill::scaffold_skill(&root, name, tags)
     }
 
-    /// Detect Drift for skills present under skills_dir vs the Project Lock.
+    /// Detect Drift for skills present under skills_dir vs the Lock (current scope).
     pub fn detect_drift(&self) -> Result<Vec<DriftItem>> {
-        self.detect_drift_in(&self.paths.cwd)
+        let config = self.load_scope_config()?;
+        let lock = self.load_scope_lock()?;
+        let root = self.scope_skills_root(&config);
+        Self::drift_items_for(&root, &lock)
     }
 
     pub fn detect_drift_in(&self, project_root: &Path) -> Result<Vec<DriftItem>> {
@@ -251,9 +434,13 @@ impl App {
         let config = ProjectConfig::load(project_root)?;
         let lock = ProjectLock::load(project_root)?;
         let root = project_root.join(&config.skills_dir);
+        Self::drift_items_for(&root, &lock)
+    }
+
+    fn drift_items_for(root: &Path, lock: &ProjectLock) -> Result<Vec<DriftItem>> {
         let mut items = Vec::new();
         if root.is_dir() {
-            for entry in std::fs::read_dir(&root).map_err(|e| {
+            for entry in std::fs::read_dir(root).map_err(|e| {
                 SkillzError::Message(format!("failed to read {}: {e}", root.display()))
             })? {
                 let entry = entry.map_err(|e| {
@@ -287,7 +474,7 @@ impl App {
             }
         }
         for name in lock.installations.keys() {
-            let path = skill::skill_dir(&root, name);
+            let path = skill::skill_dir(root, name);
             if !path.is_dir() {
                 items.push(DriftItem {
                     name: name.clone(),
@@ -326,6 +513,16 @@ impl App {
                 out.push(ProjectDrift { project, items });
             }
         }
+        if project_filter.is_none() && self.paths.user_config_path().is_file() {
+            let user_app = self.clone().with_scope(Scope::User);
+            let items = user_app.detect_drift()?;
+            if !items.is_empty() {
+                out.push(ProjectDrift {
+                    project: self.paths.user_skills_dir(),
+                    items,
+                });
+            }
+        }
         Ok(out)
     }
 
@@ -337,6 +534,11 @@ impl App {
     }
 
     pub fn hooks_install(&self) -> Result<PathBuf> {
+        if self.scope == Scope::User {
+            return Err(SkillzError::Message(
+                "hooks install applies to Managed Projects, not user scope".into(),
+            ));
+        }
         self.require_managed()?;
         hooks::install_git_pre_commit(&self.paths.cwd)
     }
@@ -348,7 +550,7 @@ impl App {
         tags: &[String],
         dedupe: bool,
     ) -> Result<Vec<ListRow>> {
-        let config = self.require_managed()?;
+        let config = self.load_scope_config()?;
         let registry = self.load_registry()?;
         let tag_filters = catalog::normalize_tag_filters(tags);
 
@@ -422,7 +624,7 @@ impl App {
         library_filter: Option<&str>,
     ) -> Result<(AddOutcome, Option<String>)> {
         skill::validate_skill_name(name)?;
-        let config = self.require_managed()?;
+        let config = self.load_scope_config()?;
         let rows = self.list_skills(library_filter, &[], false)?;
         let matches: Vec<_> = rows.into_iter().filter(|r| r.entry.name == name).collect();
         if matches.is_empty() {
@@ -449,11 +651,11 @@ impl App {
             None
         };
 
-        let dest = skill::skill_dir(&self.skills_root(&config), name);
+        let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
         let outcome = if dest.join("SKILL.md").is_file() {
             let existing = skill::content_hash(&dest)?;
             if existing == row.entry.content_hash {
-                let mut lock = ProjectLock::load(&self.paths.cwd)?;
+                let mut lock = self.load_scope_lock()?;
                 let install = InstallationLock {
                     library: row.entry.library.clone(),
                     entry_kind: EntryKind::Owned,
@@ -466,7 +668,7 @@ impl App {
                 };
                 lock.installations
                     .insert(name.to_string(), install.clone());
-                lock.save(&self.paths.cwd)?;
+                self.save_scope_lock(&lock)?;
                 AddOutcome::AlreadyPresent(install)
             } else {
                 skill::copy_skill_tree(&row.entry.skill_path, &dest)?;
@@ -515,14 +717,14 @@ impl App {
             overlay_from_library: None,
             overlay_from_entry: None,
         };
-        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let mut lock = self.load_scope_lock()?;
         lock.installations.insert(name.to_string(), install.clone());
-        lock.save(&self.paths.cwd)?;
+        self.save_scope_lock(&lock)?;
         Ok(install)
     }
 
     fn writable_library_path(&self, library_name: &str) -> Result<(ProjectConfig, PathBuf)> {
-        let config = self.require_managed()?;
+        let config = self.load_scope_config()?;
         let binding = config
             .bindings
             .iter()
@@ -560,8 +762,8 @@ impl App {
         source: &str,
         skill_name: Option<&str>,
     ) -> Result<(PathBuf, Option<String>)> {
-        let config = self.require_managed()?;
-        let skills_root = self.skills_root(&config);
+        let config = self.load_scope_config()?;
+        let skills_root = self.scope_skills_root(&config);
         std::fs::create_dir_all(&skills_root).map_err(|e| {
             SkillzError::Message(format!(
                 "failed to create {}: {e}",
@@ -612,7 +814,7 @@ impl App {
         skill::validate_skill_name(name)?;
         let (config, lib_path) = self.writable_library_path(library_name)?;
 
-        let project_skill = skill::skill_dir(&self.skills_root(&config), name);
+        let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
         if !project_skill.is_dir() {
             return Err(SkillzError::Message(format!(
                 "skill `{name}` not found under {}",
@@ -633,9 +835,9 @@ impl App {
             overlay_from_library: None,
             overlay_from_entry: None,
         };
-        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let mut lock = self.load_scope_lock()?;
         lock.installations.insert(name.to_string(), install.clone());
-        lock.save(&self.paths.cwd)?;
+        self.save_scope_lock(&lock)?;
         Ok(install)
     }
 
@@ -650,8 +852,8 @@ impl App {
         message: Option<&str>,
     ) -> Result<InstallationLock> {
         skill::validate_skill_name(name)?;
-        let config = self.require_managed()?;
-        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let config = self.load_scope_config()?;
+        let mut lock = self.load_scope_lock()?;
         let existing = lock.installations.get(name).cloned();
         let desired = library_name
             .map(|s| s.to_string())
@@ -662,7 +864,7 @@ impl App {
                 ))
             })?;
 
-        let project_skill = skill::skill_dir(&self.skills_root(&config), name);
+        let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
         if !project_skill.is_dir() {
             return Err(SkillzError::Message(format!(
                 "skill `{name}` not found under {}",
@@ -707,7 +909,7 @@ impl App {
             overlay_from_entry,
         };
         lock.installations.insert(name.to_string(), install.clone());
-        lock.save(&self.paths.cwd)?;
+        self.save_scope_lock(&lock)?;
         Ok(install)
     }
 
@@ -730,8 +932,8 @@ impl App {
 
     /// Merge a Branch Lock into the Library main line.
     pub fn promote_skill(&self, name: &str) -> Result<String> {
-        let config = self.require_managed()?;
-        let lock = ProjectLock::load(&self.paths.cwd)?;
+        let config = self.load_scope_config()?;
+        let lock = self.load_scope_lock()?;
         let install = lock.installations.get(name).ok_or_else(|| {
             SkillzError::Message(format!("skill `{name}` is not locked"))
         })?;
@@ -753,8 +955,8 @@ impl App {
 
     /// After promote, re-Lock to Library main and refresh the Installation.
     pub fn lock_main(&self, name: &str) -> Result<InstallationLock> {
-        let config = self.require_managed()?;
-        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let config = self.load_scope_config()?;
+        let mut lock = self.load_scope_lock()?;
         let install = lock.installations.get(name).cloned().ok_or_else(|| {
             SkillzError::Message(format!("skill `{name}` is not locked"))
         })?;
@@ -773,7 +975,7 @@ impl App {
                 owned.display()
             )));
         }
-        let dest = skill::skill_dir(&self.skills_root(&config), name);
+        let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
         skill::copy_skill_tree(&owned, &dest)?;
         let hash = skill::content_hash(&dest)?;
         let updated = InstallationLock {
@@ -787,7 +989,7 @@ impl App {
             overlay_from_entry: install.overlay_from_entry,
         };
         lock.installations.insert(name.to_string(), updated.clone());
-        lock.save(&self.paths.cwd)?;
+        self.save_scope_lock(&lock)?;
         Ok(updated)
     }
 
@@ -800,7 +1002,7 @@ impl App {
     ) -> Result<InstallationLock> {
         skill::validate_skill_name(name)?;
         let (config, lib_path) = self.writable_library_path(library_name)?;
-        let project_skill = skill::skill_dir(&self.skills_root(&config), name);
+        let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
         if !project_skill.is_dir() {
             return Err(SkillzError::Message(format!(
                 "skill `{name}` not found under {}",
@@ -859,9 +1061,9 @@ impl App {
             overlay_from_library: None,
             overlay_from_entry: None,
         };
-        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        let mut lock = self.load_scope_lock()?;
         lock.installations.insert(name.to_string(), install.clone());
-        lock.save(&self.paths.cwd)?;
+        self.save_scope_lock(&lock)?;
         Ok(install)
     }
 
@@ -1204,6 +1406,38 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn user_scope_init_list_add_and_libcommit() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        // Seed Library Catalog Entry via a temporary project.
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("demo", &["cli".into()]).unwrap();
+        fx.app().libcommit_authored("demo", "personal").unwrap();
+
+        let user = fx.app().with_scope(Scope::User);
+        user.user_init(&["personal".into()]).unwrap();
+        assert!(fx.config_dir.join("user.toml").is_file());
+        assert!(fx.config_dir.join("user.lock").is_file());
+        assert!(fx.home_dir.join(".agents/skills").is_dir());
+
+        let status = user.status().unwrap();
+        assert!(status.managed);
+        assert!(status.message.contains("User scope"));
+
+        let (outcome, _) = user.add_skill("demo", None).unwrap();
+        assert!(matches!(outcome, AddOutcome::Installed(_)));
+        assert!(fx
+            .home_dir
+            .join(".agents/skills/demo/SKILL.md")
+            .is_file());
+        assert!(user.detect_drift().unwrap().is_empty());
     }
 
     #[test]

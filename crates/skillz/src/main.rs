@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use skillz_core::{default_config_dir, AddOutcome, App, DriftReason, SkillzPaths};
+use skillz_core::{default_config_dir, AddOutcome, App, DriftReason, Scope, SkillzPaths};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -15,6 +15,10 @@ struct Cli {
     /// Override skillz config directory (default: ~/.config/skillz)
     #[arg(long, global = true, value_name = "DIR", env = "SKILLZ_CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+
+    /// Operate on the user-global skills scope (`~/.agents/skills`)
+    #[arg(long, global = true)]
+    user: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -119,6 +123,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
+    /// Manage the user-global skills scope
+    User {
+        #[command(subcommand)]
+        command: UserCommands,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -171,6 +180,16 @@ enum ProjectCommands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum UserCommands {
+    /// Initialize user-global skills scope with Library Bindings
+    Init {
+        /// Library binding (`name` or `name:ro`); repeatable
+        #[arg(long = "bind", required = true)]
+        bind: Vec<String>,
+    },
+}
+
 fn format_add_outcome(outcome: &AddOutcome) -> String {
     match outcome {
         AddOutcome::Installed(l) => format!("installed ({})", l.content_hash),
@@ -195,7 +214,12 @@ fn run() -> skillz_core::Result<()> {
     let cwd = std::env::current_dir().map_err(|e| {
         skillz_core::SkillzError::Message(format!("failed to read current directory: {e}"))
     })?;
-    let app = App::new(SkillzPaths::new(config_dir, cwd));
+    let scope = if cli.user {
+        Scope::User
+    } else {
+        Scope::Project
+    };
+    let app = App::new(SkillzPaths::new(config_dir, cwd)).with_scope(scope);
 
     match cli.command {
         None => {
@@ -470,6 +494,17 @@ fn run() -> skillz_core::Result<()> {
                     let ro = if b.read_only { "ro" } else { "rw" };
                     println!("  - {} [{ro}] {}", b.name, b.url);
                 }
+                Ok(())
+            }
+        },
+        Some(Commands::User { command }) => match command {
+            UserCommands::Init { bind } => {
+                let config = app.user_init(&bind)?;
+                println!(
+                    "initialized user scope with {} binding(s); skills_dir={}",
+                    config.bindings.len(),
+                    config.skills_dir
+                );
                 Ok(())
             }
         },
