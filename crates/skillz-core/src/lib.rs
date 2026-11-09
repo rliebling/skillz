@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod catalog;
 pub mod fetch;
 pub mod hooks;
+pub mod import;
 pub mod library;
 pub mod project;
 pub mod registry;
@@ -16,6 +17,8 @@ pub mod skill;
 pub mod source;
 pub mod vcs;
 pub mod vcs_ops;
+
+pub use import::{AdoptAs, ImportPlan, SkillfileEntry};
 
 pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
@@ -357,6 +360,73 @@ impl App {
             Scope::Project => self.paths.cwd.clone(),
             Scope::User => self.paths.user_skills_dir(),
         }
+    }
+
+    /// Dry-run import detection for the cwd Project.
+    pub fn project_import_dry_run(&self) -> Result<ImportPlan> {
+        import::build_plan(&self.paths.cwd)
+    }
+
+    /// Import Skillfile github entries as Upstream Catalog Entries + Locks.
+    /// Keeps matching Installation files; requires an existing Managed Project.
+    pub fn project_import_from_skillfile(&self, library_name: &str) -> Result<Vec<String>> {
+        let config = self.require_managed()?;
+        let plan = import::build_plan(&self.paths.cwd)?;
+        let mut imported = Vec::new();
+        for entry in &plan.skillfile_entries {
+            let dest = skill::skill_dir(&self.scope_skills_root(&config), &entry.name);
+            if !dest.join("SKILL.md").is_file() {
+                // Keep files when present; otherwise leave as missing (user may fetch).
+                continue;
+            }
+            // Ensure source has @rev for Lock; synthesize placeholder from content hash if needed.
+            let mut source = entry.source.clone();
+            if !source.contains('@') {
+                let hash = skill::content_hash(&dest)?;
+                let short = hash.trim_start_matches("sha256:");
+                let short = &short[..short.len().min(12)];
+                source = format!("{source}@{short}");
+            }
+            self.libcommit_upstream(&entry.name, library_name, Some(&source))?;
+            imported.push(entry.name.clone());
+        }
+        Ok(imported)
+    }
+
+    /// Adopt leftover local skills per scripted `name=upstream|authored|skip` specs.
+    pub fn project_adopt_local(
+        &self,
+        library_name: &str,
+        specs: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let _config = self.require_managed()?;
+        let plan = import::build_plan(&self.paths.cwd)?;
+        let leftover_set: std::collections::BTreeSet<_> =
+            plan.leftovers.iter().cloned().collect();
+        let mut results = Vec::new();
+        for spec in specs {
+            let (name, adopt) = import::parse_adopt_spec(spec)?;
+            if !leftover_set.contains(&name) && !plan.local_skills.iter().any(|s| s == &name) {
+                return Err(SkillzError::Message(format!(
+                    "skill `{name}` not found as a local leftover"
+                )));
+            }
+            match adopt {
+                AdoptAs::Skip => {
+                    results.push((name, "skipped (remains Drift/import candidate)".into()));
+                }
+                AdoptAs::Authored => {
+                    self.libcommit_authored(&name, library_name)?;
+                    results.push((name, "adopted as authored".into()));
+                }
+                AdoptAs::Upstream => {
+                    let source = format!("github:local/import/{name}@adopted");
+                    self.libcommit_upstream(&name, library_name, Some(&source))?;
+                    results.push((name, "adopted as upstream".into()));
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Initialize cwd as a Managed Project with ordered Library Bindings.
@@ -1406,6 +1476,57 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn project_import_skillfile_and_adopt_local() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        let skills = fx.project_dir.join(".agents/skills");
+        fs::create_dir_all(skills.join("grilling")).unwrap();
+        fs::write(
+            skills.join("grilling/SKILL.md"),
+            "---\nname: grilling\n---\n# g\n",
+        )
+        .unwrap();
+        fs::create_dir_all(skills.join("local-only")).unwrap();
+        fs::write(
+            skills.join("local-only/SKILL.md"),
+            "---\nname: local-only\n---\n# l\n",
+        )
+        .unwrap();
+        fs::write(
+            fx.project_dir.join("Skillfile"),
+            "github  skill  mattpocock/skills  skills/productivity/grilling\n",
+        )
+        .unwrap();
+
+        let plan = fx.app().project_import_dry_run().unwrap();
+        assert_eq!(plan.skillfile_entries.len(), 1);
+        assert!(plan.leftovers.iter().any(|n| n == "local-only"));
+
+        let imported = fx
+            .app()
+            .project_import_from_skillfile("personal")
+            .unwrap();
+        assert_eq!(imported, vec!["grilling".to_string()]);
+
+        let adopted = fx
+            .app()
+            .project_adopt_local(
+                "personal",
+                &["local-only=authored".into(), "grilling=skip".into()],
+            )
+            .unwrap();
+        assert!(adopted.iter().any(|(n, m)| n == "local-only" && m.contains("authored")));
+        // skipped leftovers remain unlocked Drift if not locked — grilling is locked.
+        assert!(fx.app().detect_drift().unwrap().is_empty());
     }
 
     #[test]

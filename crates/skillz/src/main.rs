@@ -178,6 +178,21 @@ enum ProjectCommands {
         #[arg(long, default_value = ".agents/skills")]
         skills_dir: String,
     },
+    /// Import skills from Skillfile / adopt local leftovers
+    Import {
+        /// Report detection only
+        #[arg(long)]
+        dry_run: bool,
+        /// Import github Skillfile entries into this Library
+        #[arg(long = "from", value_name = "SOURCE")]
+        from: Option<String>,
+        /// Target Library Binding for import/adopt
+        #[arg(long)]
+        library: Option<String>,
+        /// Adopt leftover local skills: `name=upstream|authored|skip` (repeatable)
+        #[arg(long = "adopt-local")]
+        adopt_local: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -493,6 +508,71 @@ fn run() -> skillz_core::Result<()> {
                 for b in &config.bindings {
                     let ro = if b.read_only { "ro" } else { "rw" };
                     println!("  - {} [{ro}] {}", b.name, b.url);
+                }
+                Ok(())
+            }
+            ProjectCommands::Import {
+                dry_run,
+                from,
+                library,
+                adopt_local,
+            } => {
+                if dry_run {
+                    let plan = app.project_import_dry_run()?;
+                    println!("skills_dir: {}", plan.skills_dir.display());
+                    println!(
+                        "skillfile: {}",
+                        plan.skillfile
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(none)".into())
+                    );
+                    println!("skillfile entries:");
+                    for e in &plan.skillfile_entries {
+                        println!("  - {} ({})", e.name, e.source);
+                    }
+                    println!("local skills: {}", plan.local_skills.join(", "));
+                    println!("leftovers:");
+                    for name in &plan.leftovers {
+                        println!("  - {name}");
+                    }
+                    return Ok(());
+                }
+                let mut did_work = false;
+                if let Some(ref from_src) = from {
+                    if from_src != "skillfile" {
+                        return Err(skillz_core::SkillzError::Message(format!(
+                            "unknown --from `{from_src}` (supported: skillfile)"
+                        )));
+                    }
+                    let library = library.as_deref().ok_or_else(|| {
+                        skillz_core::SkillzError::Message(
+                            "`project import --from skillfile` requires --library".into(),
+                        )
+                    })?;
+                    let imported = app.project_import_from_skillfile(library)?;
+                    println!("imported {} Skillfile entr(y/ies)", imported.len());
+                    for name in imported {
+                        println!("  - {name}");
+                    }
+                    did_work = true;
+                }
+                if !adopt_local.is_empty() {
+                    let library = library.as_deref().ok_or_else(|| {
+                        skillz_core::SkillzError::Message(
+                            "`--adopt-local` requires --library".into(),
+                        )
+                    })?;
+                    let results = app.project_adopt_local(library, &adopt_local)?;
+                    for (name, msg) in results {
+                        println!("{name}: {msg}");
+                    }
+                    did_work = true;
+                }
+                if !did_work {
+                    return Err(skillz_core::SkillzError::Message(
+                        "specify --dry-run, --from skillfile, and/or --adopt-local".into(),
+                    ));
                 }
                 Ok(())
             }
