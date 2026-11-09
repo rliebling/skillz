@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use skillz_core::{default_config_dir, App, SkillzPaths};
+use skillz_core::{default_config_dir, App, DriftReason, SkillzPaths};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +24,27 @@ struct Cli {
 enum Commands {
     /// Show Managed Project bindings and installations
     Status,
+    /// Scaffold a new Authored skill in the Project skills dir
+    New {
+        /// Skill name (directory under skills_dir)
+        name: String,
+        /// Optional tags written into SKILL.md frontmatter
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Formalize a tested Installation into a Library Catalog Entry + Lock
+    Libcommit {
+        /// Skill name under the Project skills dir
+        name: String,
+        /// Target Library Binding name
+        #[arg(long)]
+        library: String,
+        /// How to record the Catalog Entry
+        #[arg(long = "as", value_name = "KIND")]
+        as_kind: LibcommitKind,
+    },
+    /// Report Installation Drift against Locks
+    Drift,
     /// Manage Libraries in the user registry
     Library {
         #[command(subcommand)]
@@ -34,6 +55,12 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommands,
     },
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum LibcommitKind {
+    Authored,
+    Upstream,
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,6 +154,47 @@ fn run() -> skillz_core::Result<()> {
                 }
             }
             println!("{}", report.message);
+            Ok(())
+        }
+        Some(Commands::New { name, tags }) => {
+            let path = app.skill_new(&name, &tags)?;
+            println!("scaffolded skill at {}", path.display());
+            println!("(Drift until `skillz libcommit`)");
+            Ok(())
+        }
+        Some(Commands::Libcommit {
+            name,
+            library,
+            as_kind,
+        }) => match as_kind {
+            LibcommitKind::Authored => {
+                let lock = app.libcommit_authored(&name, &library)?;
+                println!(
+                    "libcommit `{name}` → library `{library}` as owned ({})",
+                    lock.content_hash
+                );
+                Ok(())
+            }
+            LibcommitKind::Upstream => Err(skillz_core::SkillzError::Message(
+                "`libcommit --as upstream` is not implemented yet".into(),
+            )),
+        },
+        Some(Commands::Drift) => {
+            let items = app.detect_drift()?;
+            if items.is_empty() {
+                println!("no drift");
+                return Ok(());
+            }
+            for item in items {
+                let reason = match &item.reason {
+                    DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
+                    DriftReason::MissingFiles => "missing installation files".to_string(),
+                    DriftReason::HashMismatch { .. } => {
+                        "content hash differs from Lock".to_string()
+                    }
+                };
+                println!("{}\t{reason}", item.name);
+            }
             Ok(())
         }
         Some(Commands::Library { command }) => match command {

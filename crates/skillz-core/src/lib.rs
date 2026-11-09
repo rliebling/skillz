@@ -9,11 +9,13 @@ use thiserror::Error;
 pub mod library;
 pub mod project;
 pub mod registry;
+pub mod skill;
 pub mod vcs;
 
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
+pub use skill::{DriftItem, DriftReason, EntryKind, InstallationLock};
 pub use vcs::{infer_vcs, Vcs};
 
 /// Filesystem roots skillz resolves against for a given invocation.
@@ -158,6 +160,138 @@ impl App {
             self.save_registry(&registry)?;
         }
         Ok(config)
+    }
+
+    fn require_managed(&self) -> Result<ProjectConfig> {
+        let cfg_path = ProjectConfig::path(&self.paths.cwd);
+        if !cfg_path.is_file() {
+            return Err(SkillzError::Message(
+                "not a Managed Project (no .skillz/skillz.toml); run `skillz project init`".into(),
+            ));
+        }
+        ProjectConfig::load(&self.paths.cwd)
+    }
+
+    fn skills_root(&self, config: &ProjectConfig) -> PathBuf {
+        self.paths.cwd.join(&config.skills_dir)
+    }
+
+    /// Scaffold a new Authored skill in the Project skills dir (Drift until libcommit).
+    pub fn skill_new(&self, name: &str, tags: &[String]) -> Result<PathBuf> {
+        let config = self.require_managed()?;
+        let root = self.skills_root(&config);
+        skill::scaffold_skill(&root, name, tags)
+    }
+
+    /// Detect Drift for skills present under skills_dir vs the Project Lock.
+    pub fn detect_drift(&self) -> Result<Vec<DriftItem>> {
+        let config = self.require_managed()?;
+        let lock = ProjectLock::load(&self.paths.cwd)?;
+        let root = self.skills_root(&config);
+        let mut items = Vec::new();
+        if root.is_dir() {
+            for entry in std::fs::read_dir(&root).map_err(|e| {
+                SkillzError::Message(format!("failed to read {}: {e}", root.display()))
+            })? {
+                let entry = entry.map_err(|e| {
+                    SkillzError::Message(format!("failed to read {}: {e}", root.display()))
+                })?;
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                match lock.installations.get(&name) {
+                    None => items.push(DriftItem {
+                        name,
+                        reason: DriftReason::Unlocked,
+                    }),
+                    Some(rec) => match skill::content_hash(&path) {
+                        Ok(actual) if actual == rec.content_hash => {}
+                        Ok(actual) => items.push(DriftItem {
+                            name,
+                            reason: DriftReason::HashMismatch {
+                                locked: rec.content_hash.clone(),
+                                actual,
+                            },
+                        }),
+                        Err(_) => items.push(DriftItem {
+                            name,
+                            reason: DriftReason::MissingFiles,
+                        }),
+                    },
+                }
+            }
+        }
+        for name in lock.installations.keys() {
+            let path = skill::skill_dir(&root, name);
+            if !path.is_dir() {
+                items.push(DriftItem {
+                    name: name.clone(),
+                    reason: DriftReason::MissingFiles,
+                });
+            }
+        }
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(items)
+    }
+
+    /// Formalize a tested Installation into a writable Library as an Owned Entry.
+    pub fn libcommit_authored(
+        &self,
+        name: &str,
+        library_name: &str,
+    ) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let config = self.require_managed()?;
+        let binding = config
+            .bindings
+            .iter()
+            .find(|b| b.name == library_name)
+            .ok_or_else(|| {
+                SkillzError::Message(format!(
+                    "library `{library_name}` is not a Binding on this Managed Project"
+                ))
+            })?;
+        if binding.read_only {
+            return Err(SkillzError::Message(format!(
+                "library `{library_name}` is read-only; choose a writable Binding"
+            )));
+        }
+
+        let registry = self.load_registry()?;
+        let record = registry.libraries.get(library_name).ok_or_else(|| {
+            SkillzError::Message(format!(
+                "library `{library_name}` is not in the local registry"
+            ))
+        })?;
+        if record.read_only {
+            return Err(SkillzError::Message(format!(
+                "library `{library_name}` is marked read-only in the registry"
+            )));
+        }
+
+        let project_skill = skill::skill_dir(&self.skills_root(&config), name);
+        if !project_skill.is_dir() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found under {}",
+                config.skills_dir
+            )));
+        }
+        let hash = skill::content_hash(&project_skill)?;
+        let owned = record.path.join(crate::library::SKILLS_DIR).join(name);
+        skill::copy_skill_tree(&project_skill, &owned)?;
+
+        let install = InstallationLock {
+            library: library_name.to_string(),
+            entry_kind: EntryKind::Owned,
+            content_hash: hash,
+            source: None,
+        };
+        let mut lock = ProjectLock::load(&self.paths.cwd)?;
+        lock.installations.insert(name.to_string(), install.clone());
+        lock.save(&self.paths.cwd)?;
+        Ok(install)
     }
 
     /// Ensure the config directory exists.
@@ -409,6 +543,62 @@ mod tests {
             .project_init(&["missing".into()], None)
             .unwrap_err();
         assert!(err.to_string().contains("not in the local registry"));
+    }
+
+    #[test]
+    fn new_then_libcommit_authored_clears_drift() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        let path = fx
+            .app()
+            .skill_new("demo-skill", &["process".into()])
+            .unwrap();
+        assert!(path.join("SKILL.md").is_file());
+
+        let drift = fx.app().detect_drift().unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].name, "demo-skill");
+        assert_eq!(drift[0].reason, DriftReason::Unlocked);
+
+        let lock = fx
+            .app()
+            .libcommit_authored("demo-skill", "personal")
+            .unwrap();
+        assert_eq!(lock.library, "personal");
+        assert_eq!(lock.entry_kind, EntryKind::Owned);
+        assert!(fx
+            .libs_dir
+            .join("personal/skills/demo-skill/SKILL.md")
+            .is_file());
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+
+        let project_hash = skill::content_hash(&path).unwrap();
+        assert_eq!(project_hash, lock.content_hash);
+    }
+
+    #[test]
+    fn libcommit_rejects_read_only_library() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("company"), "company")
+            .unwrap();
+        // Mark registry record read-only via add path: re-register after init is blocked,
+        // so mutate registry directly.
+        let mut reg = fx.app().load_registry().unwrap();
+        reg.libraries.get_mut("company").unwrap().read_only = true;
+        fx.app().save_registry(&reg).unwrap();
+        fx.app()
+            .project_init(&["company:ro".into()], None)
+            .unwrap();
+        fx.app().skill_new("x", &[]).unwrap();
+        let err = fx.app().libcommit_authored("x", "company").unwrap_err();
+        assert!(err.to_string().contains("read-only"));
     }
 
     #[test]

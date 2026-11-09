@@ -7,6 +7,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::registry::LibraryRecord;
+use crate::skill::InstallationLock;
 use crate::vcs::{infer_vcs, Vcs};
 use crate::{Result, SkillzError};
 
@@ -84,11 +85,10 @@ impl ProjectConfig {
 }
 
 /// Lock file for Installations (`PROJECT/.skillz/skillz.lock`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectLock {
-    /// Map of skill name → lock records (empty until later tickets).
     #[serde(default)]
-    pub installations: std::collections::BTreeMap<String, toml::Value>,
+    pub installations: std::collections::BTreeMap<String, InstallationLock>,
 }
 
 impl ProjectLock {
