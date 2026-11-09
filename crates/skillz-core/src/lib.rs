@@ -8,6 +8,7 @@ use thiserror::Error;
 
 pub mod catalog;
 pub mod fetch;
+pub mod hooks;
 pub mod library;
 pub mod project;
 pub mod registry;
@@ -95,6 +96,13 @@ pub struct LibraryListEntry {
 pub struct ListRow {
     pub entry: CatalogEntry,
     pub availability: Availability,
+}
+
+/// Drift for one Managed Project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDrift {
+    pub project: PathBuf,
+    pub items: Vec<DriftItem>,
 }
 
 /// Result of [`App::add_skill`].
@@ -228,9 +236,20 @@ impl App {
 
     /// Detect Drift for skills present under skills_dir vs the Project Lock.
     pub fn detect_drift(&self) -> Result<Vec<DriftItem>> {
-        let config = self.require_managed()?;
-        let lock = ProjectLock::load(&self.paths.cwd)?;
-        let root = self.skills_root(&config);
+        self.detect_drift_in(&self.paths.cwd)
+    }
+
+    pub fn detect_drift_in(&self, project_root: &Path) -> Result<Vec<DriftItem>> {
+        let cfg_path = ProjectConfig::path(project_root);
+        if !cfg_path.is_file() {
+            return Err(SkillzError::Message(format!(
+                "not a Managed Project: {}",
+                project_root.display()
+            )));
+        }
+        let config = ProjectConfig::load(project_root)?;
+        let lock = ProjectLock::load(project_root)?;
+        let root = project_root.join(&config.skills_dir);
         let mut items = Vec::new();
         if root.is_dir() {
             for entry in std::fs::read_dir(&root).map_err(|e| {
@@ -277,6 +296,48 @@ impl App {
         }
         items.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(items)
+    }
+
+    /// Drift across Managed Projects recorded in the user registry.
+    pub fn drift_report(&self, project_filter: Option<&Path>) -> Result<Vec<ProjectDrift>> {
+        let mut projects = Vec::new();
+        if let Some(p) = project_filter {
+            projects.push(canonicalize_or_clone(p));
+        } else {
+            let registry = self.load_registry()?;
+            for p in registry.projects {
+                let p = canonicalize_or_clone(&p);
+                if !projects.iter().any(|x| x == &p) {
+                    projects.push(p);
+                }
+            }
+            if ProjectConfig::path(&self.paths.cwd).is_file() {
+                let cwd = canonicalize_or_clone(&self.paths.cwd);
+                if !projects.iter().any(|p| p == &cwd) {
+                    projects.push(cwd);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for project in projects {
+            let items = self.detect_drift_in(&project)?;
+            if !items.is_empty() {
+                out.push(ProjectDrift { project, items });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn allow_drift_env() -> bool {
+        matches!(
+            std::env::var("SKILLZ_ALLOW_DRIFT").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+        )
+    }
+
+    pub fn hooks_install(&self) -> Result<PathBuf> {
+        self.require_managed()?;
+        hooks::install_git_pre_commit(&self.paths.cwd)
     }
 
     /// List Catalog Entries from bound Libraries (or a single `--library`).
@@ -714,6 +775,10 @@ impl App {
     }
 }
 
+fn canonicalize_or_clone(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn validate_library_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(SkillzError::Message(
@@ -970,6 +1035,29 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn drift_check_and_hooks_install() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("drifty", &[]).unwrap();
+
+        let report = fx.app().drift_report(None).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].items[0].name, "drifty");
+
+        fs::create_dir_all(fx.project_dir.join(".git/hooks")).unwrap();
+        let hook = fx.app().hooks_install().unwrap();
+        assert!(hook.is_file());
+        let body = fs::read_to_string(&hook).unwrap();
+        assert!(body.contains("skillz drift --check"));
+        assert!(body.contains("SKILLZ_ALLOW_DRIFT"));
     }
 
     #[test]

@@ -54,7 +54,22 @@ enum Commands {
         source: Option<String>,
     },
     /// Report Installation Drift against Locks
-    Drift,
+    Drift {
+        /// Exit non-zero when Drift is present (for hooks)
+        #[arg(long)]
+        check: bool,
+        /// Limit to one Managed Project path
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Allow Drift (also via SKILLZ_ALLOW_DRIFT=1)
+        #[arg(long)]
+        allow_drift: bool,
+    },
+    /// Install git/jj Drift hooks for this Managed Project
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommands,
+    },
     /// List Catalog Entries from bound Libraries
     List {
         /// Restrict to one Library Binding
@@ -119,6 +134,12 @@ enum LibraryCommands {
     },
     /// List registered Libraries
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCommands {
+    /// Install the git pre-commit Drift gate
+    Install,
 }
 
 #[derive(Debug, Subcommand)]
@@ -238,24 +259,50 @@ fn run() -> skillz_core::Result<()> {
                 Ok(())
             }
         },
-        Some(Commands::Drift) => {
-            let items = app.detect_drift()?;
-            if items.is_empty() {
+        Some(Commands::Drift {
+            check,
+            project,
+            allow_drift,
+        }) => {
+            if allow_drift || App::allow_drift_env() {
+                if check {
+                    println!("drift check skipped (--allow-drift / SKILLZ_ALLOW_DRIFT)");
+                }
+                return Ok(());
+            }
+            let report = app.drift_report(project.as_deref())?;
+            if report.is_empty() {
                 println!("no drift");
                 return Ok(());
             }
-            for item in items {
-                let reason = match &item.reason {
-                    DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
-                    DriftReason::MissingFiles => "missing installation files".to_string(),
-                    DriftReason::HashMismatch { .. } => {
-                        "content hash differs from Lock".to_string()
-                    }
-                };
-                println!("{}\t{reason}", item.name);
+            for proj in &report {
+                println!("project: {}", proj.project.display());
+                for item in &proj.items {
+                    let reason = match &item.reason {
+                        DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
+                        DriftReason::MissingFiles => "missing installation files".to_string(),
+                        DriftReason::HashMismatch { .. } => {
+                            "content hash differs from Lock".to_string()
+                        }
+                    };
+                    println!("  {}\t{reason}", item.name);
+                }
+            }
+            if check {
+                return Err(skillz_core::SkillzError::Message(
+                    "drift detected; commit blocked (use --allow-drift or SKILLZ_ALLOW_DRIFT=1)"
+                        .into(),
+                ));
             }
             Ok(())
         }
+        Some(Commands::Hooks { command }) => match command {
+            HooksCommands::Install => {
+                let path = app.hooks_install()?;
+                println!("installed drift gate at {}", path.display());
+                Ok(())
+            }
+        },
         Some(Commands::List {
             library,
             tags,
