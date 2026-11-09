@@ -50,6 +50,12 @@ skillz library init ~/code/my-skills --name personal
 # or register an existing checkout:
 skillz library add ~/code/acme-skills --name company --read-only
 skillz library list
+
+# Bulk-add Upstream Catalog Entries from a GitHub skills repo (Library only; no Project install):
+skillz library import github:mattpocock/skills --library personal
+skillz library import https://github.com/mattpocock/skills --library personal --dry-run
+skillz library import github:mattpocock/skills --library personal --path skills/engineering
+skillz library import github:mattpocock/skills --library personal -i
 ```
 
 The user registry (`~/.config/skillz/registry.toml`) maps Library **name → local path**. Project Bindings store the shared name plus remote URL so other machines can resolve the same Library.
@@ -137,7 +143,7 @@ skillz drift --check                 # non-zero exit for hooks
 skillz hooks install
 ```
 
-In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays.
+In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays. Confirming Remove warns (soft) when a retained Installation appears to depend on the skill being dropped.
 
 - **git:** pre-commit runs `skillz drift --check` on the Managed Project.
 - **jj:** repo-local alias `jj push-with-checks` (drift check, then `jj git push`). Ordinary `jj git push` stays unwrapped.

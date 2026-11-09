@@ -47,6 +47,24 @@ Decisions:
 - Committed Project Bindings use shared `name` + Library remote URL; local registry maps name → path (user-global registry, not per-project).
 - VCS inferred: `.jj/` → jj, else git; optional `--vcs` escape hatch only.
 
+### A2. Bulk-import Upstream from a GitHub skills repo
+
+Catalog-only: upsert Upstream Catalog Entries into a writable Library. Does **not** materialize Project or `--user` Installations (use `add` later to install selectively).
+
+```text
+$ skillz library import github:mattpocock/skills --library personal
+$ skillz library import https://github.com/mattpocock/skills --library personal --dry-run
+$ skillz library import github:mattpocock/skills --library personal --path skills/engineering
+$ skillz library import github:mattpocock/skills --library personal -i   # multi-select
+```
+
+Decisions:
+- Accept `github:owner/repo[/path][@rev]` and `https://github.com/owner/repo…`; normalize to canonical `github:…@rev` in the catalog (ADR 0003).
+- Discover every `**/SKILL.md` under the repo (honoring optional source path + `--path` prefix); skill name = containing directory name.
+- `--dry-run` prints the plan; `-i` multi-selects a subset; `--dry-run -i` errors.
+- Name collision with a different existing source → skip + warn; identical → no-op.
+- Distinct from `project import` (Skillfile / adopt local leftovers into a Managed Project).
+
 ## B. Initialize a new Managed Project
 
 ```text
