@@ -433,8 +433,10 @@ fn run() -> skillz_core::Result<()> {
         }
         Some(Commands::Hooks { command }) => match command {
             HooksCommands::Install => {
-                let path = app.hooks_install()?;
-                println!("installed drift gate at {}", path.display());
+                let paths = app.hooks_install()?;
+                for path in paths {
+                    println!("installed drift gate at {}", path.display());
+                }
                 Ok(())
             }
         },

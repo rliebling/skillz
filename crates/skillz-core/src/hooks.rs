@@ -75,6 +75,50 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Install repo-local `jj push-with-checks` alias (does not wrap plain `jj git push`).
+pub fn install_jj_push_with_checks(project_root: &Path) -> Result<std::path::PathBuf> {
+    if infer_vcs(project_root) != Some(Vcs::Jj) {
+        return Err(SkillzError::Message(format!(
+            "not a jj repo: {}",
+            project_root.display()
+        )));
+    }
+    let config_path = project_root.join(".jj").join("repo").join("config.toml");
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to create {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let existing = if config_path.is_file() {
+        fs::read_to_string(&config_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if existing.contains("push-with-checks") {
+        return Ok(config_path);
+    }
+    let alias = r#"
+# skillz drift gate
+[aliases]
+push-with-checks = ["util", "exec", "--", "sh", "-c", "if [ \"${SKILLZ_ALLOW_DRIFT:-}\" = 1 ] || [ \"${SKILLZ_ALLOW_DRIFT:-}\" = true ]; then jj git push \"$@\"; else skillz drift --check --project \"$PWD\" && jj git push \"$@\"; fi", ""]
+"#;
+    let mut new_contents = existing;
+    if !new_contents.ends_with('\n') && !new_contents.is_empty() {
+        new_contents.push('\n');
+    }
+    new_contents.push_str(alias);
+    fs::write(&config_path, new_contents).map_err(|e| {
+        SkillzError::Message(format!(
+            "failed to write {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    Ok(config_path)
+}
+
 fn resolve_git_dir(project_root: &Path) -> Result<std::path::PathBuf> {
     match infer_vcs(project_root) {
         Some(Vcs::Git) | Some(Vcs::Jj) => {}

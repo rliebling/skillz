@@ -356,13 +356,6 @@ impl App {
         }
     }
 
-    fn scope_root_for_errors(&self) -> PathBuf {
-        match self.scope {
-            Scope::Project => self.paths.cwd.clone(),
-            Scope::User => self.paths.user_skills_dir(),
-        }
-    }
-
     /// Dry-run import detection for the cwd Project.
     pub fn project_import_dry_run(&self) -> Result<ImportPlan> {
         import::build_plan(&self.paths.cwd)
@@ -604,14 +597,32 @@ impl App {
         )
     }
 
-    pub fn hooks_install(&self) -> Result<PathBuf> {
+    pub fn hooks_install(&self) -> Result<Vec<PathBuf>> {
         if self.scope == Scope::User {
             return Err(SkillzError::Message(
                 "hooks install applies to Managed Projects, not user scope".into(),
             ));
         }
         self.require_managed()?;
-        hooks::install_git_pre_commit(&self.paths.cwd)
+        let mut installed = Vec::new();
+        match hooks::install_git_pre_commit(&self.paths.cwd) {
+            Ok(path) => installed.push(path),
+            Err(err) => {
+                // jj-only checkouts may still get the alias below.
+                if infer_vcs(&self.paths.cwd) != Some(Vcs::Jj) {
+                    return Err(err);
+                }
+            }
+        }
+        if infer_vcs(&self.paths.cwd) == Some(Vcs::Jj) {
+            installed.push(hooks::install_jj_push_with_checks(&self.paths.cwd)?);
+        }
+        if installed.is_empty() {
+            return Err(SkillzError::Message(
+                "no hooks installed (need git and/or jj metadata)".into(),
+            ));
+        }
+        Ok(installed)
     }
 
     /// List Catalog Entries from bound Libraries (or a single `--library`).
@@ -1748,11 +1759,32 @@ mod tests {
         assert_eq!(report[0].items[0].name, "drifty");
 
         fs::create_dir_all(fx.project_dir.join(".git/hooks")).unwrap();
-        let hook = fx.app().hooks_install().unwrap();
-        assert!(hook.is_file());
-        let body = fs::read_to_string(&hook).unwrap();
+        let hooks = fx.app().hooks_install().unwrap();
+        assert!(!hooks.is_empty());
+        let body = fs::read_to_string(&hooks[0]).unwrap();
         assert!(body.contains("skillz drift --check"));
         assert!(body.contains("SKILLZ_ALLOW_DRIFT"));
+    }
+
+    #[test]
+    fn hooks_install_jj_push_with_checks_alias() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fs::create_dir_all(fx.project_dir.join(".jj/repo")).unwrap();
+        let hooks = fx.app().hooks_install().unwrap();
+        let jj_cfg = hooks
+            .iter()
+            .find(|p| p.ends_with("config.toml"))
+            .expect("jj config");
+        let body = fs::read_to_string(jj_cfg).unwrap();
+        assert!(body.contains("push-with-checks"));
+        assert!(body.contains("skillz drift --check"));
+        assert!(!body.contains("skillz push"));
     }
 
     #[test]
