@@ -11,15 +11,18 @@ pub mod deps;
 pub mod fetch;
 pub mod hooks;
 pub mod import;
+pub mod interactive;
 pub mod library;
 pub mod project;
 pub mod registry;
 pub mod skill;
 pub mod source;
+pub mod ui;
 pub mod vcs;
 pub mod vcs_ops;
 
 pub use import::{AdoptAs, ImportPlan, SkillfileEntry};
+pub use ui::{Prompter, SelectAllPrompter};
 
 pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
@@ -1538,6 +1541,37 @@ mod tests {
         app.ensure_config_dir().unwrap();
         assert!(nested.is_dir());
         assert_eq!(app.paths().registry_path(), nested.join("registry.toml"));
+    }
+
+    #[test]
+    fn interactive_add_uses_prompter_without_ratatui() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app()
+            .skill_new("a", &["t".into()])
+            .unwrap();
+        fx.app().libcommit_authored("a", "personal").unwrap();
+        fx.app()
+            .skill_new("b", &["t".into()])
+            .unwrap();
+        fx.app().libcommit_authored("b", "personal").unwrap();
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/a")).ok();
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/b")).ok();
+        let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
+        lock.installations.clear();
+        lock.save(&fx.project_dir).unwrap();
+
+        let mut ui = SelectAllPrompter;
+        let added = fx
+            .app()
+            .interactive_add_by_tag(&["t".into()], None, &mut ui)
+            .unwrap();
+        assert_eq!(added.len(), 2);
     }
 
     #[test]

@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod tui;
+
 use clap::{Parser, Subcommand};
 use skillz_core::{default_config_dir, AddOutcome, App, DriftReason, Scope, SkillzPaths};
+use tui::RatatuiPrompter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -87,6 +90,9 @@ enum Commands {
         /// Allow Drift (also via SKILLZ_ALLOW_DRIFT=1)
         #[arg(long)]
         allow_drift: bool,
+        /// Interactive next-actions (Ratatui)
+        #[arg(short = 'i', long)]
+        interactive: bool,
     },
     /// Install git/jj Drift hooks for this Managed Project
     Hooks {
@@ -118,6 +124,9 @@ enum Commands {
         /// Also add detected sibling dependencies (best-effort)
         #[arg(long)]
         with_deps: bool,
+        /// Interactive multi-select (Ratatui)
+        #[arg(short = 'i', long)]
+        interactive: bool,
     },
     /// Manage Libraries in the user registry
     Library {
@@ -198,6 +207,9 @@ enum ProjectCommands {
         /// Adopt leftover local skills: `name=upstream|authored|skip` (repeatable)
         #[arg(long = "adopt-local")]
         adopt_local: Vec<String>,
+        /// Interactive per-skill adopt (Ratatui)
+        #[arg(short = 'i', long)]
+        interactive: bool,
     },
 }
 
@@ -398,11 +410,17 @@ fn run() -> skillz_core::Result<()> {
             check,
             project,
             allow_drift,
+            interactive,
         }) => {
             if allow_drift || App::allow_drift_env() {
                 if check {
                     println!("drift check skipped (--allow-drift / SKILLZ_ALLOW_DRIFT)");
                 }
+                return Ok(());
+            }
+            if interactive {
+                let mut ui = RatatuiPrompter;
+                app.interactive_drift(&mut ui)?;
                 return Ok(());
             }
             let report = app.drift_report(project.as_deref())?;
@@ -471,7 +489,21 @@ fn run() -> skillz_core::Result<()> {
             library,
             tags,
             with_deps,
+            interactive,
         }) => {
+            if interactive {
+                if tags.is_empty() {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`add -i` requires --tag filters to multi-select among".into(),
+                    ));
+                }
+                let mut ui = RatatuiPrompter;
+                let added = app.interactive_add_by_tag(&tags, library.as_deref(), &mut ui)?;
+                for skill_name in added {
+                    println!("added {skill_name}");
+                }
+                return Ok(());
+            }
             if !tags.is_empty() {
                 let results = app.add_skills_by_tag(&tags, library.as_deref())?;
                 if results.is_empty() {
@@ -481,6 +513,16 @@ fn run() -> skillz_core::Result<()> {
                 for (skill_name, outcome, warn) in results {
                     if let Some(w) = warn {
                         eprintln!("warning: {w}");
+                    }
+                    if with_deps {
+                        let (_, _, missing) =
+                            app.add_skill_with_deps(&skill_name, library.as_deref(), true)?;
+                        if !missing.is_empty() {
+                            eprintln!(
+                                "warning: possible sibling deps not present for {skill_name}: {}",
+                                missing.join(", ")
+                            );
+                        }
                     }
                     println!("{}: {}", skill_name, format_add_outcome(&outcome));
                 }
@@ -567,7 +609,21 @@ fn run() -> skillz_core::Result<()> {
                 from,
                 library,
                 adopt_local,
+                interactive,
             } => {
+                if interactive {
+                    let library = library.as_deref().ok_or_else(|| {
+                        skillz_core::SkillzError::Message(
+                            "`project import -i` requires --library".into(),
+                        )
+                    })?;
+                    let mut ui = RatatuiPrompter;
+                    let results = app.interactive_import_adopt(library, &mut ui)?;
+                    for (name, msg) in results {
+                        println!("{name}: {msg}");
+                    }
+                    return Ok(());
+                }
                 if dry_run {
                     let plan = app.project_import_dry_run()?;
                     println!("skills_dir: {}", plan.skills_dir.display());
