@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod catalog;
+pub mod deps;
 pub mod fetch;
 pub mod hooks;
 pub mod import;
@@ -687,12 +688,36 @@ impl App {
         avail
     }
 
+    /// Missing sibling dependency warnings for a skill path.
+    pub fn sibling_dep_warnings(
+        &self,
+        skill_path: &Path,
+        known_siblings: &[String],
+        present: &[String],
+    ) -> Result<Vec<String>> {
+        let deps = deps::detect_sibling_deps(skill_path, known_siblings)?;
+        Ok(deps
+            .into_iter()
+            .filter(|d| !present.iter().any(|p| p == d))
+            .collect())
+    }
+
     /// Install a Catalog Entry into the Managed Project (copy + Lock).
     pub fn add_skill(
         &self,
         name: &str,
         library_filter: Option<&str>,
     ) -> Result<(AddOutcome, Option<String>)> {
+        self.add_skill_with_deps(name, library_filter, false)
+            .map(|(outcome, warn, _)| (outcome, warn))
+    }
+
+    pub fn add_skill_with_deps(
+        &self,
+        name: &str,
+        library_filter: Option<&str>,
+        with_deps: bool,
+    ) -> Result<(AddOutcome, Option<String>, Vec<String>)> {
         skill::validate_skill_name(name)?;
         let config = self.load_scope_config()?;
         let rows = self.list_skills(library_filter, &[], false)?;
@@ -758,7 +783,33 @@ impl App {
             let install = self.write_owned_lock(name, &row.entry)?;
             AddOutcome::Installed(install)
         };
-        Ok((outcome, warn))
+
+        // Sibling dependency detection (best-effort).
+        let catalog_names: Vec<String> = self
+            .list_skills(library_filter, &[], true)?
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        let present = deps::list_skill_names(&self.scope_skills_root(&config))?;
+        let mut missing = self.sibling_dep_warnings(
+            &row.entry.skill_path,
+            &catalog_names,
+            &present,
+        )?;
+        let mut pulled = Vec::new();
+        if with_deps {
+            for dep in missing.clone() {
+                if let Ok((dep_outcome, _, nested)) =
+                    self.add_skill_with_deps(&dep, library_filter.or(Some(&row.entry.library)), true)
+                {
+                    let _ = dep_outcome;
+                    pulled.push(dep);
+                    pulled.extend(nested);
+                }
+            }
+            missing.retain(|m| !pulled.iter().any(|p| p == m));
+        }
+        Ok((outcome, warn, missing))
     }
 
     /// Add every Catalog Entry matching tag filters.

@@ -42,6 +42,9 @@ enum Commands {
         source: String,
         /// Skill name for nested lookup (`github:owner/repo NAME`)
         skill_name: Option<String>,
+        /// Also fetch detected sibling dependencies when resolvable locally (best-effort)
+        #[arg(long)]
+        with_deps: bool,
     },
     /// Formalize a tested Installation into a Library Catalog Entry + Lock
     Libcommit {
@@ -112,6 +115,9 @@ enum Commands {
         /// Add all Catalog Entries matching tags (AND)
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Also add detected sibling dependencies (best-effort)
+        #[arg(long)]
+        with_deps: bool,
     },
     /// Manage Libraries in the user registry
     Library {
@@ -279,11 +285,46 @@ fn run() -> skillz_core::Result<()> {
             println!("(Drift until `skillz libcommit`)");
             Ok(())
         }
-        Some(Commands::Fetch { source, skill_name }) => {
+        Some(Commands::Fetch {
+            source,
+            skill_name,
+            with_deps,
+        }) => {
             let (dest, pinned) = app.fetch_skill(&source, skill_name.as_deref())?;
             println!("fetched skill into {}", dest.display());
             if let Some(src) = pinned {
                 println!("source: {src}");
+            }
+            // Best-effort sibling warnings / local with-deps from same tree root.
+            if let Some(parent) = dest.parent() {
+                let known = skillz_core::deps::list_skill_names(parent).unwrap_or_default();
+                let present = known.clone();
+                let missing = app
+                    .sibling_dep_warnings(&dest, &known, &present)
+                    .unwrap_or_default();
+                if !missing.is_empty() {
+                    eprintln!(
+                        "warning: possible sibling deps not present: {} (best-effort)",
+                        missing.join(", ")
+                    );
+                }
+                if with_deps {
+                    let root = if source.starts_with("github:") {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(&source))
+                    };
+                    if let Some(root) = root {
+                        for dep in missing {
+                            if app
+                                .fetch_skill(root.to_str().unwrap_or(""), Some(&dep))
+                                .is_ok()
+                            {
+                                println!("fetched dependency `{dep}`");
+                            }
+                        }
+                    }
+                }
             }
             println!("(Drift until `skillz libcommit`)");
             Ok(())
@@ -427,6 +468,7 @@ fn run() -> skillz_core::Result<()> {
             name,
             library,
             tags,
+            with_deps,
         }) => {
             if !tags.is_empty() {
                 let results = app.add_skills_by_tag(&tags, library.as_deref())?;
@@ -447,9 +489,16 @@ fn run() -> skillz_core::Result<()> {
                     "provide a skill name or --tag".into(),
                 ));
             };
-            let (outcome, warn) = app.add_skill(&name, library.as_deref())?;
+            let (outcome, warn, missing) =
+                app.add_skill_with_deps(&name, library.as_deref(), with_deps)?;
             if let Some(w) = warn {
                 eprintln!("warning: {w}");
+            }
+            if !missing.is_empty() {
+                eprintln!(
+                    "warning: possible sibling deps not present: {} (best-effort; pass --with-deps)",
+                    missing.join(", ")
+                );
             }
             println!("{name}: {}", format_add_outcome(&outcome));
             Ok(())
