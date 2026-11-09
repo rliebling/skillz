@@ -16,7 +16,7 @@ impl App {
         library_filter: Option<&str>,
         prompler: &mut dyn Prompter,
     ) -> Result<Vec<String>> {
-        let rows = self.list_skills(library_filter, tags, true)?;
+        let rows = self.list_skills(library_filter, tags, true, false)?;
         if rows.is_empty() {
             return Ok(Vec::new());
         }

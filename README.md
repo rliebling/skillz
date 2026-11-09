@@ -77,11 +77,14 @@ This writes `.skillz/skillz.toml` and an empty `.skillz/skillz.lock`. No skills 
 ### 3. Discover and install from a Library
 
 ```bash
-skillz list
+skillz list                         # Project Installations only (aligned columns)
+skillz list --catalog               # full bound Library Catalog
 skillz list --tag elixir --tag phoenix
 skillz list --dedupe
-skillz add ecto-thinking
-skillz add -i                       # interactive multi-select (all Catalog Entries; / to filter)
+skillz add ecto-thinking            # prompts to add missing sibling deps
+skillz add ecto-thinking --with-deps
+skillz add ecto-thinking --no-deps
+skillz add -i                       # interactive multi-select (Catalog; / to filter)
 skillz add --tag elixir -i          # optional pre-filter, then multi-select
 ```
 

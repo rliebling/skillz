@@ -64,6 +64,11 @@ pub trait Prompter {
         self.multi_select(title, &labels)
     }
     fn choose(&mut self, title: &str, options: &[String]) -> Result<usize>;
+    /// Yes/no confirm; default uses [`Self::choose`] with yes/no.
+    fn confirm(&mut self, title: &str, _detail: &str) -> Result<bool> {
+        let choice = self.choose(title, &["yes".into(), "no".into()])?;
+        Ok(choice == 0)
+    }
 }
 
 /// Non-interactive prompler for tests: selects all / first.
@@ -80,6 +85,10 @@ impl Prompter for SelectAllPrompter {
             return Err(SkillzError::Message("no options".into()));
         }
         Ok(0)
+    }
+
+    fn confirm(&mut self, _title: &str, _detail: &str) -> Result<bool> {
+        Ok(true)
     }
 }
 
@@ -113,6 +122,10 @@ impl Prompter for CancelPrompter {
 
     fn choose(&mut self, _title: &str, _options: &[String]) -> Result<usize> {
         Err(SkillzError::Message("cancelled".into()))
+    }
+
+    fn confirm(&mut self, _title: &str, _detail: &str) -> Result<bool> {
+        Ok(false)
     }
 }
 

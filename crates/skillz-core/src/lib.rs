@@ -742,15 +742,24 @@ impl App {
     }
 
     /// List Catalog Entries from bound Libraries (or a single `--library`).
+    ///
+    /// When `project_only` is true, only skills present in this Project's
+    /// skills dir and/or recorded in the Project Lock are returned.
     pub fn list_skills(
         &self,
         library_filter: Option<&str>,
         tags: &[String],
         dedupe: bool,
+        project_only: bool,
     ) -> Result<Vec<ListRow>> {
         let config = self.load_scope_config()?;
         let registry = self.load_registry()?;
         let tag_filters = catalog::normalize_tag_filters(tags);
+        let project_names = if project_only {
+            Some(self.project_skill_names(&config)?)
+        } else {
+            None
+        };
 
         let bindings: Vec<&Binding> = if let Some(name) = library_filter {
             let b = config
@@ -786,6 +795,11 @@ impl App {
             }
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             for entry in entries {
+                if let Some(names) = &project_names {
+                    if !names.contains(&entry.name) {
+                        continue;
+                    }
+                }
                 if !catalog::entry_matches_tags(&entry, &tag_filters) {
                     continue;
                 }
@@ -799,7 +813,76 @@ impl App {
                 });
             }
         }
+
+        // Project-only: include on-disk / locked skills that are not (yet) in a Library.
+        if let Some(names) = &project_names {
+            let listed: std::collections::BTreeSet<_> =
+                rows.iter().map(|r| r.entry.name.clone()).collect();
+            let lock = self.load_scope_lock()?;
+            let root = self.scope_skills_root(&config);
+            for name in names {
+                if listed.contains(name) || (dedupe && !seen.insert(name.clone())) {
+                    continue;
+                }
+                let skill_path = skill::skill_dir(&root, name);
+                let tags = if skill_path.join("SKILL.md").is_file() {
+                    catalog::read_tags(&skill_path.join("SKILL.md")).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if !tag_filters.is_empty()
+                    && !tag_filters.iter().all(|t| tags.iter().any(|e| e == t))
+                {
+                    continue;
+                }
+                let (library, content_hash, kind, source) =
+                    if let Some(install) = lock.installations.get(name) {
+                        (
+                            install.library.clone(),
+                            install.content_hash.clone(),
+                            install.entry_kind,
+                            install.source.clone(),
+                        )
+                    } else {
+                        (
+                            "-".into(),
+                            String::new(),
+                            EntryKind::Owned,
+                            None,
+                        )
+                    };
+                if let Some(lib_filter) = library_filter {
+                    if library != lib_filter {
+                        continue;
+                    }
+                }
+                let availability = self.availability_for(&config, name);
+                rows.push(ListRow {
+                    entry: CatalogEntry {
+                        name: name.clone(),
+                        library,
+                        library_path: PathBuf::new(),
+                        skill_path,
+                        tags,
+                        content_hash,
+                        kind,
+                        source,
+                    },
+                    availability,
+                });
+            }
+            rows.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
+        }
         Ok(rows)
+    }
+
+    fn project_skill_names(&self, config: &ProjectConfig) -> Result<std::collections::BTreeSet<String>> {
+        let root = self.scope_skills_root(config);
+        let mut names: std::collections::BTreeSet<String> =
+            deps::list_skill_names(&root)?.into_iter().collect();
+        let lock = self.load_scope_lock()?;
+        names.extend(lock.installations.keys().cloned());
+        Ok(names)
     }
 
     fn availability_for(&self, config: &ProjectConfig, name: &str) -> Availability {
@@ -838,6 +921,43 @@ impl App {
             .collect())
     }
 
+    /// Missing sibling deps for an installed skill (best-effort).
+    pub fn missing_sibling_deps(
+        &self,
+        name: &str,
+        library_filter: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let config = self.load_scope_config()?;
+        let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
+        if !dest.join("SKILL.md").is_file() {
+            return Ok(Vec::new());
+        }
+        let catalog_names: Vec<String> = self
+            .list_skills(library_filter, &[], true, false)?
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+        let present = deps::list_skill_names(&self.scope_skills_root(&config))?;
+        self.sibling_dep_warnings(&dest, &catalog_names, &present)
+    }
+
+    /// Forward sibling deps of `name` that are not in `also_removing` (still retained).
+    pub fn forward_deps_remaining(
+        &self,
+        name: &str,
+        also_removing: &[String],
+    ) -> Result<Vec<String>> {
+        let config = self.load_scope_config()?;
+        let root = self.scope_skills_root(&config);
+        let path = skill::skill_dir(&root, name);
+        let known = deps::list_skill_names(&root)?;
+        let deps = deps::detect_sibling_deps(&path, &known)?;
+        Ok(deps
+            .into_iter()
+            .filter(|d| d != name && !also_removing.iter().any(|r| r == d))
+            .collect())
+    }
+
     /// Install a Catalog Entry into the Managed Project (copy + Lock).
     pub fn add_skill(
         &self,
@@ -856,7 +976,7 @@ impl App {
     ) -> Result<(AddOutcome, Option<String>, Vec<String>)> {
         skill::validate_skill_name(name)?;
         let config = self.load_scope_config()?;
-        let rows = self.list_skills(library_filter, &[], false)?;
+        let rows = self.list_skills(library_filter, &[], false, false)?;
         let matches: Vec<_> = rows.into_iter().filter(|r| r.entry.name == name).collect();
         if matches.is_empty() {
             return Err(SkillzError::Message(format!(
@@ -924,7 +1044,7 @@ impl App {
 
         // Sibling dependency detection (best-effort).
         let catalog_names: Vec<String> = self
-            .list_skills(library_filter, &[], true)?
+            .list_skills(library_filter, &[], true, false)?
             .into_iter()
             .map(|r| r.entry.name)
             .collect();
@@ -961,7 +1081,7 @@ impl App {
         tags: &[String],
         library_filter: Option<&str>,
     ) -> Result<Vec<(String, AddOutcome, Option<String>)>> {
-        let rows = self.list_skills(library_filter, tags, true)?;
+        let rows = self.list_skills(library_filter, tags, true, false)?;
         let mut out = Vec::new();
         for row in rows {
             let (outcome, warn) = self.add_skill(&row.entry.name, Some(&row.entry.library))?;
@@ -1975,6 +2095,24 @@ mod tests {
             .reverse_deps_for_remove("grilling", &["grill-with-docs".into()])
             .unwrap();
         assert!(deps.is_empty());
+
+        let forward = fx
+            .app()
+            .forward_deps_remaining("grill-with-docs", &[])
+            .unwrap();
+        assert_eq!(forward, vec!["grilling".to_string()]);
+        let forward = fx
+            .app()
+            .forward_deps_remaining("grill-with-docs", &["grilling".into()])
+            .unwrap();
+        assert!(forward.is_empty());
+
+        let missing = fx
+            .app()
+            .missing_sibling_deps("grill-with-docs", None)
+            .unwrap();
+        // grilling is present on disk, so not missing.
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -2350,11 +2488,18 @@ mod tests {
 
         let listed = fx
             .app()
-            .list_skills(None, &["elixir".into()], false)
+            .list_skills(None, &["elixir".into()], false, false)
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].entry.name, "demo-skill");
         assert!(!listed[0].availability.project);
+
+        // Default project-only list is empty until installed again.
+        let project_listed = fx
+            .app()
+            .list_skills(None, &[], false, true)
+            .unwrap();
+        assert!(project_listed.is_empty());
 
         // Warn path: present only in user skills.
         fs::create_dir_all(fx.home_dir.join(".agents/skills/demo-skill")).unwrap();

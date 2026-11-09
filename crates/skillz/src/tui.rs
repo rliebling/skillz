@@ -25,10 +25,10 @@ const DRIFT_HELP: &[&str] = &[
     "  s                 skip",
     "  c                 libcommit (Branch Lock / Overlay Fork)",
     "  p                 promote Branch Lock to Library main",
-    "  r                 remove Installation + Lock (asks confirm)",
+    "  r                 mark remove (dep options if others depend on it)",
     "",
     "Apply / quit",
-    "  Enter             apply all non-skip actions",
+    "  Enter             confirm removals (if any) then apply actions",
     "  q / Esc           quit without further applies",
     "",
     "Remove keeps the Library Catalog Entry; only Project files + Lock go away.",
@@ -103,11 +103,21 @@ struct DriftRow {
     outcome: Option<String>,
 }
 
+#[derive(Clone)]
 enum Modal {
-    ConfirmRemove {
+    /// Mark-time: retained skills depend on the skill being removed.
+    RemoveDeps {
         index: usize,
-        /// Soft warn: retained skills that appear to depend on this one.
         dependants: Vec<String>,
+        forward_deps: Vec<String>,
+    },
+    /// Apply-time: confirm the full remove set.
+    ConfirmApplyRemoves {
+        names: Vec<String>,
+        /// name -> dependants still retained (should be empty if mark-time handled)
+        reverse_notes: Vec<(String, Vec<String>)>,
+        /// name -> forward deps that will remain installed
+        forward_notes: Vec<(String, Vec<String>)>,
     },
 }
 
@@ -224,25 +234,59 @@ pub fn run_drift_board(app: &App) -> Result<()> {
 
                 if show_help {
                     draw_help_modal(frame, area, "drift keys", DRIFT_HELP);
-                } else if let Some(Modal::ConfirmRemove {
+                } else if let Some(Modal::RemoveDeps {
                     index,
                     dependants,
+                    forward_deps,
                 }) = &modal
                 {
                     let name = &rows[*index].item.name;
-                    let body = if dependants.is_empty() {
-                        "Deletes the Installation and Lock. The Library Catalog Entry is kept."
-                            .to_string()
-                    } else {
-                        format!(
-                            "Deletes the Installation and Lock. The Library Catalog Entry is kept.\nWarning: referenced by retained skill(s): {}.",
-                            dependants.join(", ")
-                        )
-                    };
+                    let mut body = format!(
+                        "`{name}` is referenced by retained skill(s):\n  {}\n",
+                        dependants.join(", ")
+                    );
+                    if !forward_deps.is_empty() {
+                        body.push_str(&format!(
+                            "\n`{name}` itself depends on (will remain):\n  {}\n",
+                            forward_deps.join(", ")
+                        ));
+                    }
+                    body.push_str(
+                        "\n[a] also mark dependants for remove\n[r] remove anyway (only this skill)\n[n] cancel",
+                    );
+                    draw_options_modal(
+                        frame,
+                        area,
+                        &format!("Remove `{name}` — dependency warning"),
+                        &body,
+                    );
+                } else if let Some(Modal::ConfirmApplyRemoves {
+                    names,
+                    reverse_notes,
+                    forward_notes,
+                }) = &modal
+                {
+                    let mut body = format!("Remove {} skill(s) from this Project:\n", names.len());
+                    for n in names {
+                        body.push_str(&format!("  - {n}\n"));
+                    }
+                    body.push_str("\nLibrary Catalog Entries are kept.\n");
+                    if !reverse_notes.is_empty() {
+                        body.push_str("\nStill referenced by retained skills:\n");
+                        for (n, deps) in reverse_notes {
+                            body.push_str(&format!("  {n} ← {}\n", deps.join(", ")));
+                        }
+                    }
+                    if !forward_notes.is_empty() {
+                        body.push_str("\nDependencies that will remain installed:\n");
+                        for (n, deps) in forward_notes {
+                            body.push_str(&format!("  {n} → {}\n", deps.join(", ")));
+                        }
+                    }
                     draw_confirm_modal(
                         frame,
                         area,
-                        &format!("Remove `{name}` from this Project?"),
+                        "Confirm removals",
                         &body,
                     );
                 }
@@ -262,22 +306,68 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                 continue;
             }
 
-            if let Some(Modal::ConfirmRemove { index, .. }) = modal {
+            if let Some(Modal::RemoveDeps {
+                index,
+                dependants,
+                ..
+            }) = modal.clone()
+            {
                 match key.code {
                     KeyCode::Char('?') => {
                         show_help = true;
                     }
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        rows[index].action = DriftAction::Remove;
+                        rows[index].outcome = None;
+                        for dep_name in &dependants {
+                            if let Some(row) = rows.iter_mut().find(|r| r.item.name == *dep_name) {
+                                row.action = DriftAction::Remove;
+                                row.outcome = None;
+                            }
+                        }
+                        status_line = format!(
+                            "queued remove for `{}` + dependants — press enter to apply",
+                            rows[index].item.name
+                        );
+                        modal = None;
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
                         rows[index].action = DriftAction::Remove;
                         rows[index].outcome = None;
                         status_line = format!(
-                            "queued remove for `{}` — press enter to apply",
+                            "queued remove for `{}` anyway — press enter to apply",
                             rows[index].item.name
                         );
                         modal = None;
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                         status_line = "remove cancelled".into();
+                        modal = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if let Some(Modal::ConfirmApplyRemoves { .. }) = &modal {
+                match key.code {
+                    KeyCode::Char('?') => {
+                        show_help = true;
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        modal = None;
+                        let (applied, errors) = apply_pending_actions(app, &mut rows);
+                        status_line = format!(
+                            "applied {applied} action(s), {errors} error(s) — ? help · q quit"
+                        );
+                        if applied == 0 && errors == 0 {
+                            status_line =
+                                "nothing to apply (set actions with ←/→ or r) — ? help · q quit"
+                                    .into();
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                        status_line = "apply cancelled".into();
                         modal = None;
                     }
                     _ => {}
@@ -302,7 +392,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     if let Some(i) = state.selected() {
                         let next = rows[i].action.next();
                         if next == DriftAction::Remove {
-                            modal = Some(confirm_remove_modal(app, &rows, i)?);
+                            queue_remove(app, &mut rows, i, &mut modal, &mut status_line)?;
                         } else {
                             rows[i].action = next;
                             rows[i].outcome = None;
@@ -313,7 +403,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     if let Some(i) = state.selected() {
                         let prev = rows[i].action.prev();
                         if prev == DriftAction::Remove {
-                            modal = Some(confirm_remove_modal(app, &rows, i)?);
+                            queue_remove(app, &mut rows, i, &mut modal, &mut status_line)?;
                         } else {
                             rows[i].action = prev;
                             rows[i].outcome = None;
@@ -340,37 +430,27 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                 }
                 KeyCode::Char('r') => {
                     if let Some(i) = state.selected() {
-                        modal = Some(confirm_remove_modal(app, &rows, i)?);
+                        queue_remove(app, &mut rows, i, &mut modal, &mut status_line)?;
                     }
                 }
                 KeyCode::Enter => {
-                    let mut applied = 0;
-                    let mut errors = 0;
-                    for row in &mut rows {
-                        if row.action == DriftAction::Skip {
-                            continue;
+                    let pending_removes: Vec<String> = rows
+                        .iter()
+                        .filter(|r| r.action == DriftAction::Remove && r.outcome.is_none())
+                        .map(|r| r.item.name.clone())
+                        .collect();
+                    if !pending_removes.is_empty() {
+                        modal = Some(build_apply_removes_modal(app, &rows, &pending_removes)?);
+                    } else {
+                        let (applied, errors) = apply_pending_actions(app, &mut rows);
+                        status_line = format!(
+                            "applied {applied} action(s), {errors} error(s) — ? help · q quit"
+                        );
+                        if applied == 0 && errors == 0 {
+                            status_line =
+                                "nothing to apply (set actions with ←/→ or r) — ? help · q quit"
+                                    .into();
                         }
-                        if row.outcome.is_some() {
-                            continue;
-                        }
-                        match app.apply_drift_action(&row.item.name, row.action) {
-                            Ok(msg) => {
-                                row.outcome = Some(msg.to_string());
-                                applied += 1;
-                            }
-                            Err(e) => {
-                                row.outcome = Some(format!("error: {e}"));
-                                errors += 1;
-                            }
-                        }
-                    }
-                    status_line = format!(
-                        "applied {applied} action(s), {errors} error(s) — ? help · q quit"
-                    );
-                    if applied == 0 && errors == 0 {
-                        status_line =
-                            "nothing to apply (set actions with ←/→ or r) — ? help · q quit"
-                                .into();
                     }
                 }
                 _ => {}
@@ -411,16 +491,100 @@ fn draw_help_modal(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, line
     );
 }
 
-fn confirm_remove_modal(app: &App, rows: &[DriftRow], index: usize) -> Result<Modal> {
-    let name = &rows[index].item.name;
+fn queue_remove(
+    app: &App,
+    rows: &mut [DriftRow],
+    index: usize,
+    modal: &mut Option<Modal>,
+    status_line: &mut String,
+) -> Result<()> {
+    let name = rows[index].item.name.clone();
     let also_removing: Vec<String> = rows
         .iter()
         .enumerate()
         .filter(|(i, r)| *i == index || r.action == DriftAction::Remove)
         .map(|(_, r)| r.item.name.clone())
         .collect();
-    let dependants = app.reverse_deps_for_remove(name, &also_removing)?;
-    Ok(Modal::ConfirmRemove { index, dependants })
+    let dependants = app.reverse_deps_for_remove(&name, &also_removing)?;
+    let forward_deps = app.forward_deps_remaining(&name, &also_removing)?;
+    if dependants.is_empty() {
+        rows[index].action = DriftAction::Remove;
+        rows[index].outcome = None;
+        *status_line = if forward_deps.is_empty() {
+            format!("queued remove for `{name}` — press enter to apply")
+        } else {
+            format!(
+                "queued remove for `{name}` (leaves deps: {}) — press enter to apply",
+                forward_deps.join(", ")
+            )
+        };
+        *modal = None;
+    } else {
+        *modal = Some(Modal::RemoveDeps {
+            index,
+            dependants,
+            forward_deps,
+        });
+    }
+    Ok(())
+}
+
+fn build_apply_removes_modal(
+    app: &App,
+    rows: &[DriftRow],
+    names: &[String],
+) -> Result<Modal> {
+    let mut reverse_notes = Vec::new();
+    let mut forward_notes = Vec::new();
+    for name in names {
+        let reverse = app.reverse_deps_for_remove(name, names)?;
+        if !reverse.is_empty() {
+            reverse_notes.push((name.clone(), reverse));
+        }
+        let forward = app.forward_deps_remaining(name, names)?;
+        if !forward.is_empty() {
+            forward_notes.push((name.clone(), forward));
+        }
+    }
+    let _ = rows;
+    Ok(Modal::ConfirmApplyRemoves {
+        names: names.to_vec(),
+        reverse_notes,
+        forward_notes,
+    })
+}
+
+fn apply_pending_actions(app: &App, rows: &mut [DriftRow]) -> (usize, usize) {
+    let mut applied = 0;
+    let mut errors = 0;
+    for row in rows.iter_mut() {
+        if row.action == DriftAction::Skip {
+            continue;
+        }
+        if row.outcome.is_some() {
+            continue;
+        }
+        match app.apply_drift_action(&row.item.name, row.action) {
+            Ok(msg) => {
+                row.outcome = Some(msg.to_string());
+                applied += 1;
+            }
+            Err(e) => {
+                row.outcome = Some(format!("error: {e}"));
+                errors += 1;
+            }
+        }
+    }
+    (applied, errors)
+}
+
+fn draw_options_modal(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    body: &str,
+) {
+    draw_text_modal(frame, area, " options ", Color::Yellow, title, body, false);
 }
 
 fn draw_confirm_modal(
@@ -429,9 +593,21 @@ fn draw_confirm_modal(
     title: &str,
     body: &str,
 ) {
-    let width = area.width.min(72).max(40);
+    draw_text_modal(frame, area, " confirm ", Color::Red, title, body, true);
+}
+
+fn draw_text_modal(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    border_title: &str,
+    border_color: Color,
+    title: &str,
+    body: &str,
+    yn_footer: bool,
+) {
+    let width = area.width.min(78).max(44);
     let extra_lines = body.lines().count().saturating_sub(1) as u16;
-    let height = (7 + extra_lines).min(area.height.saturating_sub(2)).max(7);
+    let height = (8 + extra_lines).min(area.height.saturating_sub(2)).max(8);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let modal = Rect {
@@ -443,8 +619,8 @@ fn draw_confirm_modal(
     frame.render_widget(Clear, modal);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" confirm ")
-        .border_style(Style::default().fg(Color::Red));
+        .title(border_title)
+        .border_style(Style::default().fg(border_color));
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
     let mut lines = vec![
@@ -452,23 +628,46 @@ fn draw_confirm_modal(
         Line::from(""),
     ];
     for part in body.split('\n') {
-        let style = if part.starts_with("Warning:") {
+        let style = if part.starts_with('[') {
+            Style::default().fg(Color::Cyan)
+        } else if part.contains("referenced")
+            || part.contains("depends on")
+            || part.contains("Still referenced")
+            || part.contains("will remain")
+        {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default()
         };
         lines.push(Line::from(Span::styled(part.to_string(), style)));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw(" yes   "),
-        Span::styled("[n]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw(" cancel   "),
-        Span::styled("[?]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" help"),
-    ]));
-    let text = Paragraph::new(lines).wrap(Wrap { trim: true });
+    if yn_footer {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "[y]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" yes   "),
+            Span::styled(
+                "[n]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel   "),
+            Span::styled(
+                "[?]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" help"),
+        ]));
+    }
+    let text = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(text, inner);
 }
 

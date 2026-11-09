@@ -5,7 +5,8 @@ mod tui;
 
 use clap::{Parser, Subcommand};
 use skillz_core::{
-    default_config_dir, AddOutcome, App, DriftReason, LibraryImportAction, Scope, SkillzPaths,
+    default_config_dir, AddOutcome, App, DriftReason, LibraryImportAction, ListRow, Scope,
+    SkillzPaths,
 };
 use tui::RatatuiPrompter;
 
@@ -101,7 +102,7 @@ enum Commands {
         #[command(subcommand)]
         command: HooksCommands,
     },
-    /// List Catalog Entries from bound Libraries
+    /// List skills in this Project (default) or the bound Library Catalog
     List {
         /// Restrict to one Library Binding
         #[arg(long)]
@@ -112,6 +113,9 @@ enum Commands {
         /// Keep only the first Binding match per skill name
         #[arg(long)]
         dedupe: bool,
+        /// List full bound Library Catalog instead of Project Installations
+        #[arg(long)]
+        catalog: bool,
     },
     /// Install Catalog Entries into this Managed Project
     Add {
@@ -123,9 +127,12 @@ enum Commands {
         /// Add all Catalog Entries matching tags (AND)
         #[arg(long = "tag")]
         tags: Vec<String>,
-        /// Also add detected sibling dependencies (best-effort)
+        /// Automatically add detected sibling dependencies (no prompt)
         #[arg(long)]
         with_deps: bool,
+        /// Do not prompt for or add sibling dependencies
+        #[arg(long)]
+        no_deps: bool,
         /// Interactive multi-select (Ratatui); works without --tag (filter in UI with /)
         #[arg(short = 'i', long)]
         interactive: bool,
@@ -251,6 +258,124 @@ fn format_add_outcome(outcome: &AddOutcome) -> String {
         AddOutcome::Refreshed(l) => format!("refreshed ({})", l.content_hash),
         AddOutcome::AlreadyPresent(l) => format!("already present ({})", l.content_hash),
     }
+}
+
+fn print_skill_table(rows: &[ListRow]) {
+    let mut name_w = "NAME".len();
+    let mut lib_w = "LIBRARY".len();
+    let mut tags_w = "TAGS".len();
+    let mut avail_w = "AVAIL".len();
+    let rendered: Vec<(String, String, String, String)> = rows
+        .iter()
+        .map(|row| {
+            let tags = if row.entry.tags.is_empty() {
+                "-".to_string()
+            } else {
+                row.entry.tags.join(",")
+            };
+            let avail = row.availability.summary();
+            name_w = name_w.max(row.entry.name.len());
+            lib_w = lib_w.max(row.entry.library.len());
+            tags_w = tags_w.max(tags.len());
+            avail_w = avail_w.max(avail.len());
+            (
+                row.entry.name.clone(),
+                row.entry.library.clone(),
+                tags,
+                avail,
+            )
+        })
+        .collect();
+    println!(
+        "{:<name_w$}  {:<lib_w$}  {:<tags_w$}  {:<avail_w$}",
+        "NAME", "LIBRARY", "TAGS", "AVAIL"
+    );
+    for (name, library, tags, avail) in rendered {
+        println!("{name:<name_w$}  {library:<lib_w$}  {tags:<tags_w$}  {avail:<avail_w$}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepsPolicy {
+    Always,
+    Never,
+    Prompt,
+}
+
+fn stdin_confirm(prompt: &str) -> bool {
+    eprint!("{prompt} [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+}
+
+fn resolve_missing_deps(
+    app: &App,
+    skills: &[String],
+    library: Option<&str>,
+    policy: DepsPolicy,
+    mut prompter: Option<&mut dyn skillz_core::Prompter>,
+) -> skillz_core::Result<()> {
+    let mut missing: Vec<String> = Vec::new();
+    for name in skills {
+        for dep in app.missing_sibling_deps(name, library)? {
+            if !missing.iter().any(|m| m == &dep) && !skills.iter().any(|s| s == &dep) {
+                missing.push(dep);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let add_them = match policy {
+        DepsPolicy::Always => true,
+        DepsPolicy::Never => {
+            eprintln!(
+                "note: possible sibling deps not added: {} (--no-deps)",
+                missing.join(", ")
+            );
+            false
+        }
+        DepsPolicy::Prompt => {
+            let detail = format!(
+                "Possible sibling dependencies not present: {}",
+                missing.join(", ")
+            );
+            eprintln!("{detail}");
+            if let Some(ui) = prompter.as_mut() {
+                ui.confirm("Add missing sibling dependencies?", &detail)?
+            } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                stdin_confirm("Add them now?")
+            } else {
+                eprintln!("(non-interactive; pass --with-deps to add, or --no-deps to silence)");
+                false
+            }
+        }
+    };
+    if !add_them {
+        return Ok(());
+    }
+    for dep in &missing {
+        match app.add_skill_with_deps(dep, library, true) {
+            Ok((outcome, warn, still_missing)) => {
+                if let Some(w) = warn {
+                    eprintln!("warning: {w}");
+                }
+                println!("{dep}: {}", format_add_outcome(&outcome));
+                if !still_missing.is_empty() {
+                    eprintln!(
+                        "warning: still missing for `{dep}`: {}",
+                        still_missing.join(", ")
+                    );
+                }
+            }
+            Err(e) => eprintln!("warning: could not add dependency `{dep}`: {e}"),
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -487,26 +612,18 @@ fn run() -> skillz_core::Result<()> {
             library,
             tags,
             dedupe,
+            catalog,
         }) => {
-            let rows = app.list_skills(library.as_deref(), &tags, dedupe)?;
+            let rows = app.list_skills(library.as_deref(), &tags, dedupe, !catalog)?;
             if rows.is_empty() {
-                println!("(no matching skills)");
+                if catalog {
+                    println!("(no matching Catalog Entries)");
+                } else {
+                    println!("(no skills in this Project; try `skillz list --catalog`)");
+                }
                 return Ok(());
             }
-            for row in rows {
-                let tags = if row.entry.tags.is_empty() {
-                    "-".to_string()
-                } else {
-                    row.entry.tags.join(",")
-                };
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    row.entry.name,
-                    row.entry.library,
-                    tags,
-                    row.availability.summary()
-                );
-            }
+            print_skill_table(&rows);
             Ok(())
         }
         Some(Commands::Add {
@@ -514,17 +631,33 @@ fn run() -> skillz_core::Result<()> {
             library,
             tags,
             with_deps,
+            no_deps,
             interactive,
         }) => {
+            if with_deps && no_deps {
+                return Err(skillz_core::SkillzError::Message(
+                    "pass only one of --with-deps or --no-deps".into(),
+                ));
+            }
+            let deps_policy = if with_deps {
+                DepsPolicy::Always
+            } else if no_deps {
+                DepsPolicy::Never
+            } else {
+                DepsPolicy::Prompt
+            };
+
             if interactive {
                 let mut ui = RatatuiPrompter;
                 let added = app.interactive_add_by_tag(&tags, library.as_deref(), &mut ui)?;
                 if added.is_empty() {
                     println!("(no skills added)");
+                    return Ok(());
                 }
-                for skill_name in added {
+                for skill_name in &added {
                     println!("added {skill_name}");
                 }
+                resolve_missing_deps(&app, &added, library.as_deref(), deps_policy, Some(&mut ui))?;
                 return Ok(());
             }
             if !tags.is_empty() {
@@ -533,41 +666,29 @@ fn run() -> skillz_core::Result<()> {
                     println!("(no matching skills to add)");
                     return Ok(());
                 }
+                let mut names = Vec::new();
                 for (skill_name, outcome, warn) in results {
                     if let Some(w) = warn {
                         eprintln!("warning: {w}");
                     }
-                    if with_deps {
-                        let (_, _, missing) =
-                            app.add_skill_with_deps(&skill_name, library.as_deref(), true)?;
-                        if !missing.is_empty() {
-                            eprintln!(
-                                "warning: possible sibling deps not present for {skill_name}: {}",
-                                missing.join(", ")
-                            );
-                        }
-                    }
                     println!("{}: {}", skill_name, format_add_outcome(&outcome));
+                    names.push(skill_name);
                 }
+                resolve_missing_deps(&app, &names, library.as_deref(), deps_policy, None)?;
                 return Ok(());
             }
             let Some(name) = name else {
                 return Err(skillz_core::SkillzError::Message(
-                    "provide a skill name or --tag".into(),
+                    "provide a skill name, --tag, or -i".into(),
                 ));
             };
-            let (outcome, warn, missing) =
-                app.add_skill_with_deps(&name, library.as_deref(), with_deps)?;
+            let (outcome, warn, _) =
+                app.add_skill_with_deps(&name, library.as_deref(), false)?;
             if let Some(w) = warn {
                 eprintln!("warning: {w}");
             }
-            if !missing.is_empty() {
-                eprintln!(
-                    "warning: possible sibling deps not present: {} (best-effort; pass --with-deps)",
-                    missing.join(", ")
-                );
-            }
             println!("{name}: {}", format_add_outcome(&outcome));
+            resolve_missing_deps(&app, &[name], library.as_deref(), deps_policy, None)?;
             Ok(())
         }
         Some(Commands::Library { command }) => match command {
