@@ -419,8 +419,7 @@ fn run() -> skillz_core::Result<()> {
                 return Ok(());
             }
             if interactive {
-                let mut ui = RatatuiPrompter;
-                app.interactive_drift(&mut ui)?;
+                tui::run_drift_board(&app)?;
                 return Ok(());
             }
             let report = app.drift_report(project.as_deref())?;
@@ -430,15 +429,19 @@ fn run() -> skillz_core::Result<()> {
             }
             for proj in &report {
                 println!("project: {}", proj.project.display());
+                let name_width = proj
+                    .items
+                    .iter()
+                    .map(|item| item.name.len())
+                    .max()
+                    .unwrap_or(0);
                 for item in &proj.items {
                     let reason = match &item.reason {
-                        DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
-                        DriftReason::MissingFiles => "missing installation files".to_string(),
-                        DriftReason::HashMismatch { .. } => {
-                            "content hash differs from Lock".to_string()
-                        }
+                        DriftReason::Unlocked => "unlocked (not in skillz.lock)",
+                        DriftReason::MissingFiles => "missing installation files",
+                        DriftReason::HashMismatch { .. } => "content hash differs from Lock",
                     };
-                    println!("  {}\t{reason}", item.name);
+                    println!("  {:<width$}  {reason}", item.name, width = name_width);
                 }
             }
             if check {
