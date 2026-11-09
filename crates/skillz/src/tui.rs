@@ -13,7 +13,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
-use skillz_core::{App, DriftAction, DriftItem, Prompter, Result, SelectItem, SkillzError};
+use skillz_core::{
+    App, DriftAction, DriftItem, DriftReason, Prompter, Result, SelectItem, SkillzError,
+};
 
 const DRIFT_HELP: &[&str] = &[
     "Navigate",
@@ -31,6 +33,8 @@ const DRIFT_HELP: &[&str] = &[
     "  Enter             confirm removals (if any) then apply actions",
     "  q / Esc           quit without further applies",
     "",
+    "Unlocked rows show a Catalog suggestion: library (owned|upstream, exact|differs).",
+    "Libcommit on an exact match records a Lock; otherwise Branch Lock / Overlay Fork.",
     "Remove keeps the Library Catalog Entry; only Project files + Lock go away.",
     "",
     "Press ? or Esc to close this help.",
@@ -149,9 +153,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
     state.select(Some(0));
     let mut modal: Option<Modal> = None;
     let mut show_help = false;
-    let mut status_line = String::from(
-        "j/k move · ←/→ action · r remove · enter apply · ? help · q quit",
-    );
+    let mut status_line = default_status_line(&rows);
 
     let result = loop {
         terminal
@@ -183,7 +185,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     .max(8);
                 let status_width = rows
                     .iter()
-                    .map(|r| r.item.reason.label().len())
+                    .map(|r| drift_status_label(r).len())
                     .max()
                     .unwrap_or(8)
                     .max(12);
@@ -206,12 +208,19 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                             }
                             _ => Style::default().fg(Color::DarkGray),
                         };
+                        let status = drift_status_label(row);
+                        let status_style = if row.item.suggestion.as_ref().and_then(|s| s.exact_match)
+                            == Some(true)
+                        {
+                            Style::default().fg(Color::Green)
+                        } else if row.item.suggestion.is_some() {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::Yellow)
+                        };
                         let line = Line::from(vec![
                             Span::raw(format!(" {:<w$}  ", row.item.name, w = name_width)),
-                            Span::styled(
-                                format!("{:<sw$}", row.item.reason.label(), sw = status_width),
-                                Style::default().fg(Color::Yellow),
-                            ),
+                            Span::styled(format!("{status:<status_width$}"), status_style),
                             Span::raw("  "),
                             Span::styled(format!("[{action_label}]"), action_style),
                         ]);
@@ -223,7 +232,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(" NAME / DRIFT STATUS / ACTION "),
+                            .title(" NAME / STATUS (catalog match) / ACTION "),
                     )
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                     .highlight_symbol("▸ ");
@@ -325,23 +334,17 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                                 row.outcome = None;
                             }
                         }
-                        status_line = format!(
-                            "queued remove for `{}` + dependants — press enter to apply",
-                            rows[index].item.name
-                        );
+                        status_line = default_status_line(&rows);
                         modal = None;
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
                         rows[index].action = DriftAction::Remove;
                         rows[index].outcome = None;
-                        status_line = format!(
-                            "queued remove for `{}` anyway — press enter to apply",
-                            rows[index].item.name
-                        );
+                        status_line = default_status_line(&rows);
                         modal = None;
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
-                        status_line = "remove cancelled".into();
+                        status_line = default_status_line(&rows);
                         modal = None;
                     }
                     _ => {}
@@ -396,6 +399,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                         } else {
                             rows[i].action = next;
                             rows[i].outcome = None;
+                            status_line = default_status_line(&rows);
                         }
                     }
                 }
@@ -407,6 +411,7 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                         } else {
                             rows[i].action = prev;
                             rows[i].outcome = None;
+                            status_line = default_status_line(&rows);
                         }
                     }
                 }
@@ -414,18 +419,21 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                     if let Some(i) = state.selected() {
                         rows[i].action = DriftAction::Skip;
                         rows[i].outcome = None;
+                        status_line = default_status_line(&rows);
                     }
                 }
                 KeyCode::Char('c') => {
                     if let Some(i) = state.selected() {
                         rows[i].action = DriftAction::Libcommit;
                         rows[i].outcome = None;
+                        status_line = default_status_line(&rows);
                     }
                 }
                 KeyCode::Char('p') => {
                     if let Some(i) = state.selected() {
                         rows[i].action = DriftAction::Promote;
                         rows[i].outcome = None;
+                        status_line = default_status_line(&rows);
                     }
                 }
                 KeyCode::Char('r') => {
@@ -491,6 +499,37 @@ fn draw_help_modal(frame: &mut ratatui::Frame<'_>, area: Rect, title: &str, line
     );
 }
 
+fn default_status_line(rows: &[DriftRow]) -> String {
+    let removes: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.action == DriftAction::Remove && r.outcome.is_none())
+        .map(|r| r.item.name.as_str())
+        .collect();
+    if removes.is_empty() {
+        "j/k move · ←/→ action · r remove · enter apply · ? help · q quit".into()
+    } else if removes.len() == 1 {
+        format!(
+            "queued remove: {} — enter to apply · ? help · q quit",
+            removes[0]
+        )
+    } else {
+        format!(
+            "queued remove ({}): {} — enter to apply · ? help · q quit",
+            removes.len(),
+            removes.join(", ")
+        )
+    }
+}
+
+fn drift_status_label(row: &DriftRow) -> String {
+    match (&row.item.reason, &row.item.suggestion) {
+        (DriftReason::Unlocked, Some(sug)) => {
+            format!("unlocked → {}", sug.label())
+        }
+        (reason, _) => reason.label().to_string(),
+    }
+}
+
 fn queue_remove(
     app: &App,
     rows: &mut [DriftRow],
@@ -510,14 +549,14 @@ fn queue_remove(
     if dependants.is_empty() {
         rows[index].action = DriftAction::Remove;
         rows[index].outcome = None;
-        *status_line = if forward_deps.is_empty() {
-            format!("queued remove for `{name}` — press enter to apply")
-        } else {
-            format!(
-                "queued remove for `{name}` (leaves deps: {}) — press enter to apply",
+        *status_line = default_status_line(rows);
+        if !forward_deps.is_empty() {
+            *status_line = format!(
+                "{} · leaves deps: {}",
+                status_line.trim_end_matches(" · ? help · q quit"),
                 forward_deps.join(", ")
-            )
-        };
+            );
+        }
         *modal = None;
     } else {
         *modal = Some(Modal::RemoveDeps {

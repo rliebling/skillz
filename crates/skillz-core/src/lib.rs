@@ -30,7 +30,9 @@ pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
-pub use skill::{DriftAction, DriftItem, DriftReason, EntryKind, InstallationLock};
+pub use skill::{
+    CatalogSuggestion, DriftAction, DriftItem, DriftReason, EntryKind, InstallationLock,
+};
 pub use vcs::{infer_vcs, Vcs};
 
 /// Filesystem roots skillz resolves against for a given invocation.
@@ -581,6 +583,19 @@ impl App {
         match action {
             DriftAction::Skip => Ok("skipped"),
             DriftAction::Libcommit => {
+                // Exact Catalog match → record Lock only (no Branch Lock needed).
+                if let Some(sug) = self.suggest_catalog_match(name)? {
+                    if sug.exact_match == Some(true) {
+                        self.lock_unlocked_to_catalog(name, &sug)?;
+                        return Ok("locked to catalog");
+                    }
+                    self.libcommit_branch(
+                        name,
+                        Some(&sug.library),
+                        Some("interactive libcommit"),
+                    )?;
+                    return Ok("libcommitted");
+                }
                 self.libcommit_branch(name, None, Some("interactive libcommit"))?;
                 Ok("libcommitted")
             }
@@ -595,12 +610,76 @@ impl App {
         }
     }
 
+    /// Suggest a bound Catalog Entry for an unlocked Installation by name.
+    pub fn suggest_catalog_match(&self, name: &str) -> Result<Option<skill::CatalogSuggestion>> {
+        let rows = self.list_skills(None, &[], true, false)?;
+        let Some(row) = rows.into_iter().find(|r| r.entry.name == name) else {
+            return Ok(None);
+        };
+        let config = self.load_scope_config()?;
+        let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
+        let exact_match = match row.entry.kind {
+            EntryKind::Owned if row.entry.skill_path.join("SKILL.md").is_file() => {
+                match (
+                    skill::content_hash(&project_skill),
+                    skill::content_hash(&row.entry.skill_path),
+                ) {
+                    (Ok(a), Ok(b)) => Some(a == b),
+                    _ => None,
+                }
+            }
+            EntryKind::Owned => None,
+            EntryKind::Upstream => None,
+        };
+        Ok(Some(skill::CatalogSuggestion {
+            library: row.entry.library,
+            kind: row.entry.kind,
+            exact_match,
+        }))
+    }
+
+    fn lock_unlocked_to_catalog(
+        &self,
+        name: &str,
+        suggestion: &skill::CatalogSuggestion,
+    ) -> Result<InstallationLock> {
+        let config = self.load_scope_config()?;
+        let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
+        let hash = skill::content_hash(&project_skill)?;
+        let rows = self.list_skills(Some(&suggestion.library), &[], true, false)?;
+        let entry = rows
+            .into_iter()
+            .find(|r| r.entry.name == name)
+            .ok_or_else(|| {
+                SkillzError::Message(format!(
+                    "Catalog Entry `{name}` missing from library `{}`",
+                    suggestion.library
+                ))
+            })?;
+        let install = InstallationLock {
+            library: suggestion.library.clone(),
+            entry_kind: suggestion.kind,
+            content_hash: hash,
+            source: entry.entry.source,
+            rev: None,
+            branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
+        };
+        let mut lock = self.load_scope_lock()?;
+        lock.installations.insert(name.to_string(), install.clone());
+        self.save_scope_lock(&lock)?;
+        Ok(install)
+    }
+
     /// Detect Drift for skills present under skills_dir vs the Lock (current scope).
     pub fn detect_drift(&self) -> Result<Vec<DriftItem>> {
         let config = self.load_scope_config()?;
         let lock = self.load_scope_lock()?;
         let root = self.scope_skills_root(&config);
-        Self::drift_items_for(&root, &lock)
+        let mut items = Self::drift_items_for(&root, &lock)?;
+        self.attach_unlocked_suggestions(&mut items)?;
+        Ok(items)
     }
 
     pub fn detect_drift_in(&self, project_root: &Path) -> Result<Vec<DriftItem>> {
@@ -614,7 +693,21 @@ impl App {
         let config = ProjectConfig::load(project_root)?;
         let lock = ProjectLock::load(project_root)?;
         let root = project_root.join(&config.skills_dir);
-        Self::drift_items_for(&root, &lock)
+        // Suggestions need App paths; attach only when cwd matches project.
+        let mut items = Self::drift_items_for(&root, &lock)?;
+        if self.paths.cwd == project_root {
+            self.attach_unlocked_suggestions(&mut items)?;
+        }
+        Ok(items)
+    }
+
+    fn attach_unlocked_suggestions(&self, items: &mut [DriftItem]) -> Result<()> {
+        for item in items.iter_mut() {
+            if item.reason == DriftReason::Unlocked {
+                item.suggestion = self.suggest_catalog_match(&item.name)?;
+            }
+        }
+        Ok(())
     }
 
     fn drift_items_for(root: &Path, lock: &ProjectLock) -> Result<Vec<DriftItem>> {
@@ -635,6 +728,7 @@ impl App {
                     None => items.push(DriftItem {
                         name,
                         reason: DriftReason::Unlocked,
+                        suggestion: None,
                     }),
                     Some(rec) => match skill::content_hash(&path) {
                         Ok(actual) if actual == rec.content_hash => {}
@@ -644,10 +738,12 @@ impl App {
                                 locked: rec.content_hash.clone(),
                                 actual,
                             },
+                            suggestion: None,
                         }),
                         Err(_) => items.push(DriftItem {
                             name,
                             reason: DriftReason::MissingFiles,
+                            suggestion: None,
                         }),
                     },
                 }
@@ -659,6 +755,7 @@ impl App {
                 items.push(DriftItem {
                     name: name.clone(),
                     reason: DriftReason::MissingFiles,
+                    suggestion: None,
                 });
             }
         }
@@ -1293,6 +1390,12 @@ impl App {
         let desired = library_name
             .map(|s| s.to_string())
             .or_else(|| existing.as_ref().map(|e| e.library.clone()))
+            .or_else(|| {
+                // Unlocked skills in drift -i: fall back to first writable Binding.
+                self.first_writable_binding(&config)
+                    .ok()
+                    .map(|s| s.to_string())
+            })
             .ok_or_else(|| {
                 SkillzError::Message(format!(
                     "skill `{name}` has no Lock; pass --library or libcommit --as first"
@@ -1981,6 +2084,8 @@ mod tests {
         assert_eq!(drift.len(), 1);
         assert_eq!(drift[0].name, "demo-skill");
         assert_eq!(drift[0].reason, DriftReason::Unlocked);
+        // Not yet in the Library Catalog.
+        assert!(drift[0].suggestion.is_none());
 
         let lock = fx
             .app()
@@ -1996,6 +2101,59 @@ mod tests {
 
         let project_hash = skill::content_hash(&path).unwrap();
         assert_eq!(project_hash, lock.content_hash);
+    }
+
+    #[test]
+    fn unlocked_suggests_catalog_match_and_libcommit_without_lock() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app()
+            .skill_new("demo-skill", &["process".into()])
+            .unwrap();
+        fx.app()
+            .libcommit_authored("demo-skill", "personal")
+            .unwrap();
+
+        // Simulate unlocked install that still matches the Library Owned tree.
+        let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
+        lock.installations.clear();
+        lock.save(&fx.project_dir).unwrap();
+
+        let drift = fx.app().detect_drift().unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].reason, DriftReason::Unlocked);
+        let sug = drift[0].suggestion.as_ref().expect("catalog suggestion");
+        assert_eq!(sug.library, "personal");
+        assert_eq!(sug.exact_match, Some(true));
+
+        // Drift -i libcommit must work without an existing Lock.
+        let msg = fx
+            .app()
+            .apply_drift_action("demo-skill", DriftAction::Libcommit)
+            .unwrap();
+        assert!(msg.contains("locked") || msg.contains("libcommit"));
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+
+        // Divergent content → differs.
+        fs::write(
+            fx.project_dir
+                .join(".agents/skills/demo-skill/SKILL.md"),
+            "---\nname: demo-skill\ntags: [process]\n---\n# changed\n",
+        )
+        .unwrap();
+        let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
+        lock.installations.clear();
+        lock.save(&fx.project_dir).unwrap();
+        let drift = fx.app().detect_drift().unwrap();
+        assert_eq!(
+            drift[0].suggestion.as_ref().unwrap().exact_match,
+            Some(false)
+        );
     }
 
     #[test]

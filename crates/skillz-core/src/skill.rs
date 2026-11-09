@@ -45,10 +45,36 @@ pub enum DriftReason {
     HashMismatch { locked: String, actual: String },
 }
 
+/// Suggested Catalog Entry for an unlocked Installation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSuggestion {
+    pub library: String,
+    pub kind: EntryKind,
+    /// `Some(true)` if every file matches the Library Owned tree; `None` if
+    /// comparison was not possible (e.g. Upstream reference with no local tree).
+    pub exact_match: Option<bool>,
+}
+
+impl CatalogSuggestion {
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            EntryKind::Owned => "owned",
+            EntryKind::Upstream => "upstream",
+        };
+        let match_label = match self.exact_match {
+            Some(true) => "exact",
+            Some(false) => "differs",
+            None => "uncompared",
+        };
+        format!("{} ({kind}, {match_label})", self.library)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftItem {
     pub name: String,
     pub reason: DriftReason,
+    pub suggestion: Option<CatalogSuggestion>,
 }
 
 impl DriftReason {
