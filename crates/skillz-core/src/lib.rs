@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod library;
+pub mod project;
 pub mod registry;
 pub mod vcs;
 
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
+pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
 pub use vcs::{infer_vcs, Vcs};
 
@@ -45,12 +47,15 @@ pub enum SkillzError {
 
 pub type Result<T> = std::result::Result<T, SkillzError>;
 
-/// Snapshot returned by [`App::status`] (stub until Managed Project work).
+/// Snapshot returned by [`App::status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub cwd: PathBuf,
     pub config_dir: PathBuf,
     pub managed: bool,
+    pub skills_dir: Option<String>,
+    pub bindings: Vec<Binding>,
+    pub installations: Vec<String>,
     pub message: String,
 }
 
@@ -87,25 +92,72 @@ impl App {
         registry.save(&self.paths.registry_path())
     }
 
-    /// Stub status: reports whether a Managed Project config exists.
+    /// Status for the cwd Managed Project (bindings + installations).
     pub fn status(&self) -> Result<StatusReport> {
-        let managed = self
-            .paths
-            .cwd
-            .join(".skillz")
-            .join("skillz.toml")
-            .is_file();
-        let message = if managed {
-            "Managed Project (config present; domain status not implemented yet)".to_string()
-        } else {
-            "Not a Managed Project (no .skillz/skillz.toml)".to_string()
-        };
+        let cfg_path = ProjectConfig::path(&self.paths.cwd);
+        if !cfg_path.is_file() {
+            return Ok(StatusReport {
+                cwd: self.paths.cwd.clone(),
+                config_dir: self.paths.config_dir.clone(),
+                managed: false,
+                skills_dir: None,
+                bindings: Vec::new(),
+                installations: Vec::new(),
+                message: "Not a Managed Project (no .skillz/skillz.toml)".to_string(),
+            });
+        }
+        let config = ProjectConfig::load(&self.paths.cwd)?;
+        let lock = ProjectLock::load(&self.paths.cwd)?;
+        let installations = lock.installation_names();
+        let message = format!(
+            "Managed Project; {} binding(s); {} installation(s)",
+            config.bindings.len(),
+            installations.len()
+        );
         Ok(StatusReport {
             cwd: self.paths.cwd.clone(),
             config_dir: self.paths.config_dir.clone(),
-            managed,
+            managed: true,
+            skills_dir: Some(config.skills_dir),
+            bindings: config.bindings,
+            installations,
             message,
         })
+    }
+
+    /// Initialize cwd as a Managed Project with ordered Library Bindings.
+    pub fn project_init(
+        &self,
+        bind_specs: &[String],
+        skills_dir: Option<&str>,
+    ) -> Result<ProjectConfig> {
+        let cfg_path = ProjectConfig::path(&self.paths.cwd);
+        if cfg_path.is_file() {
+            return Err(SkillzError::Message(format!(
+                "already a Managed Project ({})",
+                cfg_path.display()
+            )));
+        }
+        let registry = self.load_registry()?;
+        let bindings = project::bindings_from_specs(bind_specs, &registry.libraries)?;
+        let config = ProjectConfig {
+            skills_dir: skills_dir
+                .unwrap_or(DEFAULT_SKILLS_DIR)
+                .to_string(),
+            bindings,
+        };
+        config.save(&self.paths.cwd)?;
+        ProjectLock::default().save(&self.paths.cwd)?;
+
+        let project_abs = std::fs::canonicalize(&self.paths.cwd).unwrap_or_else(|_| {
+            self.paths.cwd.clone()
+        });
+        let mut registry = registry;
+        if !registry.projects.iter().any(|p| p == &project_abs) {
+            registry.projects.push(project_abs);
+            self.save_registry(&registry)?;
+        }
+        Ok(config)
     }
 
     /// Ensure the config directory exists.
@@ -299,19 +351,64 @@ mod tests {
         assert!(!report.managed);
         assert_eq!(report.cwd, fx.project_dir);
         assert_eq!(report.config_dir, fx.config_dir);
+        assert!(report.bindings.is_empty());
         assert!(report.message.contains("Not a Managed Project"));
     }
 
     #[test]
-    fn status_detects_managed_config_file() {
+    fn project_init_writes_config_lock_and_registry() {
         let fx = Fixture::new();
-        let cfg = fx.project_dir.join(".skillz");
-        fs::create_dir_all(&cfg).unwrap();
-        fs::write(cfg.join("skillz.toml"), "skills_dir = \".agents/skills\"\n").unwrap();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal").unwrap();
 
-        let report = fx.app().status().expect("status");
+        let config = fx
+            .app()
+            .project_init(&["personal".into()], None)
+            .expect("init");
+        assert_eq!(config.skills_dir, DEFAULT_SKILLS_DIR);
+        assert_eq!(config.bindings.len(), 1);
+        assert_eq!(config.bindings[0].name, "personal");
+        assert!(!config.bindings[0].read_only);
+        assert!(config.bindings[0].url.starts_with("file://"));
+
+        assert!(fx.project_dir.join(".skillz/skillz.toml").is_file());
+        assert!(fx.project_dir.join(".skillz/skillz.lock").is_file());
+
+        let reg = fx.app().load_registry().unwrap();
+        assert_eq!(reg.projects.len(), 1);
+
+        let report = fx.app().status().unwrap();
         assert!(report.managed);
-        assert!(report.message.contains("Managed Project"));
+        assert_eq!(report.bindings.len(), 1);
+        assert!(report.installations.is_empty());
+        assert_eq!(
+            report.skills_dir.as_deref(),
+            Some(DEFAULT_SKILLS_DIR)
+        );
+    }
+
+    #[test]
+    fn project_init_honors_skills_dir_and_ro_bind() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("company"), "company")
+            .unwrap();
+        let config = fx
+            .app()
+            .project_init(&["company:ro".into()], Some(".claude/skills"))
+            .unwrap();
+        assert_eq!(config.skills_dir, ".claude/skills");
+        assert!(config.bindings[0].read_only);
+    }
+
+    #[test]
+    fn project_init_fails_for_unknown_library() {
+        let fx = Fixture::new();
+        let err = fx
+            .app()
+            .project_init(&["missing".into()], None)
+            .unwrap_err();
+        assert!(err.to_string().contains("not in the local registry"));
     }
 
     #[test]

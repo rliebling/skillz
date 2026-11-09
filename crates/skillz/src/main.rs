@@ -22,12 +22,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Show Managed Project / binding status (stub)
+    /// Show Managed Project bindings and installations
     Status,
     /// Manage Libraries in the user registry
     Library {
         #[command(subcommand)]
         command: LibraryCommands,
+    },
+    /// Manage the current Project as a Managed Project
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
     },
 }
 
@@ -54,6 +59,19 @@ enum LibraryCommands {
     },
     /// List registered Libraries
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommands {
+    /// Initialize a Managed Project with Library Bindings
+    Init {
+        /// Library binding (`name` or `name:ro`); repeatable, order = precedence
+        #[arg(long = "bind", required = true)]
+        bind: Vec<String>,
+        /// Skills directory relative to the Project root
+        #[arg(long, default_value = ".agents/skills")]
+        skills_dir: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -86,6 +104,28 @@ fn run() -> skillz_core::Result<()> {
             let report = app.status()?;
             println!("cwd: {}", report.cwd.display());
             println!("config: {}", report.config_dir.display());
+            if report.managed {
+                if let Some(skills_dir) = &report.skills_dir {
+                    println!("skills_dir: {skills_dir}");
+                }
+                println!("bindings:");
+                if report.bindings.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for (i, b) in report.bindings.iter().enumerate() {
+                        let ro = if b.read_only { "ro" } else { "rw" };
+                        println!("  {}. {} [{ro}] {}", i + 1, b.name, b.url);
+                    }
+                }
+                println!("installations:");
+                if report.installations.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for name in &report.installations {
+                        println!("  - {name}");
+                    }
+                }
+            }
             println!("{}", report.message);
             Ok(())
         }
@@ -120,12 +160,29 @@ fn run() -> skillz_core::Result<()> {
                     return Ok(());
                 }
                 for e in entries {
-                    let vcs = e
-                        .vcs
-                        .map(|v| v.as_str())
-                        .unwrap_or("-");
+                    let vcs = e.vcs.map(|v| v.as_str()).unwrap_or("-");
                     let ro = if e.read_only { "ro" } else { "rw" };
                     println!("{}\t{ro}\t{vcs}\t{}", e.name, e.path.display());
+                }
+                Ok(())
+            }
+        },
+        Some(Commands::Project { command }) => match command {
+            ProjectCommands::Init { bind, skills_dir } => {
+                let skills = if skills_dir == ".agents/skills" {
+                    None
+                } else {
+                    Some(skills_dir.as_str())
+                };
+                let config = app.project_init(&bind, skills)?;
+                println!(
+                    "initialized Managed Project with {} binding(s); skills_dir={}",
+                    config.bindings.len(),
+                    config.skills_dir
+                );
+                for b in &config.bindings {
+                    let ro = if b.read_only { "ro" } else { "rw" };
+                    println!("  - {} [{ro}] {}", b.name, b.url);
                 }
                 Ok(())
             }
