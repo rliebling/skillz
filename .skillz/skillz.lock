@@ -1,1 +1,48 @@
-[installations]
+[installations.domain-modeling]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:a755ee1e482f20b3ac905cf1aa80ca18f41e7411300ae46d81bf019ac8980554"
+rev = "491e155f0ea42dde8738d780297b9aecf1d5dc87"
+branch = "skillz/domain-modeling"
+
+[installations.grill-with-docs]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:975b10c08e8a833fe0e82631f9fa6859be11a950555311d3e47e7aa55d00eaef"
+rev = "159a1c25c9320ccea7b5f51557568800df8a4c06"
+branch = "skillz/grill-with-docs"
+
+[installations.grilling]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:d8ce3d14d13c6c2d6f6be3f28ce1ed31efd17d1c81d1e937e44b9ae3688ede8f"
+rev = "e8faba0c032c4a393a6f3370058217eaa98bd16b"
+branch = "skillz/grilling"
+
+[installations.handoff]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:c9fb351e599c5bf4d2f79c2c3df84c9c0def2c842cafb7a8d11ce7d8e5e0c52d"
+rev = "281cd7ec6c1d7700ccca94ee076f185365337020"
+branch = "skillz/handoff"
+
+[installations.setup-matt-pocock-skills]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:13142856688012add387b351e8b0f8356a0d825496f34d1f6c6c22a458c19309"
+rev = "ac82820811ece521f2424ef264a08a51a0fe2652"
+branch = "skillz/setup-matt-pocock-skills"
+
+[installations.to-spec]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:38ca47433b5b4aa9fa5c7eab1254ec5ba7cf3db8e2f1182fd0c51661b0e5a56e"
+rev = "ecb479481e989504b9189e27c403d932d3522ab8"
+branch = "skillz/to-spec"
+
+[installations.to-tickets]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:6a76d979366fa6edac12c38b45afc25f7e6fc990f936f23d8903ced6f851f8db"
+rev = "03e5cb9b0f0a281f0bb2aac6d96166ea016bb298"
+branch = "skillz/to-tickets"
