@@ -63,14 +63,23 @@ Use `br update` for status, labels, description, acceptance criteria, and notes.
 
 Use `br close <id> -r "Reason"` when work is complete. Prefer `br close <id> --suggest-next` when continuing through newly unblocked work.
 
+Close **before** creating the implementation commit so `.beads/issues.jsonl` updates land with the code. Do not commit the work first and then close into a separate revision.
+
 ## Labels
 
 Apply triage labels with `br update <id> --add-label <label>` or `br create ... -l <label>`. See `docs/agents/triage-labels.md`.
 
 ## Commits
 
-When a commit implements or closes a bead, include the bead ID at the end of the commit subject, for example:
+When a commit implements a bead, end the subject with that bead’s id:
 
 ```text
 Add Library Binding config (z-12)
 ```
+
+Rules:
+
+- **One leaf bead per commit.** Do not implement or close two leaf beads in one commit, and do not mention a second leaf id in the subject or body.
+- **Close with the work.** `br close` (and claim) metadata in `.beads/issues.jsonl` belongs in the same commit as the implementation. Do not leave a follow-up commit whose only change is closing a bead (e.g. subject `Close …`).
+- Finish, close, and commit the current leaf before starting the next one.
+- Exception: when closing the last child of a Spec/epic, the parent Spec’s close may ride in that child’s commit’s beads metadata; the commit subject still uses the child id only.
