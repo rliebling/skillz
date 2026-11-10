@@ -41,6 +41,30 @@ cargo run -p skillz -- --help
 
 Config lives under `~/.config/skillz/` (override with `--config-dir` or `SKILLZ_CONFIG_DIR`).
 
+## Shell completions
+
+Generate a completion script for your shell (bash, zsh, fish, elvish, or powershell) and install it the usual way for that shell:
+
+```bash
+# bash (~/.bashrc or a file under bash_completion.d)
+skillz completions bash > ~/.local/share/bash-completion/completions/skillz
+
+# zsh — add to ~/.zshrc *before* compinit, then generate + reload the shell:
+#   fpath=(~/.zfunc $fpath)
+#   autoload -Uz compinit && compinit
+mkdir -p ~/.zfunc && skillz completions zsh > ~/.zfunc/_skillz
+# then: exec zsh
+
+# fish
+skillz completions fish > ~/.config/fish/completions/skillz.fish
+
+# elvish / powershell
+skillz completions elvish
+skillz completions powershell
+```
+
+Completions are generated from the clap command tree, so they stay in sync with `skillz --help`.
+
 ## Quick start
 
 ### 1. Create or register a Library

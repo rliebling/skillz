@@ -3,7 +3,8 @@ use std::process::ExitCode;
 
 mod tui;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use skillz_core::{
     default_config_dir, AddOutcome, App, DriftReason, LibraryImportAction, ListRow, Scope,
     SkillzPaths,
@@ -151,6 +152,30 @@ enum Commands {
     User {
         #[command(subcommand)]
         command: UserCommands,
+    },
+    /// Generate shell completions (print script to stdout; redirect to install)
+    #[command(after_help = "\
+Examples:
+  # bash — write into bash-completion's completions dir (or source from ~/.bashrc)
+  skillz completions bash > ~/.local/share/bash-completion/completions/skillz
+
+  # zsh — (1) ensure ~/.zfunc is on fpath *before* compinit in ~/.zshrc:
+  #         fpath=(~/.zfunc $fpath)
+  #         autoload -Uz compinit && compinit
+  #       (2) generate the script:
+  mkdir -p ~/.zfunc && skillz completions zsh > ~/.zfunc/_skillz
+  #       (3) reload the shell (new tab, or: exec zsh)
+
+  # fish
+  skillz completions fish > ~/.config/fish/completions/skillz.fish
+
+  # elvish / powershell — print the script, then load it with your shell's usual mechanism
+  skillz completions elvish
+  skillz completions powershell
+")]
+    Completions {
+        /// Target shell (script goes to stdout — redirect it; see Examples)
+        shell: Shell,
     },
 }
 
@@ -392,6 +417,14 @@ fn main() -> ExitCode {
 
 fn run() -> skillz_core::Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Commands::Completions { shell }) = cli.command {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
+
     let config_dir = cli.config_dir.unwrap_or_else(default_config_dir);
     let cwd = std::env::current_dir().map_err(|e| {
         skillz_core::SkillzError::Message(format!("failed to read current directory: {e}"))
@@ -411,6 +444,7 @@ fn run() -> skillz_core::Result<()> {
             );
             Ok(())
         }
+        Some(Commands::Completions { .. }) => unreachable!("handled above"),
         Some(Commands::Status) => {
             let report = app.status()?;
             println!("cwd: {}", report.cwd.display());
