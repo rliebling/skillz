@@ -45,10 +45,14 @@ skillz promote NAME
 skillz lock NAME --main
 skillz hooks show
 skillz hooks install
+skillz skill show
+skillz skill install
 ```
 
 Library registry / bootstrap: `skillz library init|add|list|import`.  
 Project bootstrap: `skillz project init --bind LIBRARY`.
+
+This skill ships inside the `skillz` binary. Humans can inspect it with `skillz skill show`; agents/tools materialize it with `skillz skill install --dir {dir}` (Tool-Provided `cmd:` template).
 
 ## Authored vs Upstream vs Tool-Provided
 
@@ -57,6 +61,9 @@ Project bootstrap: `skillz project init --bind LIBRARY`.
 - **Tool-Provided** (`--source 'cmd:…'`): Catalog reference whose source is an install **command template** (ADR 0005). Example:
 
   ```bash
+  skillz libcommit skillz --as upstream --library personal \
+    --source 'cmd:skillz skill install --dir {dir}'
+  # or another tool, e.g. rexpad:
   skillz libcommit rexpad --as upstream --library personal \
     --source 'cmd:rexpad skill install --dir {dir}'
   ```

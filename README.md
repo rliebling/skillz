@@ -135,6 +135,12 @@ skillz libcommit ecto-thinking --library personal --as upstream
 skillz libcommit rexpad --library personal --as upstream \
   --source 'cmd:rexpad skill install --dir {dir}'
 # Optional version probe: …|version:rexpad version
+
+# skillz's own agent skill is Tool-Provided the same way:
+skillz skill show                              # print embedded SKILL.md
+skillz skill install                           # → ~/.agents/skills/skillz/SKILL.md
+skillz libcommit skillz --library personal --as upstream \
+  --source 'cmd:skillz skill install --dir {dir}'
 ```
 
 Until `libcommit`, new/fetched skills are **Drift**. Agents working in this repo can load the **`skillz`** skill (`.agents/skills/skillz`) for CLI workflow guidance.

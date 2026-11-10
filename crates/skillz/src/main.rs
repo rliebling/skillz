@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod provided_skill;
 mod tui;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -153,6 +154,11 @@ enum Commands {
         #[command(subcommand)]
         command: UserCommands,
     },
+    /// Install or print the Tool-Provided skillz agent skill
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     /// Generate shell completions (print script to stdout; redirect to install)
     #[command(after_help = "\
 Examples:
@@ -277,6 +283,20 @@ enum UserCommands {
         #[arg(long = "bind", required = true)]
         bind: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommands {
+    /// Write the embedded skillz SKILL.md into an Installation directory
+    Install {
+        /// Installation directory (default: `~/.agents/skills/skillz`).
+        /// For Tool-Provided `cmd:` sources, pass `{dir}` — SKILL.md is written
+        /// directly under that path.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Print the embedded skillz SKILL.md to stdout
+    Show,
 }
 
 fn format_add_outcome(outcome: &AddOutcome) -> String {
@@ -425,6 +445,21 @@ fn run() -> skillz_core::Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::Skill { command }) = cli.command {
+        return match command {
+            SkillCommands::Show => {
+                print!("{}", provided_skill::SKILL_MD);
+                Ok(())
+            }
+            SkillCommands::Install { dir } => {
+                let dir = dir.unwrap_or_else(provided_skill::default_install_dir);
+                let target = provided_skill::install(&dir)?;
+                println!("installed the skillz skill at {}", target.display());
+                Ok(())
+            }
+        };
+    }
+
     let config_dir = cli.config_dir.unwrap_or_else(default_config_dir);
     let cwd = std::env::current_dir().map_err(|e| {
         skillz_core::SkillzError::Message(format!("failed to read current directory: {e}"))
@@ -445,6 +480,7 @@ fn run() -> skillz_core::Result<()> {
             Ok(())
         }
         Some(Commands::Completions { .. }) => unreachable!("handled above"),
+        Some(Commands::Skill { .. }) => unreachable!("handled above"),
         Some(Commands::Status) => {
             let report = app.status()?;
             println!("cwd: {}", report.cwd.display());
