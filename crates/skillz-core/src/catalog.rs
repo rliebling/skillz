@@ -142,6 +142,17 @@ pub fn entry_matches_tags(entry: &CatalogEntry, required: &[String]) -> bool {
     required.iter().all(|t| entry.tags.iter().any(|e| e == t))
 }
 
+/// Case-insensitive substring match against name and tags (general search).
+pub fn entry_matches_search(entry: &CatalogEntry, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    if entry.name.to_lowercase().contains(&q) {
+        return true;
+    }
+    entry.tags.iter().any(|t| t.to_lowercase().contains(&q))
+}
 
 /// Merge `incoming` into `existing` (union, preserving existing order then new).
 pub fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
@@ -203,7 +214,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_tags_unions_preserving_order() {
+    fn search_and_merge_tags() {
+        let entry = CatalogEntry {
+            name: "ecto-thinking".into(),
+            library: "personal".into(),
+            library_path: PathBuf::from("/tmp"),
+            skill_path: PathBuf::from("/tmp/skills/ecto-thinking"),
+            tags: vec!["elixir".into(), "phoenix".into()],
+            content_hash: "abc".into(),
+            kind: EntryKind::Owned,
+            source: None,
+        };
+        assert!(entry_matches_search(&entry, "ecto"));
+        assert!(entry_matches_search(&entry, "PHOENIX"));
+        assert!(!entry_matches_search(&entry, "rust"));
         assert_eq!(
             merge_tags(&["elixir".into()], &["phoenix".into(), "elixir".into()]),
             vec!["elixir".to_string(), "phoenix".to_string()]

@@ -2,11 +2,14 @@
 //!
 //! Drift review uses a dedicated board UI in the CLI crate; add/import still use Prompter.
 
-use crate::ui::Prompter;
+use crate::ui::{Prompter, SelectItem};
 use crate::{AdoptAs, App, LibraryImportReport, Result};
 
 impl App {
-    /// Interactive add-by-tag: multi-select among matching Catalog Entries.
+    /// Interactive add: multi-select among Catalog Entries.
+    ///
+    /// `tags` optionally pre-filters (same AND semantics as `list --tag`).
+    /// The TUI supports further `/` search and `tag:` filters.
     pub fn interactive_add_by_tag(
         &self,
         tags: &[String],
@@ -17,11 +20,22 @@ impl App {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let labels: Vec<String> = rows
+        let items: Vec<SelectItem> = rows
             .iter()
-            .map(|r| format!("{} ({})", r.entry.name, r.entry.library))
+            .map(|r| {
+                let tags_suffix = if r.entry.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", r.entry.tags.join(","))
+                };
+                SelectItem {
+                    label: format!("{} ({}){tags_suffix}", r.entry.name, r.entry.library),
+                    search_text: format!("{} {}", r.entry.name, r.entry.library),
+                    tags: r.entry.tags.clone(),
+                }
+            })
             .collect();
-        let selected = prompler.multi_select("Add skills", &labels)?;
+        let selected = prompler.multi_select_filterable("Add skills", &items)?;
         let mut added = Vec::new();
         for idx in selected {
             let row = &rows[idx];
@@ -37,6 +51,7 @@ impl App {
         source: &str,
         library_name: &str,
         path_filter: Option<&str>,
+        tags: &[String],
         prompler: &mut dyn Prompter,
     ) -> Result<LibraryImportReport> {
         let candidates = self.library_import_discover(source, library_name, path_filter)?;
@@ -69,7 +84,14 @@ impl App {
                 items: Vec::new(),
             });
         }
-        self.library_import_filtered(source, library_name, path_filter, false, Some(&sources))
+        self.library_import_filtered(
+            source,
+            library_name,
+            path_filter,
+            false,
+            Some(&sources),
+            tags,
+        )
     }
 
     /// Interactive import adopt for leftovers.

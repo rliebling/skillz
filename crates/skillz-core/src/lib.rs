@@ -1994,12 +1994,32 @@ mod tests {
             .skill_new("b", &["t".into()])
             .unwrap();
         fx.app().libcommit_authored("b", "personal").unwrap();
+        fx.app()
+            .skill_new("c", &["other".into()])
+            .unwrap();
+        fx.app().libcommit_authored("c", "personal").unwrap();
         fs::remove_dir_all(fx.project_dir.join(".agents/skills/a")).ok();
         fs::remove_dir_all(fx.project_dir.join(".agents/skills/b")).ok();
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/c")).ok();
         let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
         lock.installations.clear();
         lock.save(&fx.project_dir).unwrap();
 
+        // Without --tag: all Catalog Entries available.
+        let mut ui = SelectAllPrompter;
+        let added = fx
+            .app()
+            .interactive_add_by_tag(&[], None, &mut ui)
+            .unwrap();
+        assert_eq!(added.len(), 3);
+
+        // Optional --tag still pre-filters.
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/a")).ok();
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/b")).ok();
+        fs::remove_dir_all(fx.project_dir.join(".agents/skills/c")).ok();
+        let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
+        lock.installations.clear();
+        lock.save(&fx.project_dir).unwrap();
         let mut ui = SelectAllPrompter;
         let added = fx
             .app()

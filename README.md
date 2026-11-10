@@ -81,7 +81,8 @@ skillz list
 skillz list --tag elixir --tag phoenix
 skillz list --dedupe
 skillz add ecto-thinking
-skillz add --tag elixir -i          # interactive multi-select
+skillz add -i                       # interactive multi-select (all Catalog Entries; / to filter)
+skillz add --tag elixir -i          # optional pre-filter, then multi-select
 ```
 
 `list` shows **Availability** (project skills dir, `~/.agents/skills`, `.cursor/skills`, `.claude/skills`, …) so you know what the agent can already load. `add` materializes into the Project `skills_dir` and records a Lock (collaborators get the files on clone).

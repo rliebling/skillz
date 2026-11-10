@@ -126,7 +126,7 @@ enum Commands {
         /// Also add detected sibling dependencies (best-effort)
         #[arg(long)]
         with_deps: bool,
-        /// Interactive multi-select (Ratatui)
+        /// Interactive multi-select (Ratatui); works without --tag (filter in UI with /)
         #[arg(short = 'i', long)]
         interactive: bool,
     },
@@ -517,13 +517,11 @@ fn run() -> skillz_core::Result<()> {
             interactive,
         }) => {
             if interactive {
-                if tags.is_empty() {
-                    return Err(skillz_core::SkillzError::Message(
-                        "`add -i` requires --tag filters to multi-select among".into(),
-                    ));
-                }
                 let mut ui = RatatuiPrompter;
                 let added = app.interactive_add_by_tag(&tags, library.as_deref(), &mut ui)?;
+                if added.is_empty() {
+                    println!("(no skills added)");
+                }
                 for skill_name in added {
                     println!("added {skill_name}");
                 }
