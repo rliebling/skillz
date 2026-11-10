@@ -63,7 +63,7 @@ enum Commands {
         /// How to record the Catalog Entry (`authored` / `upstream`); omit for Branch Lock edit path
         #[arg(long = "as", value_name = "KIND")]
         as_kind: Option<LibcommitKind>,
-        /// Upstream source string (defaults to fetch sidecar)
+        /// Upstream source (`github:…@rev` or `cmd:…`); defaults to fetch sidecar
         #[arg(long)]
         source: Option<String>,
         /// Commit message for Branch Lock libcommit

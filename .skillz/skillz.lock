@@ -33,6 +33,11 @@ content_hash = "sha256:13142856688012add387b351e8b0f8356a0d825496f34d1f6c6c22a45
 rev = "ac82820811ece521f2424ef264a08a51a0fe2652"
 branch = "skillz/setup-matt-pocock-skills"
 
+[installations.skillz]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:d090ff9d4594553955026e44958053144683ffe252812aa6f0ef4bb2a041df05"
+
 [installations.to-spec]
 library = "personal"
 entry_kind = "owned"

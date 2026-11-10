@@ -129,9 +129,15 @@ skillz libcommit my-skill --library personal --as authored
 skillz fetch github:owner/repo/path/to/skill
 skillz fetch github:owner/repo ecto-thinking
 skillz libcommit ecto-thinking --library personal --as upstream
+
+# Tool-Provided Upstream (command template; see ADR 0005)
+# Catalog stores cmd:… without @rev; Lock pins observational tool version.
+skillz libcommit rexpad --library personal --as upstream \
+  --source 'cmd:rexpad skill install --dir {dir}'
+# Optional version probe: …|version:rexpad version
 ```
 
-Until `libcommit`, new/fetched skills are **Drift**.
+Until `libcommit`, new/fetched skills are **Drift**. Agents working in this repo can load the **`skillz`** skill (`.agents/skills/skillz`) for CLI workflow guidance.
 
 ### 5. Edit, Branch Lock, promote
 

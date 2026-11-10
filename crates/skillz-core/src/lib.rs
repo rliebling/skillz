@@ -1216,32 +1216,42 @@ impl App {
                 "upstream Catalog Entry `{name}` is missing a source string"
             ))
         })?;
-        let parsed = source::GithubSource::parse(source)?;
-        let cache = self.paths.config_dir.join("cache");
-        let (skill_path, pinned) = fetch::resolve_github_skill(&cache, &parsed, Some(name))?;
         let dest = skill::skill_dir(&self.scope_skills_root(config), name);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                SkillzError::Message(format!(
-                    "failed to create {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
         let already = dest.join("SKILL.md").is_file();
         let prev_hash = if already {
             Some(skill::content_hash(&dest)?)
         } else {
             None
         };
-        skill::copy_skill_tree(&skill_path, &dest)?;
+
+        let (pinned_source, pinned_rev) = if source.starts_with("cmd:") {
+            let mut parsed = source::CmdSource::parse(source)?;
+            let version = parsed.validate_install_and_probe(&dest, name)?;
+            parsed = parsed.with_rev(version.clone());
+            (parsed.render(), Some(version))
+        } else {
+            let parsed = source::GithubSource::parse(source)?;
+            let cache = self.paths.config_dir.join("cache");
+            let (skill_path, pinned) = fetch::resolve_github_skill(&cache, &parsed, Some(name))?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    SkillzError::Message(format!(
+                        "failed to create {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            skill::copy_skill_tree(&skill_path, &dest)?;
+            (pinned.render(), pinned.rev.clone())
+        };
+
         let hash = skill::content_hash(&dest)?;
         let install = InstallationLock {
             library: entry.library.clone(),
             entry_kind: EntryKind::Upstream,
             content_hash: hash.clone(),
-            source: Some(pinned.render()),
-            rev: pinned.rev.clone(),
+            source: Some(pinned_source),
+            rev: pinned_rev,
             branch: None,
             overlay_from_library: None,
             overlay_from_entry: None,
@@ -1564,27 +1574,41 @@ impl App {
                     .to_string()
                 } else {
                     return Err(SkillzError::Message(
-                        "upstream libcommit requires a source string (pass --source or fetch via github:…)"
+                        "upstream libcommit requires a source string (pass --source as github:… or cmd:…, or fetch via github:…)"
                             .into(),
                     ));
                 }
             }
         };
-        // Validate grammar when it looks like github.
-        if source.starts_with("github:") {
+        let (catalog_source, lock_source, lock_rev) = if source.starts_with("cmd:") {
+            let mut parsed = source::CmdSource::parse(&source)?;
+            // Eager validation: install template + version probe (ADR 0005).
+            let version = parsed.validate_install_and_probe(&project_skill, name)?;
+            parsed = parsed.with_rev(version.clone());
+            (
+                parsed.render_catalog(),
+                parsed.render(),
+                Some(version),
+            )
+        } else if source.starts_with("github:") {
             let parsed = source::GithubSource::parse(&source)?;
             if parsed.rev.is_none() {
                 return Err(SkillzError::Message(
                     "upstream Lock source must include @rev".into(),
                 ));
             }
-        }
+            (source.clone(), source.clone(), parsed.rev.clone())
+        } else {
+            return Err(SkillzError::Message(format!(
+                "unsupported upstream source `{source}` (expected github:… or cmd:…)"
+            )));
+        };
 
         // Upstream Catalog Entry is a reference — do not vendor into Library skills/.
         let mut meta = LibraryMeta::load(&lib_path)?;
         meta.upsert_upstream(crate::library::UpstreamEntry {
             name: name.to_string(),
-            source: source.clone(),
+            source: catalog_source,
             tags: Vec::new(),
         });
         meta.save(&lib_path)?;
@@ -1595,8 +1619,8 @@ impl App {
             library: library_name.to_string(),
             entry_kind: EntryKind::Upstream,
             content_hash: hash,
-            source: Some(source),
-            rev: None,
+            source: Some(lock_source),
+            rev: lock_rev,
             branch: None,
             overlay_from_library: None,
             overlay_from_entry: None,
@@ -2655,6 +2679,138 @@ mod tests {
             .libs_dir
             .join("personal/skills/ecto-thinking")
             .exists());
+    }
+
+    fn write_fake_tool(bin: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(
+                bin,
+                r#"#!/bin/sh
+set -e
+if [ "$1" = "--version" ]; then
+  echo "fake-tool 9.9.9"
+  exit 0
+fi
+if [ "$1" = "version" ]; then
+  echo "fake-tool 9.9.9"
+  exit 0
+fi
+if [ "$1" = "skill" ] && [ "$2" = "install" ] && [ "$3" = "--dir" ]; then
+  dir="$4"
+  mkdir -p "$dir"
+  printf '%s\n' '---' 'name: fake-skill' 'description: from fake-tool' '---' '# fake' >"$dir/SKILL.md"
+  exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1
+"#,
+            )
+            .unwrap();
+            let mut perms = fs::metadata(bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(bin, perms).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = bin;
+            panic!("cmd: tool tests require unix");
+        }
+    }
+
+    #[test]
+    fn cmd_upstream_libcommit_validates_and_add_runs_template() {
+        let fx = Fixture::new();
+        let root = fx.libs_dir.parent().unwrap().to_path_buf();
+        let tool = root.join("fake-tool");
+        write_fake_tool(&tool);
+        let tool_s = tool.display().to_string();
+
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        // Seed Installation (as if the tool already ran once).
+        let skill_dir = fx.project_dir.join(".agents/skills/fake-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fake-skill\ndescription: seed\n---\n# seed\n",
+        )
+        .unwrap();
+
+        let source = format!("cmd:{tool_s} skill install --dir {{dir}}");
+        let lock = fx
+            .app()
+            .libcommit_upstream("fake-skill", "personal", Some(&source))
+            .unwrap();
+        assert_eq!(lock.entry_kind, EntryKind::Upstream);
+        assert_eq!(lock.rev.as_deref(), Some("9.9.9"));
+        assert!(lock
+            .source
+            .as_deref()
+            .unwrap()
+            .ends_with("@9.9.9"));
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert_eq!(meta.upstream.len(), 1);
+        assert!(
+            !meta.upstream[0].source.contains('@'),
+            "catalog omits @rev: {}",
+            meta.upstream[0].source
+        );
+        assert!(!fx
+            .libs_dir
+            .join("personal/skills/fake-skill")
+            .exists());
+
+        // Second Managed Project: add must re-run the tool template.
+        let other = root.join("other-project");
+        fs::create_dir_all(&other).unwrap();
+        fx.app_at(&other)
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        let (outcome, _, _) = fx
+            .app_at(&other)
+            .add_skill_with_deps("fake-skill", None, false)
+            .unwrap();
+        match outcome {
+            AddOutcome::Installed(l) | AddOutcome::Refreshed(l) | AddOutcome::AlreadyPresent(l) => {
+                assert_eq!(l.rev.as_deref(), Some("9.9.9"));
+            }
+        }
+        assert!(other
+            .join(".agents/skills/fake-skill/SKILL.md")
+            .is_file());
+    }
+
+    #[test]
+    fn cmd_upstream_libcommit_rejects_missing_tool() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("ghost", &[]).unwrap();
+        let err = fx
+            .app()
+            .libcommit_upstream(
+                "ghost",
+                "personal",
+                Some("cmd:/no/such/tool-xyz skill install --dir {dir}"),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("failed") || err.to_string().contains("No such"),
+            "{err}"
+        );
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert!(meta.upstream.is_empty());
     }
 
     #[test]
