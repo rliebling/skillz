@@ -69,6 +69,7 @@ skillz project init --bind personal
 # or: --bind company:ro --bind personal
 # or: --skills-dir .claude/skills
 skillz status
+skillz hooks show      # dry-run: planned gate path(s) + contents
 skillz hooks install   # git pre-commit + jj push-with-checks when applicable
 ```
 
@@ -145,6 +146,7 @@ skillz project import --library personal -i    # per-skill upstream | authored |
 skillz drift
 skillz drift -i                      # board: set skip/libcommit/promote/remove per skill
 skillz drift --check                 # non-zero exit for hooks
+skillz hooks show                    # dry-run: paths + planned contents
 skillz hooks install
 ```
 
@@ -153,6 +155,7 @@ In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→`
 - **git:** pre-commit runs `skillz drift --check` on the Managed Project.
 - **jj:** repo-local alias `jj push-with-checks` (drift check, then `jj git push`). Ordinary `jj git push` stays unwrapped.
 - Escape: `--allow-drift` or `SKILLZ_ALLOW_DRIFT=1`.
+- `hooks show` prints the target file(s) and planned gate text without writing.
 
 Sibling dependency detection is best-effort (`--with-deps` on `add` / `fetch`).
 

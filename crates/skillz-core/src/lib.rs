@@ -810,6 +810,17 @@ impl App {
         )
     }
 
+    /// Dry-run: describe Drift gates `hooks install` would write (no file changes).
+    pub fn hooks_show(&self) -> Result<Vec<hooks::HookPlan>> {
+        if self.scope == Scope::User {
+            return Err(SkillzError::Message(
+                "hooks show applies to Managed Projects, not user scope".into(),
+            ));
+        }
+        self.require_managed()?;
+        hooks::plan_hooks(&self.paths.cwd)
+    }
+
     pub fn hooks_install(&self) -> Result<Vec<PathBuf>> {
         if self.scope == Scope::User {
             return Err(SkillzError::Message(
@@ -2569,6 +2580,38 @@ mod tests {
         assert!(body.contains("push-with-checks"));
         assert!(body.contains("skillz drift --check"));
         assert!(!body.contains("skillz push"));
+    }
+
+    #[test]
+    fn hooks_show_git_and_jj_dry_run() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fs::create_dir_all(fx.project_dir.join(".git/hooks")).unwrap();
+        fs::create_dir_all(fx.project_dir.join(".jj/repo")).unwrap();
+
+        let plans = fx.app().hooks_show().unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].kind, hooks::HookKind::GitPreCommit);
+        assert_eq!(plans[0].status, hooks::HookPlanStatus::WouldCreate);
+        assert!(plans[0].contents.contains("skillz drift --check"));
+        assert_eq!(plans[1].kind, hooks::HookKind::JjPushWithChecks);
+        assert_eq!(plans[1].status, hooks::HookPlanStatus::WouldCreate);
+        assert!(plans[1].contents.contains("push-with-checks"));
+
+        // Dry-run must not create files.
+        assert!(!plans[0].path.exists());
+        assert!(!plans[1].path.exists());
+
+        fx.app().hooks_install().unwrap();
+        let after = fx.app().hooks_show().unwrap();
+        assert!(after
+            .iter()
+            .all(|p| p.status == hooks::HookPlanStatus::AlreadyInstalled));
     }
 
     #[test]

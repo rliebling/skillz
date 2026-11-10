@@ -97,7 +97,7 @@ enum Commands {
         #[arg(short = 'i', long)]
         interactive: bool,
     },
-    /// Install git/jj Drift hooks for this Managed Project
+    /// Show or install git/jj Drift hooks for this Managed Project
     Hooks {
         #[command(subcommand)]
         command: HooksCommands,
@@ -207,8 +207,10 @@ enum LibraryCommands {
 
 #[derive(Debug, Subcommand)]
 enum HooksCommands {
-    /// Install the git pre-commit Drift gate
+    /// Install git pre-commit and/or jj push-with-checks Drift gates
     Install,
+    /// Show Drift gate(s) that install would write (dry-run; no file changes)
+    Show,
 }
 
 #[derive(Debug, Subcommand)]
@@ -604,6 +606,22 @@ fn run() -> skillz_core::Result<()> {
                 let paths = app.hooks_install()?;
                 for path in paths {
                     println!("installed drift gate at {}", path.display());
+                }
+                Ok(())
+            }
+            HooksCommands::Show => {
+                let plans = app.hooks_show()?;
+                for (i, plan) in plans.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("{}", plan.kind.as_str());
+                    println!("  path:    {}", plan.path.display());
+                    println!("  status:  {}", plan.status.as_str());
+                    println!("  ---");
+                    for line in plan.contents.lines() {
+                        println!("  {line}");
+                    }
                 }
                 Ok(())
             }
