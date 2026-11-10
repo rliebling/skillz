@@ -22,7 +22,9 @@ pub mod vcs;
 pub mod vcs_ops;
 
 pub use import::{AdoptAs, ImportPlan, SkillfileEntry};
-pub use ui::{CancelPrompter, Prompter, SelectAllPrompter, SelectFirstNPrompter};
+pub use ui::{
+    CancelPrompter, Prompter, SelectAllPrompter, SelectFirstNPrompter, SelectItem,
+};
 
 pub use catalog::{Availability, CatalogEntry};
 pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
@@ -774,7 +776,16 @@ impl App {
                     binding.name
                 )));
             };
-            for entry in catalog::list_owned_entries(&binding.name, &record.path)? {
+            let mut entries = catalog::list_owned_entries(&binding.name, &record.path)?;
+            let owned_names: std::collections::BTreeSet<_> =
+                entries.iter().map(|e| e.name.clone()).collect();
+            for up in catalog::list_upstream_entries(&binding.name, &record.path)? {
+                if !owned_names.contains(&up.name) {
+                    entries.push(up);
+                }
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for entry in entries {
                 if !catalog::entry_matches_tags(&entry, &tag_filters) {
                     continue;
                 }
@@ -872,7 +883,9 @@ impl App {
         };
 
         let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
-        let outcome = if dest.join("SKILL.md").is_file() {
+        let outcome = if row.entry.kind == EntryKind::Upstream {
+            self.add_upstream_installation(&config, name, &row.entry)?
+        } else if dest.join("SKILL.md").is_file() {
             let existing = skill::content_hash(&dest)?;
             if existing == row.entry.content_hash {
                 let mut lock = self.load_scope_lock()?;
@@ -916,8 +929,13 @@ impl App {
             .map(|r| r.entry.name)
             .collect();
         let present = deps::list_skill_names(&self.scope_skills_root(&config))?;
+        let dep_scan_path = if dest.join("SKILL.md").is_file() {
+            &dest
+        } else {
+            &row.entry.skill_path
+        };
         let mut missing = self.sibling_dep_warnings(
-            &row.entry.skill_path,
+            dep_scan_path,
             &catalog_names,
             &present,
         )?;
@@ -967,6 +985,57 @@ impl App {
         lock.installations.insert(name.to_string(), install.clone());
         self.save_scope_lock(&lock)?;
         Ok(install)
+    }
+
+    fn add_upstream_installation(
+        &self,
+        config: &ProjectConfig,
+        name: &str,
+        entry: &CatalogEntry,
+    ) -> Result<AddOutcome> {
+        let source = entry.source.as_deref().ok_or_else(|| {
+            SkillzError::Message(format!(
+                "upstream Catalog Entry `{name}` is missing a source string"
+            ))
+        })?;
+        let parsed = source::GithubSource::parse(source)?;
+        let cache = self.paths.config_dir.join("cache");
+        let (skill_path, pinned) = fetch::resolve_github_skill(&cache, &parsed, Some(name))?;
+        let dest = skill::skill_dir(&self.scope_skills_root(config), name);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SkillzError::Message(format!(
+                    "failed to create {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let already = dest.join("SKILL.md").is_file();
+        let prev_hash = if already {
+            Some(skill::content_hash(&dest)?)
+        } else {
+            None
+        };
+        skill::copy_skill_tree(&skill_path, &dest)?;
+        let hash = skill::content_hash(&dest)?;
+        let install = InstallationLock {
+            library: entry.library.clone(),
+            entry_kind: EntryKind::Upstream,
+            content_hash: hash.clone(),
+            source: Some(pinned.render()),
+            rev: pinned.rev.clone(),
+            branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
+        };
+        let mut lock = self.load_scope_lock()?;
+        lock.installations.insert(name.to_string(), install.clone());
+        self.save_scope_lock(&lock)?;
+        Ok(match prev_hash {
+            Some(prev) if prev == hash => AddOutcome::AlreadyPresent(install),
+            Some(_) => AddOutcome::Refreshed(install),
+            None => AddOutcome::Installed(install),
+        })
     }
 
     fn writable_library_path(&self, library_name: &str) -> Result<(ProjectConfig, PathBuf)> {
@@ -1292,6 +1361,7 @@ impl App {
         meta.upsert_upstream(crate::library::UpstreamEntry {
             name: name.to_string(),
             source: source.clone(),
+            tags: Vec::new(),
         });
         meta.save(&lib_path)?;
 
@@ -1447,8 +1517,9 @@ impl App {
         library_name: &str,
         path_filter: Option<&str>,
         dry_run: bool,
+        tags: &[String],
     ) -> Result<LibraryImportReport> {
-        self.library_import_filtered(source, library_name, path_filter, dry_run, None)
+        self.library_import_filtered(source, library_name, path_filter, dry_run, None, tags)
     }
 
     pub fn library_import_filtered(
@@ -1458,6 +1529,7 @@ impl App {
         path_filter: Option<&str>,
         dry_run: bool,
         only_sources: Option<&[String]>,
+        tags: &[String],
     ) -> Result<LibraryImportReport> {
         let lib_path = self.writable_registry_library(library_name)?;
         let mut candidates = self.library_import_discover(source, library_name, path_filter)?;
@@ -1465,6 +1537,7 @@ impl App {
             let want: std::collections::BTreeSet<&str> = only.iter().map(|s| s.as_str()).collect();
             candidates.retain(|c| want.contains(c.source.as_str()));
         }
+        let assign_tags = catalog::normalize_tag_filters(tags);
 
         let mut meta = LibraryMeta::load(&lib_path)?;
         let owned_names: std::collections::BTreeSet<String> =
@@ -1480,17 +1553,19 @@ impl App {
         for skill in candidates {
             let pinned = source::GithubSource::parse(&skill.source)?;
             let source_str = skill.source.clone();
+            let existing = meta.upstream.iter().find(|e| e.name == skill.name).cloned();
             let action = if owned_names.contains(&skill.name) {
                 LibraryImportAction::SkipOwned
             } else if seen_names.contains(&skill.name) {
                 LibraryImportAction::SkipCollision {
                     existing_source: format!("(earlier discovery of `{}`)", skill.name),
                 }
-            } else if let Some(existing) = meta.upstream.iter().find(|e| e.name == skill.name) {
+            } else if let Some(ref existing) = existing {
                 let existing_parsed = source::GithubSource::parse(&existing.source).ok();
                 match existing_parsed {
                     Some(ex) if ex.identity_key() == pinned.identity_key() => {
-                        if existing.source == source_str {
+                        let merged = catalog::merge_tags(&existing.tags, &assign_tags);
+                        if existing.source == source_str && merged == existing.tags {
                             LibraryImportAction::SkipIdentical
                         } else {
                             LibraryImportAction::Update
@@ -1507,9 +1582,21 @@ impl App {
             match &action {
                 LibraryImportAction::Add | LibraryImportAction::Update => {
                     if !dry_run {
+                        let tags = match &existing {
+                            Some(ex)
+                                if source::GithubSource::parse(&ex.source)
+                                    .ok()
+                                    .map(|p| p.identity_key() == pinned.identity_key())
+                                    .unwrap_or(false) =>
+                            {
+                                catalog::merge_tags(&ex.tags, &assign_tags)
+                            }
+                            _ => assign_tags.clone(),
+                        };
                         meta.upsert_upstream(crate::library::UpstreamEntry {
                             name: skill.name.clone(),
                             source: source_str.clone(),
+                            tags,
                         });
                     }
                     seen_names.insert(skill.name.clone());
@@ -2438,7 +2525,7 @@ mod tests {
         let before = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
         let dry = fx
             .app()
-            .library_import("github:mattpocock/skills", "personal", None, true)
+            .library_import("github:mattpocock/skills", "personal", None, true, &[])
             .unwrap();
         assert!(dry.dry_run);
         assert!(dry.items.iter().any(|i| i.name == "grilling"));
@@ -2454,6 +2541,7 @@ mod tests {
                 "personal",
                 Some("skills/engineering"),
                 false,
+                &["elixir".into()],
             )
             .unwrap();
         assert_eq!(
@@ -2473,11 +2561,19 @@ mod tests {
         let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
         assert_eq!(meta.upstream.len(), 1);
         assert_eq!(meta.upstream[0].name, "grilling");
+        assert_eq!(meta.upstream[0].tags, vec!["elixir".to_string()]);
 
         // Full import: focus added; other grilling collides with existing / earlier.
+        // New tag on re-import merges onto grilling.
         let full = fx
             .app()
-            .library_import("github:mattpocock/skills", "personal", None, false)
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                None,
+                false,
+                &["phoenix".into()],
+            )
             .unwrap();
         let focus = full.items.iter().find(|i| i.name == "focus").unwrap();
         assert!(matches!(focus.action, LibraryImportAction::Add));
@@ -2497,6 +2593,11 @@ mod tests {
 
         let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
         assert_eq!(meta.upstream.len(), 2);
+        let grilling = meta.upstream.iter().find(|u| u.name == "grilling").unwrap();
+        assert!(grilling.tags.contains(&"elixir".to_string()));
+        assert!(grilling.tags.contains(&"phoenix".to_string()));
+        let focus_up = meta.upstream.iter().find(|u| u.name == "focus").unwrap();
+        assert_eq!(focus_up.tags, vec!["phoenix".to_string()]);
 
         // No Project / user skills materialization.
         assert!(!fx.project_dir.join(".agents/skills").exists());
@@ -2507,6 +2608,7 @@ mod tests {
         meta.upsert_upstream(crate::library::UpstreamEntry {
             name: "focus".into(),
             source: "github:other/repo/focus@abc".into(),
+            tags: vec!["phoenix".into()],
         });
         meta.save(&fx.libs_dir.join("personal")).unwrap();
         let collide = fx
@@ -2516,6 +2618,7 @@ mod tests {
                 "personal",
                 Some("skills/productivity"),
                 false,
+                &[],
             )
             .unwrap();
         assert!(matches!(
@@ -2535,7 +2638,7 @@ mod tests {
         assert!(!fx.project_dir.join(".skillz/skillz.toml").is_file());
         let report = fx
             .app()
-            .library_import("github:acme/skills", "personal", None, false)
+            .library_import("github:acme/skills", "personal", None, false, &[])
             .unwrap();
         assert!(!report.items.is_empty());
     }
@@ -2555,6 +2658,7 @@ mod tests {
                 "github:mattpocock/skills",
                 "personal",
                 None,
+                &[],
                 &mut CancelPrompter,
             )
             .unwrap_err();
@@ -2572,6 +2676,7 @@ mod tests {
                 "github:mattpocock/skills",
                 "personal",
                 Some("skills/engineering"),
+                &["process".into()],
                 &mut ui,
             )
             .unwrap();
@@ -2581,6 +2686,7 @@ mod tests {
         let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
         assert_eq!(meta.upstream.len(), 1);
         assert_eq!(meta.upstream[0].name, "grilling");
+        assert_eq!(meta.upstream[0].tags, vec!["process".to_string()]);
         assert!(!fx.project_dir.join(".agents/skills").exists());
     }
 }

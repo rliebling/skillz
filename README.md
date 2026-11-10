@@ -55,6 +55,7 @@ skillz library list
 skillz library import github:mattpocock/skills --library personal
 skillz library import https://github.com/mattpocock/skills --library personal --dry-run
 skillz library import github:mattpocock/skills --library personal --path skills/engineering
+skillz library import github:mattpocock/skills --library personal --tag elixir --tag phoenix
 skillz library import github:mattpocock/skills --library personal -i
 ```
 

@@ -192,6 +192,9 @@ enum LibraryCommands {
         /// Interactive multi-select of discovered skills (Ratatui)
         #[arg(short = 'i', long)]
         interactive: bool,
+        /// Assign tags to imported Upstream entries (repeatable; comma-separated OK)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
 }
 
@@ -612,6 +615,7 @@ fn run() -> skillz_core::Result<()> {
                 path,
                 dry_run,
                 interactive,
+                tags,
             } => {
                 if interactive && dry_run {
                     return Err(skillz_core::SkillzError::Message(
@@ -624,10 +628,11 @@ fn run() -> skillz_core::Result<()> {
                         &source,
                         &library,
                         path.as_deref(),
+                        &tags,
                         &mut ui,
                     )?
                 } else {
-                    app.library_import(&source, &library, path.as_deref(), dry_run)?
+                    app.library_import(&source, &library, path.as_deref(), dry_run, &tags)?
                 };
                 let prefix = if report.dry_run { "dry-run " } else { "" };
                 if report.items.is_empty() {

@@ -15,6 +15,8 @@ pub const SKILLS_DIR: &str = "skills";
 pub struct UpstreamEntry {
     pub name: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// Versioned Library metadata stored in the Library repo.

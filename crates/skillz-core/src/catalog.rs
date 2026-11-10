@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::library::SKILLS_DIR;
-use crate::skill;
+use crate::skill::{self, EntryKind};
 use crate::{Result, SkillzError};
 
 /// A Catalog Entry discovered in a bound Library.
@@ -16,6 +16,9 @@ pub struct CatalogEntry {
     pub skill_path: PathBuf,
     pub tags: Vec<String>,
     pub content_hash: String,
+    pub kind: EntryKind,
+    /// Upstream source string when [`kind`] is [`EntryKind::Upstream`].
+    pub source: Option<String>,
 }
 
 /// Where a skill's files are already present for the current scope.
@@ -80,6 +83,8 @@ pub fn list_owned_entries(library_name: &str, library_path: &Path) -> Result<Vec
             skill_path,
             tags,
             content_hash,
+            kind: EntryKind::Owned,
+            source: None,
         });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -137,6 +142,49 @@ pub fn entry_matches_tags(entry: &CatalogEntry, required: &[String]) -> bool {
     required.iter().all(|t| entry.tags.iter().any(|e| e == t))
 }
 
+
+/// Merge `incoming` into `existing` (union, preserving existing order then new).
+pub fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut out = existing.to_vec();
+    for tag in normalize_tag_filters(incoming) {
+        if !out.iter().any(|t| t == &tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+/// List Upstream Catalog Entries from `library.toml`.
+pub fn list_upstream_entries(
+    library_name: &str,
+    library_path: &Path,
+) -> Result<Vec<CatalogEntry>> {
+    use crate::library::LibraryMeta;
+    let meta_path = library_path.join(crate::library::LIBRARY_TOML);
+    if !meta_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let meta = LibraryMeta::load(library_path)?;
+    let mut entries = Vec::new();
+    for up in meta.upstream {
+        // Upstream is a reference — no Owned tree. Use a stable sentinel path.
+        let skill_path = library_path.join(SKILLS_DIR).join(&up.name);
+        entries.push(CatalogEntry {
+            name: up.name,
+            library: library_name.to_string(),
+            library_path: library_path.to_path_buf(),
+            skill_path,
+            tags: up.tags,
+            // Source string identity stands in until Installation is hashed.
+            content_hash: format!("upstream:{}", up.source),
+            kind: EntryKind::Upstream,
+            source: Some(up.source),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +199,14 @@ mod tests {
         assert_eq!(
             normalize_tag_filters(&["elixir,phoenix".into(), "otp".into()]),
             vec!["elixir".to_string(), "phoenix".to_string(), "otp".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_tags_unions_preserving_order() {
+        assert_eq!(
+            merge_tags(&["elixir".into()], &["phoenix".into(), "elixir".into()]),
+            vec!["elixir".to_string(), "phoenix".to_string()]
         );
     }
 }
