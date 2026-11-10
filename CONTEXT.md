@@ -29,7 +29,7 @@ A skill whose content originated with the library owner.
 _Avoid_: custom skill, my skill
 
 **Upstream Skill**:
-A third-party skill recorded in a Library as a catalog reference (source + Lock), not as owned editable content.
+A third-party skill recorded in a Library as a catalog reference (source + Lock), not as owned editable content. The source may name a forge path (e.g. GitHub) or a tool install command template (Tool-Provided).
 _Avoid_: downloaded skill, remote skill
 
 **Owned Entry**:
@@ -45,7 +45,7 @@ A skill that began as Upstream, Tool-Provided, or another Library's content and 
 _Avoid_: tweaked skill, modified copy
 
 **Tool-Provided Skill**:
-A skill installed by a tool onto the machine (often as a global); out of scope for the Personal Library until promoted to Authored or Forked.
+A skill whose canonical distribution is via a tool install (often landing as a machine global). It stays out of a Library until explicitly libcommitted; once cataloged it is an Upstream reference (tool-oriented source + Lock) that re-materializes through the providing tool, not Owned Library content—unless later Forked.
 _Avoid_: installed skill, global skill
 
 **Project**:
