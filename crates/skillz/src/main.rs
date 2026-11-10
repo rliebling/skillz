@@ -207,9 +207,9 @@ enum LibraryCommands {
 
 #[derive(Debug, Subcommand)]
 enum HooksCommands {
-    /// Install git pre-commit and/or jj push-with-checks Drift gates
+    /// Install the Drift gate for this repo's VCS (git pre-commit or jj alias)
     Install,
-    /// Show Drift gate(s) that install would write (dry-run; no file changes)
+    /// Show the Drift gate install would write (dry-run; no file changes)
     Show,
 }
 

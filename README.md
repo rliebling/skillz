@@ -69,8 +69,8 @@ skillz project init --bind personal
 # or: --bind company:ro --bind personal
 # or: --skills-dir .claude/skills
 skillz status
-skillz hooks show      # dry-run: planned gate path(s) + contents
-skillz hooks install   # git pre-commit + jj push-with-checks when applicable
+skillz hooks show      # dry-run: planned gate path + contents
+skillz hooks install   # git pre-commit XOR jj push-with-checks (by VCS)
 ```
 
 This writes `.skillz/skillz.toml` and an empty `.skillz/skillz.lock`. No skills are installed yet.
@@ -152,10 +152,10 @@ skillz hooks install
 
 In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays. Confirming Remove warns (soft) when a retained Installation appears to depend on the skill being dropped.
 
-- **git:** pre-commit runs `skillz drift --check` on the Managed Project.
-- **jj:** repo-local alias `jj push-with-checks` (drift check, then `jj git push`). Ordinary `jj git push` stays unwrapped.
+- **git-only:** pre-commit runs `skillz drift --check` on the Managed Project.
+- **jj** (including colocated): repo-local alias `jj push-with-checks` only (drift check, then `jj git push`). No git pre-commit — `jj commit` would not run it. Ordinary `jj git push` stays unwrapped.
 - Escape: `--allow-drift` or `SKILLZ_ALLOW_DRIFT=1`.
-- `hooks show` prints the target file(s) and planned gate text without writing.
+- `hooks show` prints the target file and planned gate text without writing.
 
 Sibling dependency detection is best-effort (`--with-deps` on `add` / `fetch`).
 

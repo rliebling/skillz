@@ -828,25 +828,15 @@ impl App {
             ));
         }
         self.require_managed()?;
-        let mut installed = Vec::new();
-        match hooks::install_git_pre_commit(&self.paths.cwd) {
-            Ok(path) => installed.push(path),
-            Err(err) => {
-                // jj-only checkouts may still get the alias below.
-                if infer_vcs(&self.paths.cwd) != Some(Vcs::Jj) {
-                    return Err(err);
-                }
-            }
+        match infer_vcs(&self.paths.cwd) {
+            Some(Vcs::Jj) => Ok(vec![hooks::install_jj_push_with_checks(
+                &self.paths.cwd,
+            )?]),
+            Some(Vcs::Git) => Ok(vec![hooks::install_git_pre_commit(&self.paths.cwd)?]),
+            None => Err(SkillzError::Message(
+                "no hooks installed (need git or jj metadata)".into(),
+            )),
         }
-        if infer_vcs(&self.paths.cwd) == Some(Vcs::Jj) {
-            installed.push(hooks::install_jj_push_with_checks(&self.paths.cwd)?);
-        }
-        if installed.is_empty() {
-            return Err(SkillzError::Message(
-                "no hooks installed (need git and/or jj metadata)".into(),
-            ));
-        }
-        Ok(installed)
     }
 
     /// List Catalog Entries from bound Libraries (or a single `--library`).
@@ -2570,20 +2560,21 @@ mod tests {
         fx.app()
             .project_init(&["personal".into()], None)
             .unwrap();
+        // Colocated-looking tree: .git present, but jj wins — no pre-commit.
+        fs::create_dir_all(fx.project_dir.join(".git/hooks")).unwrap();
         fs::create_dir_all(fx.project_dir.join(".jj/repo")).unwrap();
         let hooks = fx.app().hooks_install().unwrap();
-        let jj_cfg = hooks
-            .iter()
-            .find(|p| p.ends_with("config.toml"))
-            .expect("jj config");
-        let body = fs::read_to_string(jj_cfg).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].ends_with("config.toml"));
+        let body = fs::read_to_string(&hooks[0]).unwrap();
         assert!(body.contains("push-with-checks"));
         assert!(body.contains("skillz drift --check"));
         assert!(!body.contains("skillz push"));
+        assert!(!fx.project_dir.join(".git/hooks/pre-commit").exists());
     }
 
     #[test]
-    fn hooks_show_git_and_jj_dry_run() {
+    fn hooks_show_vcs_exclusive_dry_run() {
         let fx = Fixture::new();
         fx.app()
             .library_init(&fx.libs_dir.join("personal"), "personal")
@@ -2591,27 +2582,28 @@ mod tests {
         fx.app()
             .project_init(&["personal".into()], None)
             .unwrap();
+
         fs::create_dir_all(fx.project_dir.join(".git/hooks")).unwrap();
+        let git_plans = fx.app().hooks_show().unwrap();
+        assert_eq!(git_plans.len(), 1);
+        assert_eq!(git_plans[0].kind, hooks::HookKind::GitPreCommit);
+        assert_eq!(git_plans[0].status, hooks::HookPlanStatus::WouldCreate);
+        assert!(git_plans[0].contents.contains("skillz drift --check"));
+        assert!(!git_plans[0].path.exists());
+
         fs::create_dir_all(fx.project_dir.join(".jj/repo")).unwrap();
-
-        let plans = fx.app().hooks_show().unwrap();
-        assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].kind, hooks::HookKind::GitPreCommit);
-        assert_eq!(plans[0].status, hooks::HookPlanStatus::WouldCreate);
-        assert!(plans[0].contents.contains("skillz drift --check"));
-        assert_eq!(plans[1].kind, hooks::HookKind::JjPushWithChecks);
-        assert_eq!(plans[1].status, hooks::HookPlanStatus::WouldCreate);
-        assert!(plans[1].contents.contains("push-with-checks"));
-
-        // Dry-run must not create files.
-        assert!(!plans[0].path.exists());
-        assert!(!plans[1].path.exists());
+        let jj_plans = fx.app().hooks_show().unwrap();
+        assert_eq!(jj_plans.len(), 1);
+        assert_eq!(jj_plans[0].kind, hooks::HookKind::JjPushWithChecks);
+        assert_eq!(jj_plans[0].status, hooks::HookPlanStatus::WouldCreate);
+        assert!(jj_plans[0].contents.contains("push-with-checks"));
+        assert!(!jj_plans[0].path.exists());
 
         fx.app().hooks_install().unwrap();
         let after = fx.app().hooks_show().unwrap();
-        assert!(after
-            .iter()
-            .all(|p| p.status == hooks::HookPlanStatus::AlreadyInstalled));
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].status, hooks::HookPlanStatus::AlreadyInstalled);
+        assert!(!fx.project_dir.join(".git/hooks/pre-commit").exists());
     }
 
     #[test]

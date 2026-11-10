@@ -79,25 +79,17 @@ pub struct HookPlan {
 }
 
 /// Plan Drift gates for a Managed Project root without writing files.
+///
+/// VCS-exclusive: jj (including colocated) → only the push-with-checks alias;
+/// git-only → only the pre-commit hook. Never both.
 pub fn plan_hooks(project_root: &Path) -> Result<Vec<HookPlan>> {
-    let mut plans = Vec::new();
-    match plan_git_pre_commit(project_root) {
-        Ok(plan) => plans.push(plan),
-        Err(err) => {
-            if infer_vcs(project_root) != Some(Vcs::Jj) {
-                return Err(err);
-            }
-        }
+    match infer_vcs(project_root) {
+        Some(Vcs::Jj) => Ok(vec![plan_jj_push_with_checks(project_root)?]),
+        Some(Vcs::Git) => Ok(vec![plan_git_pre_commit(project_root)?]),
+        None => Err(SkillzError::Message(
+            "no hooks applicable (need git or jj metadata)".into(),
+        )),
     }
-    if infer_vcs(project_root) == Some(Vcs::Jj) {
-        plans.push(plan_jj_push_with_checks(project_root)?);
-    }
-    if plans.is_empty() {
-        return Err(SkillzError::Message(
-            "no hooks applicable (need git and/or jj metadata)".into(),
-        ));
-    }
-    Ok(plans)
 }
 
 pub fn install_git_pre_commit(project_root: &Path) -> Result<PathBuf> {
