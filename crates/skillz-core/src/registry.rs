@@ -70,6 +70,34 @@ impl Registry {
         self.libraries.insert(name, record);
         Ok(())
     }
+
+    /// Find the registered Library whose root contains `path` (longest match wins).
+    pub fn library_covering_path(&self, path: &Path) -> Option<(String, LibraryRecord)> {
+        let target = canonicalize_or_clone(path);
+        let mut best: Option<(String, LibraryRecord, usize)> = None;
+        for (name, rec) in &self.libraries {
+            let lib = canonicalize_or_clone(&rec.path);
+            if path_is_within(&target, &lib) {
+                let len = lib.as_os_str().len();
+                let replace = match &best {
+                    None => true,
+                    Some((_, _, best_len)) => len > *best_len,
+                };
+                if replace {
+                    best = Some((name.clone(), rec.clone(), len));
+                }
+            }
+        }
+        best.map(|(name, rec, _)| (name, rec))
+    }
+}
+
+fn canonicalize_or_clone(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).is_ok()
 }
 
 #[cfg(test)]
@@ -92,5 +120,35 @@ mod tests {
         reg.save(&path).unwrap();
         let loaded = Registry::load(&path).unwrap();
         assert_eq!(loaded, reg);
+    }
+
+    #[test]
+    fn library_covering_path_prefers_longest_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("libs");
+        let inner = outer.join("personal");
+        std::fs::create_dir_all(inner.join("skills")).unwrap();
+        let mut reg = Registry::default();
+        reg.insert(
+            "libs".into(),
+            LibraryRecord {
+                path: outer.clone(),
+                read_only: false,
+            },
+        )
+        .unwrap();
+        reg.insert(
+            "personal".into(),
+            LibraryRecord {
+                path: inner.clone(),
+                read_only: false,
+            },
+        )
+        .unwrap();
+        let (name, _) = reg
+            .library_covering_path(&inner.join("skills"))
+            .expect("cover");
+        assert_eq!(name, "personal");
+        assert!(reg.library_covering_path(&dir.path().join("other")).is_none());
     }
 }

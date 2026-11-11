@@ -39,7 +39,7 @@ Example lock/catalog rows use `source = "github:owner/repo/path/to/skill@abc123"
 
 ```text
 $ skillz library init ~/code/my-skills --name personal
-$ skillz library add ~/code/acme-skills --name company --read-only
+$ skillz library register ~/code/acme-skills --name company --read-only
 $ skillz library list
 ```
 
@@ -56,6 +56,8 @@ $ skillz library import github:mattpocock/skills --library personal
 $ skillz library import https://github.com/mattpocock/skills --library personal --dry-run
 $ skillz library import github:mattpocock/skills --library personal --path skills/engineering
 $ skillz library import github:mattpocock/skills --library personal -i   # multi-select
+$ cd ~/code/my-skills && skillz library import github:mattpocock/skills   # --library from cwd
+$ skillz library list --catalog
 ```
 
 Decisions:

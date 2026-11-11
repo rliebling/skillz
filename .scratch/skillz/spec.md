@@ -66,7 +66,7 @@ Agreed command-level usage is in `.scratch/skillz/usage-flows.md` and summarized
 Canonical transcripts: `.scratch/skillz/usage-flows.md`.
 
 ### A — Library bootstrap
-`library init` / `library add` / `library list`. Registry is **user-global** name → local path. Committed Project Bindings use shared **name + remote URL**. VCS inferred (`.jj/` → jj, else git).
+`library init` / `library register` / `library list`. Registry is **user-global** name → local path. Committed Project Bindings use shared **name + remote URL**. VCS inferred (`.jj/` → jj, else git). From inside a registered Library checkout, `--library` defaults to that Library for `library import` / `library list --catalog` (and top-level catalog `list`).
 
 ### B — New Managed Project
 `project init --bind …` writes Bindings + empty Locks; default `--skills-dir .agents/skills` (overridable). No skills installed yet. Hooks installed.

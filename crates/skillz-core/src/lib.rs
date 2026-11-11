@@ -843,6 +843,9 @@ impl App {
     ///
     /// When `project_only` is true, only skills present in this Project's
     /// skills dir and/or recorded in the Project Lock are returned.
+    ///
+    /// Outside a Managed Project / user scope, falls back to the Catalog of
+    /// `--library` or the registered Library that contains cwd (implies catalog).
     pub fn list_skills(
         &self,
         library_filter: Option<&str>,
@@ -850,7 +853,13 @@ impl App {
         dedupe: bool,
         project_only: bool,
     ) -> Result<Vec<ListRow>> {
-        let config = self.load_scope_config()?;
+        let config = match self.load_scope_config() {
+            Ok(c) => c,
+            Err(err) => {
+                let name = self.resolve_library_name(library_filter).map_err(|_| err)?;
+                return self.list_library_catalog(&name, tags, dedupe);
+            }
+        };
         let registry = self.load_registry()?;
         let tag_filters = catalog::normalize_tag_filters(tags);
         let project_names = if project_only {
@@ -970,6 +979,46 @@ impl App {
                 });
             }
             rows.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
+        }
+        Ok(rows)
+    }
+
+    /// List Owned + Upstream Catalog Entries for one registered Library (no Project required).
+    pub fn list_library_catalog(
+        &self,
+        library_name: &str,
+        tags: &[String],
+        dedupe: bool,
+    ) -> Result<Vec<ListRow>> {
+        let registry = self.load_registry()?;
+        let record = registry.libraries.get(library_name).ok_or_else(|| {
+            SkillzError::Message(format!(
+                "library `{library_name}` is not in the local registry"
+            ))
+        })?;
+        let tag_filters = catalog::normalize_tag_filters(tags);
+        let mut entries = catalog::list_owned_entries(library_name, &record.path)?;
+        let owned_names: std::collections::BTreeSet<_> =
+            entries.iter().map(|e| e.name.clone()).collect();
+        for up in catalog::list_upstream_entries(library_name, &record.path)? {
+            if !owned_names.contains(&up.name) {
+                entries.push(up);
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let dummy = ProjectConfig::default();
+        let mut rows = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in entries {
+            if !catalog::entry_matches_tags(&entry, &tag_filters) {
+                continue;
+            }
+            if dedupe && !seen.insert(entry.name.clone()) {
+                continue;
+            }
+            let availability = self.availability_for(&dummy, &entry.name);
+            rows.push(ListRow { entry, availability });
         }
         Ok(rows)
     }
@@ -1651,7 +1700,7 @@ impl App {
     }
 
     /// Register an existing Library checkout (optionally read-only).
-    pub fn library_add(
+    pub fn library_register(
         &self,
         path: &Path,
         name: &str,
@@ -1667,6 +1716,32 @@ impl App {
         }
         ensure_library_meta(&abs, name)?;
         self.register_library(name, &abs, read_only)
+    }
+
+    /// Registered Library whose root contains cwd, if any.
+    pub fn library_covering_cwd(&self) -> Result<Option<(String, LibraryRecord)>> {
+        let registry = self.load_registry()?;
+        Ok(registry.library_covering_path(&self.paths.cwd))
+    }
+
+    /// Resolve `--library`, defaulting to the registered Library that contains cwd.
+    pub fn resolve_library_name(&self, explicit: Option<&str>) -> Result<String> {
+        if let Some(name) = explicit {
+            validate_library_name(name)?;
+            let registry = self.load_registry()?;
+            if !registry.libraries.contains_key(name) {
+                return Err(SkillzError::Message(format!(
+                    "library `{name}` is not in the local registry"
+                )));
+            }
+            return Ok(name.to_string());
+        }
+        if let Some((name, _)) = self.library_covering_cwd()? {
+            return Ok(name);
+        }
+        Err(SkillzError::Message(
+            "pass --library or run from inside a registered Library checkout".into(),
+        ))
     }
 
     /// List registered Libraries with inferred VCS.
@@ -2914,7 +2989,7 @@ exit 1
     }
 
     #[test]
-    fn library_add_registers_existing_git_repo_read_only() {
+    fn library_register_registers_existing_git_repo_read_only() {
         let fx = Fixture::new();
         let lib_path = fx.libs_dir.join("company");
         fs::create_dir_all(lib_path.join("skills")).unwrap();
@@ -2928,8 +3003,8 @@ exit 1
 
         let entry = fx
             .app()
-            .library_add(&lib_path, "company", true)
-            .expect("add");
+            .library_register(&lib_path, "company", true)
+            .expect("register");
         assert!(entry.read_only);
         assert_eq!(entry.vcs, Some(Vcs::Git));
 
@@ -2939,16 +3014,58 @@ exit 1
     }
 
     #[test]
-    fn library_add_infers_jj() {
+    fn library_register_infers_jj() {
         let fx = Fixture::new();
         let lib_path = fx.libs_dir.join("jj-lib");
         fs::create_dir_all(&lib_path).unwrap();
         fs::create_dir_all(lib_path.join(".jj")).unwrap();
 
-        let entry = fx.app().library_add(&lib_path, "jjlib", false).unwrap();
+        let entry = fx
+            .app()
+            .library_register(&lib_path, "jjlib", false)
+            .unwrap();
         assert_eq!(entry.vcs, Some(Vcs::Jj));
         assert!(lib_path.join("library.toml").is_file());
         assert!(lib_path.join("skills").is_dir());
+    }
+
+    #[test]
+    fn resolve_library_name_defaults_to_cwd_library() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal").unwrap();
+        let nested = lib.join("skills");
+        let name = fx
+            .app_at(&nested)
+            .resolve_library_name(None)
+            .expect("cwd library");
+        assert_eq!(name, "personal");
+        let err = fx.app().resolve_library_name(None).unwrap_err();
+        assert!(err.to_string().contains("pass --library"));
+    }
+
+    #[test]
+    fn list_skills_from_library_cwd_without_project() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal").unwrap();
+        LibraryMeta {
+            name: "personal".into(),
+            upstream: vec![crate::library::UpstreamEntry {
+                name: "demo".into(),
+                source: "github:owner/repo/demo@abc".into(),
+                tags: vec!["tools".into()],
+            }],
+        }
+        .save(&lib)
+        .unwrap();
+
+        let rows = fx
+            .app_at(&lib)
+            .list_skills(None, &[], false, true)
+            .expect("list from library cwd");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.name, "demo");
     }
 
     #[test]

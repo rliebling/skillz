@@ -49,7 +49,7 @@ skillz skill show
 skillz skill install
 ```
 
-Library registry / bootstrap: `skillz library init|add|list|import`.  
+Library registry / bootstrap: `skillz library init|register|list|import` (from inside a registered Library, `--library` defaults to that checkout).  
 Project bootstrap: `skillz project init --bind LIBRARY`.
 
 This skill ships inside the `skillz` binary. Humans can inspect it with `skillz skill show`; agents/tools materialize it with `skillz skill install --dir {dir}` (Tool-Provided `cmd:` template).

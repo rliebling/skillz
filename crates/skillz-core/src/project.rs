@@ -250,7 +250,7 @@ pub fn bindings_from_specs(
         }
         let Some(record) = libraries.get(&name) else {
             return Err(SkillzError::Message(format!(
-                "library `{name}` is not in the local registry; run `skillz library add` or `skillz library init` first"
+                "library `{name}` is not in the local registry; run `skillz library register` or `skillz library init` first"
             )));
         };
         let read_only = flag_ro || record.read_only;

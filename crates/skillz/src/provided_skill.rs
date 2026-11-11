@@ -27,6 +27,11 @@ fn dirs_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
+/// Path where `install` writes `SKILL.md` under `dir`.
+pub fn skill_md_path(dir: &Path) -> PathBuf {
+    dir.join("SKILL.md")
+}
+
 /// Write embedded `SKILL.md` into `dir` (the Installation path).
 pub fn install(dir: &Path) -> skillz_core::Result<PathBuf> {
     std::fs::create_dir_all(dir).map_err(|e| {
@@ -35,7 +40,7 @@ pub fn install(dir: &Path) -> skillz_core::Result<PathBuf> {
             dir.display()
         ))
     })?;
-    let target = dir.join("SKILL.md");
+    let target = skill_md_path(dir);
     std::fs::write(&target, SKILL_MD).map_err(|e| {
         skillz_core::SkillzError::Message(format!(
             "failed to write {}: {e}",
@@ -60,8 +65,14 @@ mod tests {
     fn install_writes_skill_md_directly_under_dir() {
         let dir = tempfile_dir();
         let target = install(&dir).unwrap();
-        assert_eq!(target, dir.join("SKILL.md"));
+        assert_eq!(target, skill_md_path(&dir));
         assert_eq!(fs::read_to_string(&target).unwrap(), SKILL_MD);
+    }
+
+    #[test]
+    fn skill_md_path_is_dir_join_skill_md() {
+        let dir = PathBuf::from("/tmp/skillz-install");
+        assert_eq!(skill_md_path(&dir), dir.join("SKILL.md"));
     }
 
     fn tempfile_dir() -> PathBuf {

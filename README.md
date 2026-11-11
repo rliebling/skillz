@@ -72,15 +72,18 @@ Completions are generated from the clap command tree, so they stay in sync with 
 ```bash
 skillz library init ~/code/my-skills --name personal
 # or register an existing checkout:
-skillz library add ~/code/acme-skills --name company --read-only
+skillz library register ~/code/acme-skills --name company --read-only
 skillz library list
 
-# Bulk-add Upstream Catalog Entries from a GitHub skills repo (Library only; no Project install):
+# Bulk-add Upstream Catalog Entries from a GitHub skills repo (Library only; no Project install).
+# From inside a registered Library checkout, --library can be omitted:
 skillz library import github:mattpocock/skills --library personal
-skillz library import https://github.com/mattpocock/skills --library personal --dry-run
-skillz library import github:mattpocock/skills --library personal --path skills/engineering
-skillz library import github:mattpocock/skills --library personal --tag elixir --tag phoenix
-skillz library import github:mattpocock/skills --library personal -i
+cd ~/code/my-skills && skillz library import github:mattpocock/skills
+skillz library import https://github.com/mattpocock/skills --dry-run
+skillz library import github:mattpocock/skills --path skills/engineering
+skillz library import github:mattpocock/skills --tag elixir --tag phoenix
+skillz library import github:mattpocock/skills -i
+skillz library list --catalog
 ```
 
 The user registry (`~/.config/skillz/registry.toml`) maps Library **name → local path**. Project Bindings store the shared name plus remote URL so other machines can resolve the same Library.

@@ -202,7 +202,8 @@ enum LibraryCommands {
         name: String,
     },
     /// Register an existing Library checkout
-    Add {
+    #[command(visible_alias = "add")]
+    Register {
         /// Path to an existing Library repo
         path: PathBuf,
         /// Registry name for this Library
@@ -212,15 +213,25 @@ enum LibraryCommands {
         #[arg(long)]
         read_only: bool,
     },
-    /// List registered Libraries
-    List,
+    /// List registered Libraries, or a Library Catalog with `--catalog` / `--library`
+    List {
+        /// Library Catalog to list (defaults to the registered Library containing cwd)
+        #[arg(long)]
+        library: Option<String>,
+        /// List Catalog Entries instead of the user registry
+        #[arg(long)]
+        catalog: bool,
+        /// Filter Catalog by tag (repeatable; comma-separated allowed; AND)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
     /// Bulk-add Upstream Catalog Entries from a GitHub skills repo
     Import {
         /// `github:owner/repo[/path][@rev]` or `https://github.com/owner/repo…`
         source: String,
-        /// Target registered Library name (must be writable)
+        /// Target registered Library name (defaults to the Library containing cwd)
         #[arg(long)]
-        library: String,
+        library: Option<String>,
         /// Limit discovery to this subtree (after any path in `source`)
         #[arg(long)]
         path: Option<String>,
@@ -294,6 +305,9 @@ enum SkillCommands {
         /// directly under that path.
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
+        /// Print the target path; write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print the embedded skillz SKILL.md to stdout
     Show,
@@ -451,8 +465,16 @@ fn run() -> skillz_core::Result<()> {
                 print!("{}", provided_skill::SKILL_MD);
                 Ok(())
             }
-            SkillCommands::Install { dir } => {
+            SkillCommands::Install { dir, dry_run } => {
                 let dir = dir.unwrap_or_else(provided_skill::default_install_dir);
+                if dry_run {
+                    let target = provided_skill::skill_md_path(&dir);
+                    println!(
+                        "dry-run: would install the skillz skill at {}",
+                        target.display()
+                    );
+                    return Ok(());
+                }
                 let target = provided_skill::install(&dir)?;
                 println!("installed the skillz skill at {}", target.display());
                 Ok(())
@@ -789,12 +811,12 @@ fn run() -> skillz_core::Result<()> {
                 );
                 Ok(())
             }
-            LibraryCommands::Add {
+            LibraryCommands::Register {
                 path,
                 name,
                 read_only,
             } => {
-                let entry = app.library_add(&path, &name, read_only)?;
+                let entry = app.library_register(&path, &name, read_only)?;
                 let ro = if entry.read_only { " (read-only)" } else { "" };
                 println!(
                     "registered library `{}` at {}{ro}",
@@ -803,7 +825,21 @@ fn run() -> skillz_core::Result<()> {
                 );
                 Ok(())
             }
-            LibraryCommands::List => {
+            LibraryCommands::List {
+                library,
+                catalog,
+                tags,
+            } => {
+                if catalog || library.is_some() {
+                    let name = app.resolve_library_name(library.as_deref())?;
+                    let rows = app.list_library_catalog(&name, &tags, false)?;
+                    if rows.is_empty() {
+                        println!("(no matching Catalog Entries in library `{name}`)");
+                        return Ok(());
+                    }
+                    print_skill_table(&rows);
+                    return Ok(());
+                }
                 let entries = app.library_list()?;
                 if entries.is_empty() {
                     println!("(no libraries registered)");
@@ -829,6 +865,7 @@ fn run() -> skillz_core::Result<()> {
                         "`library import` refuses --dry-run with -i; omit one of them".into(),
                     ));
                 }
+                let library = app.resolve_library_name(library.as_deref())?;
                 let report = if interactive {
                     let mut ui = RatatuiPrompter;
                     app.interactive_library_import(
