@@ -92,8 +92,8 @@ The user registry (`~/.config/skillz/registry.toml`) maps Library **name → loc
 
 ```bash
 cd ~/code/new-app
-skillz project init --bind personal
-# or: --bind company:ro --bind personal
+skillz project init --binding personal
+# or: --binding company:ro --binding personal
 # or: --skills-dir .claude/skills
 skillz status
 skillz hooks show      # dry-run: planned gate path + contents
@@ -164,7 +164,7 @@ If the desired Library is read-only, libcommit **Overlay Forks** into a writable
 Same Bindings / Lock / add / list / libcommit / drift model for `~/.agents/skills`:
 
 ```bash
-skillz user init --bind personal
+skillz user init --binding personal
 skillz status --user
 skillz list --user
 skillz add ecto-thinking --user

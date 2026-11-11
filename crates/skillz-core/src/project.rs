@@ -132,13 +132,13 @@ impl ProjectLock {
     }
 }
 
-/// Parse `--bind name` or `--bind name:ro` tokens.
+/// Parse `--binding name` or `--binding name:ro` tokens.
 pub fn parse_bind_spec(spec: &str) -> Result<(String, bool)> {
     let spec = spec.trim();
     if let Some(name) = spec.strip_suffix(":ro") {
         if name.is_empty() {
             return Err(SkillzError::Message(
-                "invalid --bind value: missing library name before `:ro`".into(),
+                "invalid --binding value: missing library name before `:ro`".into(),
             ));
         }
         return Ok((name.to_string(), true));
@@ -146,14 +146,14 @@ pub fn parse_bind_spec(spec: &str) -> Result<(String, bool)> {
     if let Some(name) = spec.strip_suffix(":rw") {
         if name.is_empty() {
             return Err(SkillzError::Message(
-                "invalid --bind value: missing library name before `:rw`".into(),
+                "invalid --binding value: missing library name before `:rw`".into(),
             ));
         }
         return Ok((name.to_string(), false));
     }
     if spec.is_empty() {
         return Err(SkillzError::Message(
-            "invalid --bind value: empty".into(),
+            "invalid --binding value: empty".into(),
         ));
     }
     Ok((spec.to_string(), false))
@@ -229,14 +229,14 @@ fn jj_origin_url(path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Build Bindings from `--bind` specs using the local registry.
+/// Build Bindings from `--binding` specs using the local registry.
 pub fn bindings_from_specs(
     specs: &[String],
     libraries: &std::collections::BTreeMap<String, LibraryRecord>,
 ) -> Result<Vec<Binding>> {
     if specs.is_empty() {
         return Err(SkillzError::Message(
-            "at least one --bind is required".into(),
+            "at least one --binding is required".into(),
         ));
     }
     let mut bindings = Vec::with_capacity(specs.len());

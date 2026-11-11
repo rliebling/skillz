@@ -4,7 +4,7 @@ use std::process::ExitCode;
 mod provided_skill;
 mod tui;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use skillz_core::{
     default_config_dir, AddOutcome, App, DriftReason, LibraryImportAction, ListRow, Scope,
@@ -55,6 +55,24 @@ enum Commands {
         with_deps: bool,
     },
     /// Formalize a tested Installation into a Library Catalog Entry + Lock
+    #[command(after_help = "\
+Upstream --source strings (required for `--as upstream` unless a fetch sidecar exists):
+
+  github:owner/repo[/path/to/skill][@rev]
+      Catalog may omit @rev; Locks require @rev (commit SHA or tag).
+      Example: github:owner/repo/skills/foo@abc1234
+
+  cmd:<install-template>[|version:<version-cmd>][@tool-version]
+      Tool-Provided install command template. Placeholders:
+        {dir}  Installation directory (required in practice)
+        {name} Skill name
+      Optional |version:<cmd> overrides the default version probe `{argv0} --version`
+      (argv0 = first token of the install template). Catalog stores the template
+      without @tool-version; Locks pin the probed tool version after validation.
+      Examples:
+        cmd:skillz skill install --dir {dir}
+        cmd:rexpad skill install --dir {dir}|version:rexpad version
+")]
     Libcommit {
         /// Skill name under the Project skills dir
         name: String,
@@ -64,8 +82,8 @@ enum Commands {
         /// How to record the Catalog Entry (`authored` / `upstream`); omit for Branch Lock edit path
         #[arg(long = "as", value_name = "KIND")]
         as_kind: Option<LibcommitKind>,
-        /// Upstream source (`github:…@rev` or `cmd:…`); defaults to fetch sidecar
-        #[arg(long)]
+        /// Upstream source: `github:owner/repo[/path][@rev]` or `cmd:<template>[|version:<cmd>]` (see after help)
+        #[arg(long, value_name = "SOURCE")]
         source: Option<String>,
         /// Commit message for Branch Lock libcommit
         #[arg(short, long)]
@@ -260,7 +278,7 @@ enum ProjectCommands {
     /// Initialize a Managed Project with Library Bindings
     Init {
         /// Library binding (`name` or `name:ro`); repeatable, order = precedence
-        #[arg(long = "bind", required = true)]
+        #[arg(long = "binding", visible_alias = "bind", required = true)]
         bind: Vec<String>,
         /// Skills directory relative to the Project root
         #[arg(long, default_value = ".agents/skills")]
@@ -291,7 +309,7 @@ enum UserCommands {
     /// Initialize user-global skills scope with Library Bindings
     Init {
         /// Library binding (`name` or `name:ro`); repeatable
-        #[arg(long = "bind", required = true)]
+        #[arg(long = "binding", visible_alias = "bind", required = true)]
         bind: Vec<String>,
     },
 }
@@ -311,6 +329,32 @@ enum SkillCommands {
     },
     /// Print the embedded skillz SKILL.md to stdout
     Show,
+}
+
+/// Build the clap `Command`, hiding the global `--user` flag when help is for
+/// `skillz user` (that subcommand already selects user-global scope).
+fn command() -> clap::Command {
+    let mut cmd = Cli::command();
+    if under_user_subcommand(std::env::args()) {
+        cmd = cmd.mut_arg("user", |a| a.hide(true));
+    }
+    cmd
+}
+
+fn under_user_subcommand(args: impl IntoIterator<Item = String>) -> bool {
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => break,
+            "--config-dir" => {
+                let _ = args.next();
+            }
+            a if a.starts_with("--config-dir=") || a.starts_with('-') => {}
+            "user" => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn format_add_outcome(outcome: &AddOutcome) -> String {
@@ -450,10 +494,10 @@ fn main() -> ExitCode {
 }
 
 fn run() -> skillz_core::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
 
     if let Some(Commands::Completions { shell }) = cli.command {
-        let mut cmd = Cli::command();
+        let mut cmd = command();
         let name = cmd.get_name().to_string();
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         return Ok(());
