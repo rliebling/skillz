@@ -3,19 +3,20 @@
 //! Drift review uses a dedicated board UI in the CLI crate; add/import still use Prompter.
 
 use crate::ui::{Prompter, SelectItem};
-use crate::{AdoptAs, App, LibraryImportReport, Result};
+use crate::{AddOutcome, AdoptAs, App, LibraryImportReport, Result};
 
 impl App {
     /// Interactive add: multi-select among Catalog Entries.
     ///
     /// `tags` optionally pre-filters (same AND semantics as `list --tag`).
     /// The TUI supports further `/` search and `tag:` filters.
+    /// Returns `(name, outcome)` for each selected skill.
     pub fn interactive_add_by_tag(
         &self,
         tags: &[String],
         library_filter: Option<&str>,
         prompler: &mut dyn Prompter,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<(String, AddOutcome)>> {
         let rows = self.list_skills(library_filter, tags, true, false)?;
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -39,8 +40,8 @@ impl App {
         let mut added = Vec::new();
         for idx in selected {
             let row = &rows[idx];
-            self.add_skill(&row.entry.name, Some(&row.entry.library))?;
-            added.push(row.entry.name.clone());
+            let (outcome, _) = self.add_skill(&row.entry.name, Some(&row.entry.library))?;
+            added.push((row.entry.name.clone(), outcome));
         }
         Ok(added)
     }

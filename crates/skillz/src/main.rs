@@ -379,9 +379,9 @@ fn under_user_subcommand(args: impl IntoIterator<Item = String>) -> bool {
 
 fn format_add_outcome(outcome: &AddOutcome) -> String {
     match outcome {
-        AddOutcome::Installed(l) => format!("installed ({})", l.content_hash),
-        AddOutcome::Refreshed(l) => format!("refreshed ({})", l.content_hash),
-        AddOutcome::AlreadyPresent(l) => format!("already present ({})", l.content_hash),
+        AddOutcome::Installed(l) => format!("added (new) ({})", l.content_hash),
+        AddOutcome::Refreshed(l) => format!("updated ({})", l.content_hash),
+        AddOutcome::AlreadyPresent(l) => format!("unchanged ({})", l.content_hash),
     }
 }
 
@@ -843,10 +843,12 @@ fn run() -> skillz_core::Result<()> {
                     println!("(no skills added)");
                     return Ok(());
                 }
-                for skill_name in &added {
-                    println!("added {skill_name}");
+                let mut names = Vec::new();
+                for (skill_name, outcome) in &added {
+                    println!("{skill_name}: {}", format_add_outcome(outcome));
+                    names.push(skill_name.clone());
                 }
-                resolve_missing_deps(&app, &added, library.as_deref(), deps_policy, Some(&mut ui))?;
+                resolve_missing_deps(&app, &names, library.as_deref(), deps_policy, Some(&mut ui))?;
                 return Ok(());
             }
             if !tags.is_empty() {
