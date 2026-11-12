@@ -108,17 +108,70 @@ fn discover_skills_inner(
 }
 
 pub fn git_head_rev(repo: &Path) -> Result<Option<String>> {
+    git_rev_parse_commit(repo, "HEAD")
+}
+
+/// Resolve `rev` to a commit object id, if git can see it in `repo`.
+fn git_rev_parse_commit(repo: &Path, rev: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["-C"])
         .arg(repo)
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
         .output()
         .map_err(|e| SkillzError::Message(format!("git rev-parse failed: {e}")))?;
     if !output.status.success() {
         return Ok(None);
     }
-    let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if rev.is_empty() { None } else { Some(rev) })
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if id.is_empty() { None } else { Some(id) })
+}
+
+fn git_checkout_detached(repo: &Path, rev: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["checkout", "--detach", rev])
+        .status()
+        .map_err(|e| SkillzError::Message(format!("git checkout failed: {e}")))?;
+    if !status.success() {
+        return Err(SkillzError::Message(format!(
+            "failed to checkout rev `{rev}` in {}",
+            repo.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Fetch `rev` into an existing cache clone and detach HEAD onto it.
+///
+/// `git fetch origin <tag>` often updates only `FETCH_HEAD` without creating a
+/// local tag ref. Resolving via object id / `FETCH_HEAD` avoids treating the
+/// tag name as a pathspec (`git checkout --detach <unresolved>`).
+fn fetch_and_checkout_rev(repo: &Path, rev: &str) -> Result<()> {
+    let fetch_ok = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["fetch", "--depth", "1", "origin", rev])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let target = match git_rev_parse_commit(repo, rev)? {
+        Some(id) => id,
+        None if fetch_ok => git_rev_parse_commit(repo, "FETCH_HEAD")?.ok_or_else(|| {
+            SkillzError::Message(format!(
+                "fetched `{rev}` but could not resolve FETCH_HEAD in {}",
+                repo.display()
+            ))
+        })?,
+        None => {
+            return Err(SkillzError::Message(format!(
+                "failed to fetch or resolve rev `{rev}` in {}",
+                repo.display()
+            )));
+        }
+    };
+    git_checkout_detached(repo, &target)
 }
 
 /// Resolve a local filesystem path to a skill directory.
@@ -153,25 +206,8 @@ pub fn ensure_github_checkout(cache_root: &Path, source: &GithubSource) -> Resul
         .join(&source.owner)
         .join(&source.repo);
     if dest.join(".git").exists() || dest.join(".jj").is_dir() {
-        // Fetch updates when rev requested; best-effort.
         if let Some(rev) = &source.rev {
-            let _ = Command::new("git")
-                .args(["-C"])
-                .arg(&dest)
-                .args(["fetch", "--depth", "1", "origin", rev])
-                .status();
-            let status = Command::new("git")
-                .args(["-C"])
-                .arg(&dest)
-                .args(["checkout", "--detach", rev])
-                .status()
-                .map_err(|e| SkillzError::Message(format!("git checkout failed: {e}")))?;
-            if !status.success() {
-                return Err(SkillzError::Message(format!(
-                    "failed to checkout rev `{rev}` in {}",
-                    dest.display()
-                )));
-            }
+            fetch_and_checkout_rev(&dest, rev)?;
         }
         return Ok(dest);
     }
@@ -258,6 +294,17 @@ pub fn stage_skill(project_skills: &Path, skill_path: &Path, name_override: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::GithubSource;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", repo.display());
+    }
 
     #[test]
     fn discover_skills_finds_nested_and_respects_search_root() {
@@ -281,5 +328,49 @@ mod tests {
         .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "grilling");
+    }
+
+    #[test]
+    fn ensure_github_checkout_resolves_tag_left_on_fetch_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        fs::create_dir_all(&upstream).unwrap();
+        fs::write(upstream.join("SKILL.md"), "# tagged\n").unwrap();
+        git(&upstream, &["init"]);
+        git(&upstream, &["config", "user.email", "test@example.com"]);
+        git(&upstream, &["config", "user.name", "test"]);
+        git(&upstream, &["add", "."]);
+        git(&upstream, &["commit", "-m", "init"]);
+        git(&upstream, &["tag", "v2.1.0"]);
+        let tagged = git_rev_parse_commit(&upstream, "v2.1.0")
+            .unwrap()
+            .expect("tagged rev");
+
+        // Second commit on main so HEAD != tag after a plain clone.
+        fs::write(upstream.join("SKILL.md"), "# later\n").unwrap();
+        git(&upstream, &["add", "."]);
+        git(&upstream, &["commit", "-m", "later"]);
+
+        let cache = tmp.path().join("cache");
+        let dest = cache.join("github/acme/skills");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let status = Command::new("git")
+            .args(["clone", upstream.to_str().unwrap(), dest.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Match production failure mode: tag fetch lands on FETCH_HEAD only.
+        git(&dest, &["tag", "-d", "v2.1.0"]);
+        assert!(git_rev_parse_commit(&dest, "v2.1.0").unwrap().is_none());
+
+        let source = GithubSource {
+            owner: "acme".into(),
+            repo: "skills".into(),
+            path: None,
+            rev: Some("v2.1.0".into()),
+        };
+        let checked = ensure_github_checkout(&cache, &source).unwrap();
+        assert_eq!(checked, dest);
+        assert_eq!(git_head_rev(&dest).unwrap().as_deref(), Some(tagged.as_str()));
     }
 }

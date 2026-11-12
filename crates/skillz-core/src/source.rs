@@ -43,6 +43,14 @@ impl GithubSource {
                 ))
             })?;
         let rest = rest.trim_start_matches('/');
+        // Accept github-style `@rev` on HTTPS URLs too:
+        // `https://github.com/o/r@v2.1.0`, `https://github.com/o/r/@v2.1.0`.
+        let (rest, at_rev) = match rest.rsplit_once('@') {
+            Some((path, rev)) if !rev.is_empty() && !rev.contains('/') => {
+                (path.trim_end_matches('/'), Some(rev.to_string()))
+            }
+            _ => (rest, None),
+        };
         let mut segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
         if segments.len() < 2 {
             return Err(SkillzError::Message(format!(
@@ -55,7 +63,7 @@ impl GithubSource {
             repo = stripped.to_string();
         }
         // Drop trailing .git-only form; then optional /tree|/blob|/commit/REV[/path]
-        let (path, rev) = if let Some(kind) = segments.first().copied() {
+        let (path, tree_rev) = if let Some(kind) = segments.first().copied() {
             match kind {
                 "tree" | "blob" | "commit" if segments.len() >= 2 => {
                     let rev = segments[1].to_string();
@@ -75,6 +83,8 @@ impl GithubSource {
         } else {
             (None, None)
         };
+        // Prefer GitHub UI `/tree|blob|commit/REV` when present; else `@rev`.
+        let rev = tree_rev.or(at_rev);
         Ok(Self {
             owner,
             repo,
@@ -435,6 +445,33 @@ mod tests {
         assert_eq!(
             s.render(),
             "github:mattpocock/skills/skills/engineering@main"
+        );
+    }
+
+    #[test]
+    fn normalizes_https_at_rev_and_tree_tag_urls() {
+        let s = GithubSource::parse_input("https://github.com/Leonxlnx/taste-skill@v2.1.0").unwrap();
+        assert_eq!(s.owner, "Leonxlnx");
+        assert_eq!(s.repo, "taste-skill");
+        assert!(s.path.is_none());
+        assert_eq!(s.rev.as_deref(), Some("v2.1.0"));
+        assert_eq!(s.render(), "github:Leonxlnx/taste-skill@v2.1.0");
+
+        let s =
+            GithubSource::parse_input("https://github.com/Leonxlnx/taste-skill/@v2.1.0").unwrap();
+        assert_eq!(s.repo, "taste-skill");
+        assert!(s.path.is_none());
+        assert_eq!(s.rev.as_deref(), Some("v2.1.0"));
+
+        let s = GithubSource::parse_input(
+            "https://github.com/Leonxlnx/taste-skill/tree/v2.1.0/skills",
+        )
+        .unwrap();
+        assert_eq!(s.path.as_deref(), Some("skills"));
+        assert_eq!(s.rev.as_deref(), Some("v2.1.0"));
+        assert_eq!(
+            s.render(),
+            "github:Leonxlnx/taste-skill/skills@v2.1.0"
         );
     }
 
