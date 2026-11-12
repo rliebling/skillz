@@ -454,7 +454,7 @@ impl App {
                 let short = &short[..short.len().min(12)];
                 source = format!("{source}@{short}");
             }
-            self.libcommit_upstream(&entry.name, library_name, Some(&source))?;
+            self.libcommit_upstream(&entry.name, library_name, Some(&source), &[])?;
             imported.push(entry.name.clone());
         }
         Ok(imported)
@@ -483,12 +483,12 @@ impl App {
                     results.push((name, "skipped (remains Drift/import candidate)".into()));
                 }
                 AdoptAs::Authored => {
-                    self.libcommit_authored(&name, library_name)?;
+                    self.libcommit_authored(&name, library_name, &[])?;
                     results.push((name, "adopted as authored".into()));
                 }
                 AdoptAs::Upstream => {
                     let source = format!("github:local/import/{name}@adopted");
-                    self.libcommit_upstream(&name, library_name, Some(&source))?;
+                    self.libcommit_upstream(&name, library_name, Some(&source), &[])?;
                     results.push((name, "adopted as upstream".into()));
                 }
             }
@@ -625,10 +625,11 @@ impl App {
                         name,
                         Some(&sug.library),
                         Some("interactive libcommit"),
+                        &[],
                     )?;
                     return Ok("libcommitted");
                 }
-                self.libcommit_branch(name, None, Some("interactive libcommit"))?;
+                self.libcommit_branch(name, None, Some("interactive libcommit"), &[])?;
                 Ok("libcommitted")
             }
             DriftAction::Promote => {
@@ -1482,6 +1483,7 @@ impl App {
         &self,
         name: &str,
         library_name: &str,
+        tags: &[String],
     ) -> Result<InstallationLock> {
         skill::validate_skill_name(name)?;
         let (config, lib_path) = self.writable_library_path(library_name)?;
@@ -1493,6 +1495,7 @@ impl App {
                 config.skills_dir
             )));
         }
+        self.merge_tags_into_skill_dir(&project_skill, tags)?;
         let hash = skill::content_hash(&project_skill)?;
         let owned = lib_path.join(crate::library::SKILLS_DIR).join(name);
         skill::copy_skill_tree(&project_skill, &owned)?;
@@ -1522,6 +1525,7 @@ impl App {
         name: &str,
         library_name: Option<&str>,
         message: Option<&str>,
+        tags: &[String],
     ) -> Result<InstallationLock> {
         skill::validate_skill_name(name)?;
         let config = self.load_scope_config()?;
@@ -1549,6 +1553,7 @@ impl App {
                 config.skills_dir
             )));
         }
+        self.merge_tags_into_skill_dir(&project_skill, tags)?;
 
         let (target_library, overlay_from) = match self.writable_library_path(&desired) {
             Ok(_) => (desired.clone(), None),
@@ -1677,6 +1682,7 @@ impl App {
         name: &str,
         library_name: &str,
         source: Option<&str>,
+        tags: &[String],
     ) -> Result<InstallationLock> {
         skill::validate_skill_name(name)?;
         let (config, lib_path) = self.writable_library_path(library_name)?;
@@ -1735,10 +1741,17 @@ impl App {
 
         // Upstream Catalog Entry is a reference — do not vendor into Library skills/.
         let mut meta = LibraryMeta::load(&lib_path)?;
+        let existing_tags = meta
+            .upstream
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.tags.clone())
+            .unwrap_or_default();
+        let merged_tags = catalog::merge_tags(&existing_tags, tags);
         meta.upsert_upstream(crate::library::UpstreamEntry {
             name: name.to_string(),
             source: catalog_source,
-            tags: Vec::new(),
+            tags: merged_tags,
         });
         meta.save(&lib_path)?;
 
@@ -1758,6 +1771,72 @@ impl App {
         lock.installations.insert(name.to_string(), install.clone());
         self.save_scope_lock(&lock)?;
         Ok(install)
+    }
+
+    fn merge_tags_into_skill_dir(&self, skill_dir: &Path, tags: &[String]) -> Result<()> {
+        if catalog::normalize_tag_filters(tags).is_empty() {
+            return Ok(());
+        }
+        let md = skill_dir.join("SKILL.md");
+        if !md.is_file() {
+            return Err(SkillzError::Message(format!(
+                "SKILL.md not found under {}",
+                skill_dir.display()
+            )));
+        }
+        catalog::merge_tags_into_frontmatter(&md, tags)?;
+        Ok(())
+    }
+
+    /// Merge tags onto Library Catalog Entries (Owned SKILL.md or Upstream `library.toml`).
+    ///
+    /// Returns `(name, kind, merged_tags)` for each skill.
+    pub fn tag_library_skills(
+        &self,
+        library_name: &str,
+        names: &[String],
+        tags: &[String],
+    ) -> Result<Vec<(String, EntryKind, Vec<String>)>> {
+        let assign = catalog::normalize_tag_filters(tags);
+        if assign.is_empty() {
+            return Err(SkillzError::Message(
+                "provide at least one tag with --tag / -t".into(),
+            ));
+        }
+        if names.is_empty() {
+            return Err(SkillzError::Message(
+                "provide one or more skill names".into(),
+            ));
+        }
+        let lib_path = self.writable_registry_library(library_name)?;
+        let owned = catalog::list_owned_entries(library_name, &lib_path)?;
+        let mut meta = LibraryMeta::load(&lib_path)?;
+        let mut out = Vec::new();
+        let mut meta_dirty = false;
+
+        for raw_name in names {
+            skill::validate_skill_name(raw_name)?;
+            if let Some(entry) = owned.iter().find(|e| e.name == *raw_name) {
+                let merged =
+                    catalog::merge_tags_into_frontmatter(&entry.skill_path.join("SKILL.md"), &assign)?;
+                out.push((raw_name.clone(), EntryKind::Owned, merged));
+                continue;
+            }
+            if let Some(up) = meta.upstream.iter_mut().find(|e| e.name == *raw_name) {
+                let merged = catalog::merge_tags(&up.tags, &assign);
+                up.tags = merged.clone();
+                meta_dirty = true;
+                out.push((raw_name.clone(), EntryKind::Upstream, merged));
+                continue;
+            }
+            return Err(SkillzError::Message(format!(
+                "skill `{raw_name}` not found in library `{library_name}` catalog"
+            )));
+        }
+        if meta_dirty {
+            meta.save(&lib_path)?;
+        }
+        Ok(out)
     }
 
     /// Ensure the config directory exists.
@@ -2280,7 +2359,7 @@ mod tests {
 
         let lock = fx
             .app()
-            .libcommit_authored("demo-skill", "personal")
+            .libcommit_authored("demo-skill", "personal", &[])
             .unwrap();
         assert_eq!(lock.library, "personal");
         assert_eq!(lock.entry_kind, EntryKind::Owned);
@@ -2292,6 +2371,84 @@ mod tests {
 
         let project_hash = skill::content_hash(&path).unwrap();
         assert_eq!(project_hash, lock.content_hash);
+    }
+
+    #[test]
+    fn libcommit_and_tag_merge_owned_and_upstream_tags() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        fx.app().skill_new("demo-skill", &[]).unwrap();
+        fx.app()
+            .libcommit_authored(
+                "demo-skill",
+                "personal",
+                &["process".into(), "tools".into()],
+            )
+            .unwrap();
+        let owned_md = fx.libs_dir.join("personal/skills/demo-skill/SKILL.md");
+        assert_eq!(
+            catalog::read_tags(&owned_md).unwrap(),
+            vec!["process".to_string(), "tools".to_string()]
+        );
+
+        let tagged = fx
+            .app()
+            .tag_library_skills(
+                "personal",
+                &["demo-skill".into()],
+                &["elixir".into()],
+            )
+            .unwrap();
+        assert_eq!(tagged[0].1, EntryKind::Owned);
+        assert_eq!(
+            tagged[0].2,
+            vec![
+                "process".to_string(),
+                "tools".to_string(),
+                "elixir".to_string()
+            ]
+        );
+
+        // Upstream entry tags live in library.toml.
+        let skill_dir = fx.project_dir.join(".agents/skills/up-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: up-skill\n---\n# u\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join(".skillz-source"),
+            "github:acme/skills/up-skill@abc1234",
+        )
+        .unwrap();
+        fx.app()
+            .libcommit_upstream(
+                "up-skill",
+                "personal",
+                None,
+                &["phoenix".into()],
+            )
+            .unwrap();
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        let up = meta.upstream.iter().find(|u| u.name == "up-skill").unwrap();
+        assert_eq!(up.tags, vec!["phoenix".to_string()]);
+
+        let tagged_up = fx
+            .app()
+            .tag_library_skills("personal", &["up-skill".into()], &["otp".into()])
+            .unwrap();
+        assert_eq!(tagged_up[0].1, EntryKind::Upstream);
+        assert_eq!(
+            tagged_up[0].2,
+            vec!["phoenix".to_string(), "otp".to_string()]
+        );
     }
 
     #[test]
@@ -2307,7 +2464,7 @@ mod tests {
             .skill_new("demo-skill", &["process".into()])
             .unwrap();
         fx.app()
-            .libcommit_authored("demo-skill", "personal")
+            .libcommit_authored("demo-skill", "personal", &[])
             .unwrap();
 
         // Simulate unlocked install that still matches the Library Owned tree.
@@ -2362,7 +2519,7 @@ mod tests {
             .project_init(&["company:ro".into()], None)
             .unwrap();
         fx.app().skill_new("x", &[]).unwrap();
-        let err = fx.app().libcommit_authored("x", "company").unwrap_err();
+        let err = fx.app().libcommit_authored("x", "company", &[]).unwrap_err();
         assert!(err.to_string().contains("read-only"));
     }
 
@@ -2390,7 +2547,7 @@ mod tests {
             .project_init(&["personal".into()], None)
             .unwrap();
         fx.app().skill_new("demo", &[]).unwrap();
-        fx.app().libcommit_authored("demo", "personal").unwrap();
+        fx.app().libcommit_authored("demo", "personal", &[]).unwrap();
         assert!(fx
             .libs_dir
             .join("personal/skills/demo/SKILL.md")
@@ -2476,15 +2633,15 @@ mod tests {
         fx.app()
             .skill_new("a", &["t".into()])
             .unwrap();
-        fx.app().libcommit_authored("a", "personal").unwrap();
+        fx.app().libcommit_authored("a", "personal", &[]).unwrap();
         fx.app()
             .skill_new("b", &["t".into()])
             .unwrap();
-        fx.app().libcommit_authored("b", "personal").unwrap();
+        fx.app().libcommit_authored("b", "personal", &[]).unwrap();
         fx.app()
             .skill_new("c", &["other".into()])
             .unwrap();
-        fx.app().libcommit_authored("c", "personal").unwrap();
+        fx.app().libcommit_authored("c", "personal", &[]).unwrap();
         fs::remove_dir_all(fx.project_dir.join(".agents/skills/a")).ok();
         fs::remove_dir_all(fx.project_dir.join(".agents/skills/b")).ok();
         fs::remove_dir_all(fx.project_dir.join(".agents/skills/c")).ok();
@@ -2577,7 +2734,7 @@ mod tests {
             .project_init(&["personal".into()], None)
             .unwrap();
         fx.app().skill_new("demo", &["cli".into()]).unwrap();
-        fx.app().libcommit_authored("demo", "personal").unwrap();
+        fx.app().libcommit_authored("demo", "personal", &[]).unwrap();
 
         let user = fx.app().with_scope(Scope::User);
         user.user_init(&["personal".into()]).unwrap();
@@ -2643,7 +2800,7 @@ mod tests {
 
         let lock = fx
             .app()
-            .libcommit_branch("grilling", Some("company"), Some("overlay"))
+            .libcommit_branch("grilling", Some("company"), Some("overlay"), &[])
             .unwrap();
         assert_eq!(lock.library, "personal");
         assert_eq!(lock.overlay_from_library.as_deref(), Some("company"));
@@ -2676,7 +2833,7 @@ mod tests {
             .unwrap();
         fx.app().skill_new("grilling", &[]).unwrap();
         fx.app()
-            .libcommit_authored("grilling", "personal")
+            .libcommit_authored("grilling", "personal", &[])
             .unwrap();
         // Commit authored entry on main.
         std::process::Command::new("git")
@@ -2703,7 +2860,7 @@ mod tests {
 
         let branch_lock = fx
             .app()
-            .libcommit_branch("grilling", None, Some("tweak"))
+            .libcommit_branch("grilling", None, Some("tweak"), &[])
             .unwrap();
         assert!(branch_lock.branch.as_deref().unwrap().contains("grilling"));
         assert!(branch_lock.rev.is_some());
@@ -2864,6 +3021,7 @@ mod tests {
                 "ecto-thinking",
                 "personal",
                 Some("github:acme/skills/skills/ecto-thinking@deadbeef"),
+                &[],
             )
             .unwrap();
         assert_eq!(lock.entry_kind, EntryKind::Upstream);
@@ -2946,7 +3104,7 @@ exit 1
         let source = format!("cmd:{tool_s} skill install --dir {{dir}}");
         let lock = fx
             .app()
-            .libcommit_upstream("fake-skill", "personal", Some(&source))
+            .libcommit_upstream("fake-skill", "personal", Some(&source), &[])
             .unwrap();
         assert_eq!(lock.entry_kind, EntryKind::Upstream);
         assert_eq!(lock.rev.as_deref(), Some("9.9.9"));
@@ -3003,6 +3161,7 @@ exit 1
                 "ghost",
                 "personal",
                 Some("cmd:/no/such/tool-xyz skill install --dir {dir}"),
+                &[],
             )
             .unwrap_err();
         assert!(
@@ -3026,7 +3185,7 @@ exit 1
             .skill_new("demo-skill", &["elixir".into(), "phoenix".into()])
             .unwrap();
         fx.app()
-            .libcommit_authored("demo-skill", "personal")
+            .libcommit_authored("demo-skill", "personal", &[])
             .unwrap();
 
         // Remove project install to simulate a fresh project consuming the Library.

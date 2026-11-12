@@ -124,6 +124,70 @@ fn parse_tags_from_frontmatter(text: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn format_tags_line(tags: &[String]) -> String {
+    format!(
+        "tags: [{}]",
+        tags.iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Replace or insert the `tags:` line in SKILL.md frontmatter; returns the new file text.
+pub fn set_tags_in_frontmatter(text: &str, tags: &[String]) -> Result<String> {
+    let tags_line = format_tags_line(tags);
+    if !text.starts_with("---") {
+        return Ok(format!("---\n{tags_line}\n---\n{text}"));
+    }
+    let rest = text.strip_prefix("---").unwrap();
+    let Some(end) = rest.find("\n---") else {
+        return Err(SkillzError::Message(
+            "SKILL.md frontmatter is not closed with ---".into(),
+        ));
+    };
+    let fm = &rest[..end];
+    let body = &rest[end + 4..]; // skip "\n---"
+    let mut new_fm = String::new();
+    let mut replaced = false;
+    for line in fm.lines() {
+        if line.trim().starts_with("tags:") {
+            if !replaced {
+                new_fm.push_str(&tags_line);
+                new_fm.push('\n');
+                replaced = true;
+            }
+        } else {
+            new_fm.push_str(line);
+            new_fm.push('\n');
+        }
+    }
+    if !replaced {
+        new_fm.push_str(&tags_line);
+        new_fm.push('\n');
+    }
+    Ok(format!("---\n{new_fm}---{body}"))
+}
+
+/// Merge `incoming` tags into SKILL.md frontmatter (additive). Returns the merged tag list.
+pub fn merge_tags_into_frontmatter(skill_md: &Path, incoming: &[String]) -> Result<Vec<String>> {
+    let incoming = normalize_tag_filters(incoming);
+    if incoming.is_empty() {
+        return read_tags(skill_md);
+    }
+    let text = fs::read_to_string(skill_md).map_err(|e| {
+        SkillzError::Message(format!("failed to read {}: {e}", skill_md.display()))
+    })?;
+    let merged = merge_tags(&parse_tags_from_frontmatter(&text), &incoming);
+    let new_text = set_tags_in_frontmatter(&text, &merged)?;
+    if new_text != text {
+        fs::write(skill_md, new_text).map_err(|e| {
+            SkillzError::Message(format!("failed to write {}: {e}", skill_md.display()))
+        })?;
+    }
+    Ok(merged)
+}
+
 /// Expand `--tag` args that may include comma-separated lists; AND semantics.
 pub fn normalize_tag_filters(raw: &[String]) -> Vec<String> {
     let mut tags = Vec::new();
@@ -211,6 +275,24 @@ mod tests {
             normalize_tag_filters(&["elixir,phoenix".into(), "otp".into()]),
             vec!["elixir".to_string(), "phoenix".to_string(), "otp".to_string()]
         );
+    }
+
+    #[test]
+    fn set_and_merge_tags_in_frontmatter() {
+        let text = "---\nname: x\n---\n# body\n";
+        let with_tags = set_tags_in_frontmatter(text, &["process".into()]).unwrap();
+        assert_eq!(
+            parse_tags_from_frontmatter(&with_tags),
+            vec!["process".to_string()]
+        );
+        assert!(with_tags.contains("# body"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("SKILL.md");
+        fs::write(&md, "---\nname: x\ntags: [\"a\"]\n---\n").unwrap();
+        let merged = merge_tags_into_frontmatter(&md, &["b".into(), "a".into()]).unwrap();
+        assert_eq!(merged, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(read_tags(&md).unwrap(), merged);
     }
 
     #[test]

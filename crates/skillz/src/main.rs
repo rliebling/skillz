@@ -41,7 +41,7 @@ enum Commands {
         /// Skill name (directory under skills_dir)
         name: String,
         /// Optional tags written into SKILL.md frontmatter
-        #[arg(long = "tag")]
+        #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
     },
     /// Fetch an Upstream skill into the Project skills dir (Drift until libcommit)
@@ -86,9 +86,24 @@ Upstream --source strings (required for `--as upstream` unless a fetch sidecar e
         /// Upstream source: `github:owner/repo[/path][@rev]` or `cmd:<template>[|version:<cmd>]` (see after help)
         #[arg(long, value_name = "SOURCE")]
         source: Option<String>,
+        /// Merge tags onto the Catalog Entry (Owned: SKILL.md; Upstream: library.toml)
+        #[arg(short = 't', long = "tag")]
+        tags: Vec<String>,
         /// Commit message for Branch Lock libcommit
         #[arg(short, long)]
         message: Option<String>,
+    },
+    /// Merge tags onto Library Catalog Entries (Owned SKILL.md or Upstream library.toml)
+    Tag {
+        /// Skill name(s) in the Library catalog
+        #[arg(value_name = "NAME", required = true)]
+        names: Vec<String>,
+        /// Tag(s) to merge (repeatable; comma-separated OK)
+        #[arg(short = 't', long = "tag", required = true)]
+        tags: Vec<String>,
+        /// Target Library (defaults to the registered Library containing cwd)
+        #[arg(long)]
+        library: Option<String>,
     },
     /// Merge a skill's Library Branch Lock into Library main (does not re-Lock the Project)
     Promote {
@@ -149,7 +164,7 @@ Hooks already pass `--project` for the repo being gated.
         #[arg(long)]
         library: Option<String>,
         /// Filter by tag (repeatable; comma-separated allowed; AND)
-        #[arg(long = "tag")]
+        #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
         /// Keep only the first Binding match per skill name
         #[arg(long)]
@@ -167,7 +182,7 @@ Hooks already pass `--project` for the repo being gated.
         #[arg(long)]
         library: Option<String>,
         /// Add all Catalog Entries matching tags (AND)
-        #[arg(long = "tag")]
+        #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
         /// Automatically add detected sibling dependencies (no prompt)
         #[arg(long)]
@@ -262,7 +277,7 @@ enum LibraryCommands {
         #[arg(long)]
         catalog: bool,
         /// Filter Catalog by tag (repeatable; comma-separated allowed; AND)
-        #[arg(long = "tag")]
+        #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
     },
     /// Bulk-add Upstream Catalog Entries from a GitHub skills repo
@@ -285,7 +300,7 @@ enum LibraryCommands {
         #[arg(short = 'i', long)]
         interactive: bool,
         /// Assign tags to imported Upstream entries (repeatable; comma-separated OK)
-        #[arg(long = "tag")]
+        #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
     },
 }
@@ -656,6 +671,7 @@ fn run() -> skillz_core::Result<()> {
             library,
             as_kind,
             source,
+            tags,
             message,
         }) => {
             if source.is_some() && names.len() > 1 {
@@ -671,7 +687,7 @@ fn run() -> skillz_core::Result<()> {
                                 "`libcommit --as authored` requires --library".into(),
                             )
                         })?;
-                        let lock = app.libcommit_authored(name, library)?;
+                        let lock = app.libcommit_authored(name, library, &tags)?;
                         println!(
                             "libcommit `{name}` → library `{library}` as owned ({})",
                             lock.content_hash
@@ -684,7 +700,7 @@ fn run() -> skillz_core::Result<()> {
                             )
                         })?;
                         let lock =
-                            app.libcommit_upstream(name, library, source.as_deref())?;
+                            app.libcommit_upstream(name, library, source.as_deref(), &tags)?;
                         println!(
                             "libcommit `{name}` → library `{library}` as upstream ({})",
                             lock.content_hash
@@ -698,6 +714,7 @@ fn run() -> skillz_core::Result<()> {
                             name,
                             library.as_deref(),
                             message.as_deref(),
+                            &tags,
                         )?;
                         println!(
                             "libcommit `{name}` Branch Lock on {}@{}",
@@ -706,6 +723,25 @@ fn run() -> skillz_core::Result<()> {
                         );
                     }
                 }
+            }
+            Ok(())
+        }
+        Some(Commands::Tag {
+            names,
+            tags,
+            library,
+        }) => {
+            let library = app.resolve_library_name(library.as_deref())?;
+            let results = app.tag_library_skills(&library, &names, &tags)?;
+            for (name, kind, merged) in results {
+                let kind = match kind {
+                    skillz_core::EntryKind::Owned => "owned",
+                    skillz_core::EntryKind::Upstream => "upstream",
+                };
+                println!(
+                    "tagged `{name}` ({kind}) in `{library}`: [{}]",
+                    merged.join(", ")
+                );
             }
             Ok(())
         }
@@ -1195,6 +1231,8 @@ mod tests {
             "authored",
             "--library",
             "personal",
+            "-t",
+            "process",
         ])
         .unwrap();
         match cli.command {
@@ -1203,14 +1241,54 @@ mod tests {
                 library,
                 as_kind,
                 source,
+                tags,
                 ..
             }) => {
                 assert_eq!(names, vec!["foo", "bar"]);
                 assert_eq!(library.as_deref(), Some("personal"));
                 assert!(matches!(as_kind, Some(LibcommitKind::Authored)));
                 assert!(source.is_none());
+                assert_eq!(tags, vec!["process"]);
             }
             other => panic!("expected Libcommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tag_parses_multiple_skills_and_tags() {
+        let cli = Cli::try_parse_from([
+            "skillz",
+            "tag",
+            "foo",
+            "bar",
+            "-t",
+            "elixir",
+            "--tag",
+            "phoenix",
+            "--library",
+            "personal",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Tag {
+                names,
+                tags,
+                library,
+            }) => {
+                assert_eq!(names, vec!["foo", "bar"]);
+                assert_eq!(tags, vec!["elixir", "phoenix"]);
+                assert_eq!(library.as_deref(), Some("personal"));
+            }
+            other => panic!("expected Tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_accepts_short_tag_alias() {
+        let cli = Cli::try_parse_from(["skillz", "list", "-t", "elixir"]).unwrap();
+        match cli.command {
+            Some(Commands::List { tags, .. }) => assert_eq!(tags, vec!["elixir"]),
+            other => panic!("expected List, got {other:?}"),
         }
     }
 }
