@@ -159,8 +159,9 @@ Hooks already pass `--project` for the repo being gated.
     },
     /// Install Catalog Entries into this Managed Project
     Add {
-        /// Skill name to install (omit when using --tag)
-        name: Option<String>,
+        /// Skill name(s) to install (omit when using --tag or -i)
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
         /// Restrict / disambiguate Library Binding
         #[arg(long)]
         library: Option<String>,
@@ -819,7 +820,7 @@ fn run() -> skillz_core::Result<()> {
             Ok(())
         }
         Some(Commands::Add {
-            name,
+            names,
             library,
             tags,
             with_deps,
@@ -840,49 +841,67 @@ fn run() -> skillz_core::Result<()> {
             };
 
             if interactive {
+                if !names.is_empty() {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`add -i` does not take skill names; omit names or omit -i".into(),
+                    ));
+                }
                 let mut ui = RatatuiPrompter;
                 let added = app.interactive_add_by_tag(&tags, library.as_deref(), &mut ui)?;
                 if added.is_empty() {
                     println!("(no skills added)");
                     return Ok(());
                 }
-                let mut names = Vec::new();
+                let mut added_names = Vec::new();
                 for (skill_name, outcome) in &added {
                     println!("{skill_name}: {}", format_add_outcome(outcome));
-                    names.push(skill_name.clone());
+                    added_names.push(skill_name.clone());
                 }
-                resolve_missing_deps(&app, &names, library.as_deref(), deps_policy, Some(&mut ui))?;
+                resolve_missing_deps(
+                    &app,
+                    &added_names,
+                    library.as_deref(),
+                    deps_policy,
+                    Some(&mut ui),
+                )?;
                 return Ok(());
             }
             if !tags.is_empty() {
+                if !names.is_empty() {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`add --tag` does not take skill names; omit names or omit --tag".into(),
+                    ));
+                }
                 let results = app.add_skills_by_tag(&tags, library.as_deref())?;
                 if results.is_empty() {
                     println!("(no matching skills to add)");
                     return Ok(());
                 }
-                let mut names = Vec::new();
+                let mut added_names = Vec::new();
                 for (skill_name, outcome, warn) in results {
                     if let Some(w) = warn {
                         eprintln!("warning: {w}");
                     }
                     println!("{}: {}", skill_name, format_add_outcome(&outcome));
-                    names.push(skill_name);
+                    added_names.push(skill_name);
                 }
-                resolve_missing_deps(&app, &names, library.as_deref(), deps_policy, None)?;
+                resolve_missing_deps(&app, &added_names, library.as_deref(), deps_policy, None)?;
                 return Ok(());
             }
-            let Some(name) = name else {
+            if names.is_empty() {
                 return Err(skillz_core::SkillzError::Message(
-                    "provide a skill name, --tag, or -i".into(),
+                    "provide one or more skill names, --tag, or -i".into(),
                 ));
-            };
-            let (outcome, warn, _) =
-                app.add_skill_with_deps(&name, library.as_deref(), false)?;
-            if let Some(w) = warn {
-                eprintln!("warning: {w}");
             }
-            println!("{name}: {}", format_add_outcome(&outcome));
-            resolve_missing_deps(&app, &[name], library.as_deref(), deps_policy, None)?;
+            for name in &names {
+                let (outcome, warn, _) =
+                    app.add_skill_with_deps(name, library.as_deref(), false)?;
+                if let Some(w) = warn {
+                    eprintln!("warning: {w}");
+                }
+                println!("{name}: {}", format_add_outcome(&outcome));
+            }
+            resolve_missing_deps(&app, &names, library.as_deref(), deps_policy, None)?;
             Ok(())
         }
         Some(Commands::Library { command }) => match command {
@@ -1135,5 +1154,21 @@ fn run() -> skillz_core::Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_parses_multiple_skill_names() {
+        let cli = Cli::try_parse_from(["skillz", "add", "foo", "bar", "baz"]).unwrap();
+        match cli.command {
+            Some(Commands::Add { names, .. }) => {
+                assert_eq!(names, vec!["foo", "bar", "baz"]);
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
     }
 }
