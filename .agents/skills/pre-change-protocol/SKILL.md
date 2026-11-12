@@ -13,15 +13,19 @@ depends: [source-control]
 Paired with `source-control`. Read and follow this skill **before** the first
 file create/edit/delete in a task. Do not postpone until commit time.
 
+Working-copy, git-vs-jj, describe, and finish rules live only in
+`source-control` — do not reinvent them here; read that skill and follow it
+at the steps below.
+
 ## Fast path (trivial)
 
 Use when the request is a small, unambiguous edit (typo, one-liner, obvious
 doc tweak) and no design choices are open:
 
 1. Confirm the target in one sentence (silently is fine if already clear).
-2. Run **source-control start-of-work** (below).
+2. Follow `source-control` **start-of-work**.
 3. Make the change.
-4. Run **source-control end-of-work**.
+4. Follow `source-control` **end-of-work**.
 
 ## Full path
 
@@ -36,14 +40,8 @@ affects this change before editing.
 
 ### 2. Source-control start-of-work
 
-Read and follow the `source-control` skill **now**:
-
-- Detect git vs jj (`.jj/`).
-- Check working-copy state before editing.
-- In jj: describe the change before starting work when opening a new unit of
-  work; stay on `@` only when existing diffs belong with this task.
-- In git: ask if the tree is dirty with unrelated (or ambiguous) changes; do
-  not commit unless the user asked.
+Read `source-control` now and follow its start-of-work procedure before any
+edits.
 
 ### 3. Plan (non-trivial only)
 
@@ -53,17 +51,16 @@ Skip this step on the fast path.
 ### 4. Implement
 
 Only after the steps above. Prefer the smallest change that satisfies the
-request. Keep the source-control description updated in jj as intent shifts.
+request. While working, keep following `source-control` (e.g. refining the
+jj description as intent shifts).
 
 ### 5. Source-control end-of-work
 
-When the change is done, follow `source-control` finish rules:
-
-- **jj:** final `jj describe` if needed, then `jj new` (do not wait to be
-  asked to "commit").
-- **git:** leave changes uncommitted unless the user asked to commit.
+When the change is done, follow `source-control` finish rules.
 
 ## Out of scope
 
 - Not a substitute for `grilling`, specs, or ticket breakdown.
 - Does not replace project-specific `AGENTS.md` rules — apply those too.
+- Does not duplicate git/jj procedure — that is entirely `source-control`
+  (+ its jj docs).

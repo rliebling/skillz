@@ -11,9 +11,9 @@ depends: [pre-change-protocol]
 
 # Source control
 
-Paired with `pre-change-protocol`: that skill should run before the first
-file edit; this skill owns git vs jj detection, start-of-work working-copy
-rules, and finish-of-work (`jj new` / git commit policy).
+Paired with `pre-change-protocol` (runs before the first file edit). This
+skill owns git vs jj detection and the start-of-work / end-of-work procedures
+that skill calls.
 
 ## Detect git vs jj
 
@@ -24,12 +24,13 @@ Walk from the working directory up to the filesystem root:
   `.git` does not change this. `jj git fetch` / `jj git push` are jj commands.
 - No `.jj` directory → **git repo**. Use git.
 
-If this is a jj repo, read [`jujutsu.md`](jujutsu.md) before any jj work.
-Do not load jj guidance in a pure git repo.
+If this is a jj repo, read [`jujutsu.md`](jujutsu.md) before any jj work
+(including start-of-work / end-of-work below). Do not load jj guidance in a
+pure git repo.
 
-## Git
+## Start of work
 
-### Before editing
+### Git
 
 Run `git status` (and `git diff` if dirty).
 
@@ -39,7 +40,19 @@ Run `git status` (and `git diff` if dirty).
 - Dirty with unrelated changes, or relatedness is ambiguous → **stop and ask**.
   Git cannot cheaply peel work onto a new commit the way jj can.
 
-### Committing
+### jj
+
+Follow **Start of work** in [`jujutsu.md`](jujutsu.md) (status, describe
+before edits, when to `jj new`).
+
+## During work
+
+- **Git:** leave the tree uncommitted unless the user asked to commit.
+- **jj:** refine `jj describe` as intent shifts; see [`jujutsu.md`](jujutsu.md).
+
+## End of work
+
+### Git
 
 Do **not** commit, push, amend, rebase, or rewrite history unless the user
 asked.
@@ -49,9 +62,10 @@ When the user asks to commit, follow the repo's commit rules if present
 put the ticket id at the end of the subject in parentheses, e.g.
 `feat: add login throttle (z-abc)`.
 
-## jj
+### jj
 
-All jj procedure lives in [`jujutsu.md`](jujutsu.md) (day-to-day) and
-[`jujutsu-advanced.md`](jujutsu-advanced.md) (non-trivial ops). In jj repos,
-finishing work includes leaving a new empty change on `@` — that is not the
-same as git's "commit only when asked."
+Follow **End of work** in [`jujutsu.md`](jujutsu.md) (final describe, then
+`jj new`). Do not wait for the user to ask to "commit."
+
+Non-trivial jj ops (bookmarks, push/PR, conflicts, recovery): 
+[`jujutsu-advanced.md`](jujutsu-advanced.md).
