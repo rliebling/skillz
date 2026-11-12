@@ -182,16 +182,19 @@ skillz project import --library personal -i    # per-skill upstream | authored |
 ## Drift and publish gates
 
 ```bash
-skillz drift
-skillz drift -i                      # board: set skip/libcommit/promote/remove per skill
-skillz drift --check                 # non-zero exit for hooks
+skillz drift                         # current Managed Project only (or --user)
+skillz drift -i                      # board: same current-scope surface
+skillz drift -g                      # all Managed Projects + user-global
+skillz drift --check                 # non-zero exit for hooks (current Project)
 skillz hooks show                    # dry-run: paths + planned contents
 skillz hooks install
 ```
 
+Default `drift` / `drift -i` stay on the **current scope** (this Managed Project, or `~/.agents/skills` with `--user`). Use `-g/--global` to scan every registered Managed Project plus user-global.
+
 In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays. Confirming Remove warns (soft) when a retained Installation appears to depend on the skill being dropped.
 
-- **git-only:** pre-commit runs `skillz drift --check` on the Managed Project.
+- **git-only:** pre-commit runs `skillz drift --check --project …` on the Managed Project.
 - **jj** (including colocated): repo-local alias `jj push-with-checks` only (drift check, then `jj git push`). No git pre-commit — `jj commit` would not run it. Ordinary `jj git push` stays unwrapped.
 - Escape: `--allow-drift` or `SKILLZ_ALLOW_DRIFT=1`.
 - `hooks show` prints the target file and planned gate text without writing.

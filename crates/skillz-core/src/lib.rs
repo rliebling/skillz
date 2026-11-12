@@ -160,11 +160,23 @@ pub struct ListRow {
     pub availability: Availability,
 }
 
-/// Drift for one Managed Project.
+/// Drift for one Managed Project (or the user-global skills scope).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDrift {
     pub project: PathBuf,
     pub items: Vec<DriftItem>,
+}
+
+/// Which Installations [`App::drift_report`] should scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriftScan {
+    /// Current Managed Project (`cwd`) or user-global scope when `App` is [`Scope::User`].
+    /// Matches interactive `drift -i` (current scope only).
+    Current,
+    /// Every Managed Project in the user registry, plus user-global when configured.
+    Global,
+    /// One explicit Managed Project path.
+    Project(PathBuf),
 }
 
 /// Result of [`App::add_skill`].
@@ -763,24 +775,72 @@ impl App {
         Ok(items)
     }
 
-    /// Drift across Managed Projects recorded in the user registry.
-    pub fn drift_report(&self, project_filter: Option<&Path>) -> Result<Vec<ProjectDrift>> {
-        let mut projects = Vec::new();
-        if let Some(p) = project_filter {
-            projects.push(canonicalize_or_clone(p));
-        } else {
-            let registry = self.load_registry()?;
-            for p in registry.projects {
-                let p = canonicalize_or_clone(&p);
-                if !projects.iter().any(|x| x == &p) {
-                    projects.push(p);
+    /// Drift report for the requested [`DriftScan`] scope.
+    ///
+    /// - [`DriftScan::Current`]: this Managed Project (`cwd`) or user-global when
+    ///   `App` scope is [`Scope::User`] — same surface as interactive `drift -i`.
+    /// - [`DriftScan::Global`]: every registry Managed Project plus user-global.
+    /// - [`DriftScan::Project`]: one explicit Managed Project path.
+    pub fn drift_report(&self, scan: DriftScan) -> Result<Vec<ProjectDrift>> {
+        match scan {
+            DriftScan::Current => self.drift_report_current(),
+            DriftScan::Project(path) => {
+                let project = canonicalize_or_clone(&path);
+                let items = self.detect_drift_in(&project)?;
+                if items.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![ProjectDrift { project, items }])
                 }
             }
-            if ProjectConfig::path(&self.paths.cwd).is_file() {
-                let cwd = canonicalize_or_clone(&self.paths.cwd);
-                if !projects.iter().any(|p| p == &cwd) {
-                    projects.push(cwd);
+            DriftScan::Global => self.drift_report_global(),
+        }
+    }
+
+    fn drift_report_current(&self) -> Result<Vec<ProjectDrift>> {
+        match self.scope {
+            Scope::User => {
+                let items = self.detect_drift()?;
+                if items.is_empty() {
+                    return Ok(Vec::new());
                 }
+                Ok(vec![ProjectDrift {
+                    project: self.paths.user_skills_dir(),
+                    items,
+                }])
+            }
+            Scope::Project => {
+                if !ProjectConfig::path(&self.paths.cwd).is_file() {
+                    return Err(SkillzError::Message(
+                        "not a Managed Project; pass -g/--global to scan all projects \
+                         (and user-global), --user for user-global only, or --project PATH"
+                            .into(),
+                    ));
+                }
+                let project = canonicalize_or_clone(&self.paths.cwd);
+                let items = self.detect_drift_in(&project)?;
+                if items.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![ProjectDrift { project, items }])
+                }
+            }
+        }
+    }
+
+    fn drift_report_global(&self) -> Result<Vec<ProjectDrift>> {
+        let mut projects = Vec::new();
+        let registry = self.load_registry()?;
+        for p in registry.projects {
+            let p = canonicalize_or_clone(&p);
+            if !projects.iter().any(|x| x == &p) {
+                projects.push(p);
+            }
+        }
+        if ProjectConfig::path(&self.paths.cwd).is_file() {
+            let cwd = canonicalize_or_clone(&self.paths.cwd);
+            if !projects.iter().any(|p| p == &cwd) {
+                projects.push(cwd);
             }
         }
         let mut out = Vec::new();
@@ -790,7 +850,7 @@ impl App {
                 out.push(ProjectDrift { project, items });
             }
         }
-        if project_filter.is_none() && self.paths.user_config_path().is_file() {
+        if self.paths.user_config_path().is_file() {
             let user_app = self.clone().with_scope(Scope::User);
             let items = user_app.detect_drift()?;
             if !items.is_empty() {
@@ -2638,7 +2698,7 @@ mod tests {
             .unwrap();
         fx.app().skill_new("drifty", &[]).unwrap();
 
-        let report = fx.app().drift_report(None).unwrap();
+        let report = fx.app().drift_report(DriftScan::Current).unwrap();
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].items[0].name, "drifty");
 
@@ -2648,6 +2708,40 @@ mod tests {
         let body = fs::read_to_string(&hooks[0]).unwrap();
         assert!(body.contains("skillz drift --check"));
         assert!(body.contains("SKILLZ_ALLOW_DRIFT"));
+    }
+
+    #[test]
+    fn drift_current_stays_local_global_sees_other_projects() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("here-only", &[]).unwrap();
+
+        let other = fx.project_dir.parent().unwrap().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let other_app = fx.app_at(&other);
+        other_app
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        other_app.skill_new("there-only", &[]).unwrap();
+
+        let local = fx.app().drift_report(DriftScan::Current).unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].items.len(), 1);
+        assert_eq!(local[0].items[0].name, "here-only");
+
+        let global = fx.app().drift_report(DriftScan::Global).unwrap();
+        let names: std::collections::BTreeSet<_> = global
+            .iter()
+            .flat_map(|p| p.items.iter().map(|i| i.name.as_str()))
+            .collect();
+        assert!(names.contains("here-only"));
+        assert!(names.contains("there-only"));
+        assert!(global.len() >= 2);
     }
 
     #[test]

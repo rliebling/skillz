@@ -36,7 +36,7 @@ branch = "skillz/setup-matt-pocock-skills"
 [installations.skillz]
 library = "personal"
 entry_kind = "upstream"
-content_hash = "sha256:b544bbe23165c5bfd8203e277f9cb3b9387959b1e2595fceca35e82432b5fce9"
+content_hash = "sha256:c9dc2862578563a56cdd9512e6685256b478205ab84c82a3112dd79425c60f9c"
 source = "cmd:skillz skill install --dir {dir}@0.1.0"
 rev = "0.1.0"
 

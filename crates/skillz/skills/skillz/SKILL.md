@@ -41,6 +41,7 @@ skillz libcommit NAME --as authored --library LIBRARY
 skillz libcommit NAME --as upstream --library LIBRARY --source 'github:…@rev'
 skillz drift
 skillz drift -i
+skillz drift -g
 skillz promote NAME
 skillz lock NAME --main
 skillz hooks show

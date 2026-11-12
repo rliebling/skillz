@@ -7,8 +7,8 @@ mod tui;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use skillz_core::{
-    default_config_dir, AddOutcome, App, DriftReason, LibraryImportAction, ListRow, Scope,
-    SkillzPaths,
+    default_config_dir, AddOutcome, App, DriftReason, DriftScan, LibraryImportAction, ListRow,
+    Scope, SkillzPaths,
 };
 use tui::RatatuiPrompter;
 
@@ -103,18 +103,38 @@ Upstream --source strings (required for `--as upstream` unless a fetch sidecar e
         main: bool,
     },
     /// Report Installation Drift against Locks
+    #[command(after_help = "\
+Scope (default matches interactive `-i` — current scope only):
+
+  Inside a Managed Project:
+    skillz drift              this Project only
+    skillz drift -i           interactive board for this Project
+    skillz drift -g           all Managed Projects + user-global
+    skillz drift --project P  one explicit Managed Project
+
+  User-global:
+    skillz drift --user       ~/.agents/skills only
+    skillz drift -g           all Managed Projects + user-global
+
+  Outside a Managed Project (without --user/--project/-g): error — pick a scope.
+
+Hooks already pass `--project` for the repo being gated.
+")]
     Drift {
         /// Exit non-zero when Drift is present (for hooks)
         #[arg(long)]
         check: bool,
         /// Limit to one Managed Project path
-        #[arg(long)]
+        #[arg(long, value_name = "PATH")]
         project: Option<PathBuf>,
+        /// Scan every Managed Project in the registry, plus user-global
+        #[arg(short = 'g', long = "global", conflicts_with = "project")]
+        global: bool,
         /// Allow Drift (also via SKILLZ_ALLOW_DRIFT=1)
         #[arg(long)]
         allow_drift: bool,
-        /// Interactive next-actions (Ratatui)
-        #[arg(short = 'i', long)]
+        /// Interactive next-actions for the current scope (Ratatui; not with -g)
+        #[arg(short = 'i', long, conflicts_with = "global")]
         interactive: bool,
     },
     /// Show or install git/jj Drift hooks for this Managed Project
@@ -694,6 +714,7 @@ fn run() -> skillz_core::Result<()> {
         Some(Commands::Drift {
             check,
             project,
+            global,
             allow_drift,
             interactive,
         }) => {
@@ -704,16 +725,30 @@ fn run() -> skillz_core::Result<()> {
                 return Ok(());
             }
             if interactive {
+                // Current App scope only (Project cwd or --user) — same as default report.
                 tui::run_drift_board(&app)?;
                 return Ok(());
             }
-            let report = app.drift_report(project.as_deref())?;
+            let scan = if global {
+                DriftScan::Global
+            } else if let Some(path) = project {
+                DriftScan::Project(path)
+            } else {
+                DriftScan::Current
+            };
+            let report = app.drift_report(scan)?;
             if report.is_empty() {
                 println!("no drift");
                 return Ok(());
             }
+            let user_skills = app.paths().user_skills_dir();
             for proj in &report {
-                println!("project: {}", proj.project.display());
+                let label = if proj.project == user_skills {
+                    format!("user-global: {}", proj.project.display())
+                } else {
+                    format!("project: {}", proj.project.display())
+                };
+                println!("{label}");
                 let name_width = proj
                     .items
                     .iter()
