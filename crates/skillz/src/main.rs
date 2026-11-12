@@ -74,8 +74,9 @@ Upstream --source strings (required for `--as upstream` unless a fetch sidecar e
         cmd:rexpad skill install --dir {dir}|version:rexpad version
 ")]
     Libcommit {
-        /// Skill name under the Project skills dir
-        name: String,
+        /// Skill name(s) under the Project skills dir
+        #[arg(value_name = "NAME", required = true)]
+        names: Vec<String>,
         /// Target Library Binding name
         #[arg(long)]
         library: Option<String>,
@@ -651,52 +652,63 @@ fn run() -> skillz_core::Result<()> {
             Ok(())
         }
         Some(Commands::Libcommit {
-            name,
+            names,
             library,
             as_kind,
             source,
             message,
-        }) => match as_kind {
-            Some(LibcommitKind::Authored) => {
-                let library = library.ok_or_else(|| {
-                    skillz_core::SkillzError::Message(
-                        "`libcommit --as authored` requires --library".into(),
-                    )
-                })?;
-                let lock = app.libcommit_authored(&name, &library)?;
-                println!(
-                    "libcommit `{name}` → library `{library}` as owned ({})",
-                    lock.content_hash
-                );
-                Ok(())
+        }) => {
+            if source.is_some() && names.len() > 1 {
+                return Err(skillz_core::SkillzError::Message(
+                    "`libcommit --source` requires a single skill name (or omit --source to use each skill's fetch sidecar)".into(),
+                ));
             }
-            Some(LibcommitKind::Upstream) => {
-                let library = library.ok_or_else(|| {
-                    skillz_core::SkillzError::Message(
-                        "`libcommit --as upstream` requires --library".into(),
-                    )
-                })?;
-                let lock = app.libcommit_upstream(&name, &library, source.as_deref())?;
-                println!(
-                    "libcommit `{name}` → library `{library}` as upstream ({})",
-                    lock.content_hash
-                );
-                if let Some(src) = &lock.source {
-                    println!("source: {src}");
+            for name in &names {
+                match as_kind {
+                    Some(LibcommitKind::Authored) => {
+                        let library = library.as_ref().ok_or_else(|| {
+                            skillz_core::SkillzError::Message(
+                                "`libcommit --as authored` requires --library".into(),
+                            )
+                        })?;
+                        let lock = app.libcommit_authored(name, library)?;
+                        println!(
+                            "libcommit `{name}` → library `{library}` as owned ({})",
+                            lock.content_hash
+                        );
+                    }
+                    Some(LibcommitKind::Upstream) => {
+                        let library = library.as_ref().ok_or_else(|| {
+                            skillz_core::SkillzError::Message(
+                                "`libcommit --as upstream` requires --library".into(),
+                            )
+                        })?;
+                        let lock =
+                            app.libcommit_upstream(name, library, source.as_deref())?;
+                        println!(
+                            "libcommit `{name}` → library `{library}` as upstream ({})",
+                            lock.content_hash
+                        );
+                        if let Some(src) = &lock.source {
+                            println!("source: {src}");
+                        }
+                    }
+                    None => {
+                        let lock = app.libcommit_branch(
+                            name,
+                            library.as_deref(),
+                            message.as_deref(),
+                        )?;
+                        println!(
+                            "libcommit `{name}` Branch Lock on {}@{}",
+                            lock.branch.as_deref().unwrap_or("?"),
+                            lock.rev.as_deref().unwrap_or("?")
+                        );
+                    }
                 }
-                Ok(())
             }
-            None => {
-                let lock =
-                    app.libcommit_branch(&name, library.as_deref(), message.as_deref())?;
-                println!(
-                    "libcommit `{name}` Branch Lock on {}@{}",
-                    lock.branch.as_deref().unwrap_or("?"),
-                    lock.rev.as_deref().unwrap_or("?")
-                );
-                Ok(())
-            }
-        },
+            Ok(())
+        }
         Some(Commands::Promote { name }) => {
             let rev = app.promote_skill(&name)?;
             println!("promoted `{name}` to library main ({rev})");
@@ -1169,6 +1181,36 @@ mod tests {
                 assert_eq!(names, vec!["foo", "bar", "baz"]);
             }
             other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn libcommit_parses_multiple_skill_names() {
+        let cli = Cli::try_parse_from([
+            "skillz",
+            "libcommit",
+            "foo",
+            "bar",
+            "--as",
+            "authored",
+            "--library",
+            "personal",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Libcommit {
+                names,
+                library,
+                as_kind,
+                source,
+                ..
+            }) => {
+                assert_eq!(names, vec!["foo", "bar"]);
+                assert_eq!(library.as_deref(), Some("personal"));
+                assert!(matches!(as_kind, Some(LibcommitKind::Authored)));
+                assert!(source.is_none());
+            }
+            other => panic!("expected Libcommit, got {other:?}"),
         }
     }
 }
