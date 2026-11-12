@@ -1,0 +1,120 @@
+#!/bin/sh
+# Read-only jj inspection. One command, no pager, no working-copy snapshot.
+# If the repo has a .jj/ directory, callers must use this instead of git
+# and instead of shell pipelines around jj.
+set -eu
+
+usage() {
+    cat <<'EOF'
+Usage: jj-read <command> [args]
+
+  log [N]              Last N revisions (default 20), no graph
+  show REV [-- paths]  Description and diff stat for REV
+  diff REV [-- paths]  Patch for REV (against its parents)
+  stat REV [-- paths]  Diff stat for REV
+
+Output is truncated to JJ_READ_MAX bytes (default 20000).
+Does not snapshot or update the working copy.
+EOF
+    exit 2
+}
+
+find_root() {
+    dir=$(pwd)
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.jj" ]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    echo "jj-read: no .jj directory at or above $(pwd); refusing to run git" >&2
+    exit 1
+}
+
+root=$(find_root)
+cd "$root"
+
+if ! command -v jj >/dev/null 2>&1; then
+    echo "jj-read: jj is not on PATH" >&2
+    exit 1
+fi
+
+max=${JJ_READ_MAX:-20000}
+case "$max" in
+    '' | *[!0-9]*)
+        echo "jj-read: JJ_READ_MAX must be a positive integer" >&2
+        exit 2
+        ;;
+esac
+
+if [ "$#" -lt 1 ]; then
+    usage
+fi
+
+cmd=$1
+shift
+
+# --ignore-working-copy: do not snapshot or write the working copy.
+# paginate/color off: do not open a pager or emit terminal control codes.
+jj() {
+    command jj --ignore-working-copy \
+        --config ui.paginate=never \
+        --config ui.color=never \
+        "$@"
+}
+
+run() {
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' EXIT
+    set +e
+    jj "$@" >"$tmp" 2>&1
+    status=$?
+    set -e
+    bytes=$(wc -c <"$tmp" | tr -d ' ')
+    if [ "$bytes" -gt "$max" ]; then
+        head -c "$max" "$tmp"
+        printf '\n... jj-read truncated at %s bytes (%s total). Pass a path or raise JJ_READ_MAX.\n' "$max" "$bytes"
+    else
+        cat "$tmp"
+    fi
+    exit "$status"
+}
+
+case "$cmd" in
+    log)
+        n=${1:-20}
+        case "$n" in
+            *[!0-9]*)
+                echo "jj-read: log limit must be an integer" >&2
+                exit 2
+                ;;
+        esac
+        run log -n "$n" --no-graph
+        ;;
+    show)
+        [ "$#" -ge 1 ] || usage
+        rev=$1
+        shift
+        run show --stat "$rev" "$@"
+        ;;
+    diff)
+        [ "$#" -ge 1 ] || usage
+        rev=$1
+        shift
+        run diff -r "$rev" "$@"
+        ;;
+    stat)
+        [ "$#" -ge 1 ] || usage
+        rev=$1
+        shift
+        run diff --stat -r "$rev" "$@"
+        ;;
+    -h | --help | help)
+        usage
+        ;;
+    *)
+        echo "jj-read: unknown command: $cmd" >&2
+        usage
+        ;;
+esac

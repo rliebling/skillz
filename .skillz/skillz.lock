@@ -26,6 +26,13 @@ content_hash = "sha256:c9fb351e599c5bf4d2f79c2c3df84c9c0def2c842cafb7a8d11ce7d8e
 rev = "281cd7ec6c1d7700ccca94ee076f185365337020"
 branch = "skillz/handoff"
 
+[installations.pre-change-protocol]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:975cfa2f06e647b3bab5e253d2844ae65c45061cd96c7169c97b4a63d823c9a7"
+rev = "669f15a815d4d29e642f6c961dcb8f7bcc80b414"
+branch = "skillz/pre-change-protocol"
+
 [installations.setup-matt-pocock-skills]
 library = "personal"
 entry_kind = "owned"
@@ -39,6 +46,11 @@ entry_kind = "upstream"
 content_hash = "sha256:c9dc2862578563a56cdd9512e6685256b478205ab84c82a3112dd79425c60f9c"
 source = "cmd:skillz skill install --dir {dir}@0.1.0"
 rev = "0.1.0"
+
+[installations.source-control]
+library = "personal"
+entry_kind = "owned"
+content_hash = "sha256:e8922f947e682bb561f29baace7b6b39861a1adf7f358b67a8daab395f3ebf6a"
 
 [installations.to-spec]
 library = "personal"
