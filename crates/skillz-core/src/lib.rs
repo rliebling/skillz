@@ -153,6 +153,26 @@ pub struct LibraryImportCandidate {
     pub source: String,
 }
 
+/// Apply `--name` override: requires exactly one candidate; renames catalog entry only.
+fn apply_library_import_name_override(
+    candidates: &mut [LibraryImportCandidate],
+    name_override: Option<&str>,
+) -> Result<()> {
+    let Some(name) = name_override else {
+        return Ok(());
+    };
+    skill::validate_skill_name(name)?;
+    match candidates.len() {
+        1 => {
+            candidates[0].name = name.to_string();
+            Ok(())
+        }
+        n => Err(SkillzError::Message(format!(
+            "`--name` requires exactly one skill to import (found {n}); narrow with a skill path or -i"
+        ))),
+    }
+}
+
 /// A list row including Availability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRow {
@@ -1901,8 +1921,17 @@ impl App {
         path_filter: Option<&str>,
         dry_run: bool,
         tags: &[String],
+        name_override: Option<&str>,
     ) -> Result<LibraryImportReport> {
-        self.library_import_filtered(source, library_name, path_filter, dry_run, None, tags)
+        self.library_import_filtered(
+            source,
+            library_name,
+            path_filter,
+            dry_run,
+            None,
+            tags,
+            name_override,
+        )
     }
 
     pub fn library_import_filtered(
@@ -1913,6 +1942,7 @@ impl App {
         dry_run: bool,
         only_sources: Option<&[String]>,
         tags: &[String],
+        name_override: Option<&str>,
     ) -> Result<LibraryImportReport> {
         let lib_path = self.writable_registry_library(library_name)?;
         let mut candidates = self.library_import_discover(source, library_name, path_filter)?;
@@ -1920,6 +1950,7 @@ impl App {
             let want: std::collections::BTreeSet<&str> = only.iter().map(|s| s.as_str()).collect();
             candidates.retain(|c| want.contains(c.source.as_str()));
         }
+        apply_library_import_name_override(&mut candidates, name_override)?;
         let assign_tags = catalog::normalize_tag_filters(tags);
 
         let mut meta = LibraryMeta::load(&lib_path)?;
@@ -3250,7 +3281,7 @@ exit 1
         let before = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
         let dry = fx
             .app()
-            .library_import("github:mattpocock/skills", "personal", None, true, &[])
+            .library_import("github:mattpocock/skills", "personal", None, true, &[], None)
             .unwrap();
         assert!(dry.dry_run);
         assert!(dry.items.iter().any(|i| i.name == "grilling"));
@@ -3267,6 +3298,7 @@ exit 1
                 Some("skills/engineering"),
                 false,
                 &["elixir".into()],
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -3298,6 +3330,7 @@ exit 1
                 None,
                 false,
                 &["phoenix".into()],
+                None,
             )
             .unwrap();
         let focus = full.items.iter().find(|i| i.name == "focus").unwrap();
@@ -3344,12 +3377,77 @@ exit 1
                 Some("skills/productivity"),
                 false,
                 &[],
+                None,
             )
             .unwrap();
         assert!(matches!(
             collide.items[0].action,
             LibraryImportAction::SkipCollision { .. }
         ));
+    }
+
+
+    #[test]
+    fn library_import_name_override_avoids_collision() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .unwrap();
+        let rev = seed_github_cache(&fx, "mattpocock", "skills");
+
+        // Existing catalog entry occupies the discovered skill name.
+        let mut meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        meta.upsert_upstream(crate::library::UpstreamEntry {
+            name: "grilling".into(),
+            source: "github:other/repo/grilling@abc".into(),
+            tags: vec![],
+        });
+        meta.save(&fx.libs_dir.join("personal")).unwrap();
+
+        let err = fx
+            .app()
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                None,
+                true,
+                &[],
+                Some("renamed-grilling"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("exactly one skill"));
+
+        let report = fx
+            .app()
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                Some("skills/engineering/grilling"),
+                false,
+                &["import".into()],
+                Some("renamed-grilling"),
+            )
+            .unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].name, "renamed-grilling");
+        assert!(matches!(report.items[0].action, LibraryImportAction::Add));
+        assert_eq!(
+            report.items[0].source,
+            format!("github:mattpocock/skills/skills/engineering/grilling@{rev}")
+        );
+
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert!(meta.upstream.iter().any(|u| u.name == "grilling"));
+        let renamed = meta
+            .upstream
+            .iter()
+            .find(|u| u.name == "renamed-grilling")
+            .unwrap();
+        assert_eq!(
+            renamed.source,
+            format!("github:mattpocock/skills/skills/engineering/grilling@{rev}")
+        );
+        assert_eq!(renamed.tags, vec!["import".to_string()]);
     }
 
     #[test]
@@ -3363,7 +3461,7 @@ exit 1
         assert!(!fx.project_dir.join(".skillz/skillz.toml").is_file());
         let report = fx
             .app()
-            .library_import("github:acme/skills", "personal", None, false, &[])
+            .library_import("github:acme/skills", "personal", None, false, &[], None)
             .unwrap();
         assert!(!report.items.is_empty());
     }
@@ -3384,6 +3482,7 @@ exit 1
                 "personal",
                 None,
                 &[],
+                None,
                 &mut CancelPrompter,
             )
             .unwrap_err();
@@ -3402,6 +3501,7 @@ exit 1
                 "personal",
                 Some("skills/engineering"),
                 &["process".into()],
+                None,
                 &mut ui,
             )
             .unwrap();

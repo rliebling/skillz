@@ -62,9 +62,26 @@ fn find_skill_inner(dir: &Path, skill_name: &str, out: &mut Vec<PathBuf>) -> Res
 
 /// Walk `search_root` for directories containing `SKILL.md`.
 ///
-/// `repo_root` is used only to compute `rel_path` (must be an ancestor of each hit).
+/// If `search_root` itself contains `SKILL.md`, it is included (so a source URL
+/// pointing at a single skill directory works). `repo_root` is used only to
+/// compute `rel_path` (must be an ancestor of each hit).
 pub fn discover_skills(repo_root: &Path, search_root: &Path) -> Result<Vec<DiscoveredSkill>> {
     let mut out = Vec::new();
+    if search_root.join("SKILL.md").is_file() {
+        let name = search_root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "skill".into());
+        let rel = search_root
+            .strip_prefix(repo_root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| name.clone());
+        out.push(DiscoveredSkill {
+            name,
+            abs_path: search_root.to_path_buf(),
+            rel_path: rel,
+        });
+    }
     discover_skills_inner(repo_root, search_root, &mut out)?;
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(out)
@@ -328,6 +345,11 @@ mod tests {
         .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "grilling");
+
+        let leaf = discover_skills(root.path(), &eng).unwrap();
+        assert_eq!(leaf.len(), 1);
+        assert_eq!(leaf[0].name, "grilling");
+        assert_eq!(leaf[0].rel_path, "skills/engineering/grilling");
     }
 
     #[test]

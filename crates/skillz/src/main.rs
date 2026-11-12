@@ -273,6 +273,9 @@ enum LibraryCommands {
         /// Limit discovery to this subtree (after any path in `source`)
         #[arg(long)]
         path: Option<String>,
+        /// Catalog name for the imported skill (requires exactly one discovery hit)
+        #[arg(long)]
+        name: Option<String>,
         /// List what would be added/updated/skipped; write nothing
         #[arg(long)]
         dry_run: bool,
@@ -937,6 +940,7 @@ fn run() -> skillz_core::Result<()> {
                 source,
                 library,
                 path,
+                name,
                 dry_run,
                 interactive,
                 tags,
@@ -954,10 +958,18 @@ fn run() -> skillz_core::Result<()> {
                         &library,
                         path.as_deref(),
                         &tags,
+                        name.as_deref(),
                         &mut ui,
                     )?
                 } else {
-                    app.library_import(&source, &library, path.as_deref(), dry_run, &tags)?
+                    app.library_import(
+                        &source,
+                        &library,
+                        path.as_deref(),
+                        dry_run,
+                        &tags,
+                        name.as_deref(),
+                    )?
                 };
                 let prefix = if report.dry_run { "dry-run " } else { "" };
                 if report.items.is_empty() {

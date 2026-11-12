@@ -53,6 +53,7 @@ impl App {
         library_name: &str,
         path_filter: Option<&str>,
         tags: &[String],
+        name_override: Option<&str>,
         prompler: &mut dyn Prompter,
     ) -> Result<LibraryImportReport> {
         let candidates = self.library_import_discover(source, library_name, path_filter)?;
@@ -92,6 +93,7 @@ impl App {
             false,
             Some(&sources),
             tags,
+            name_override,
         )
     }
 
