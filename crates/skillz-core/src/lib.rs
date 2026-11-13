@@ -129,6 +129,36 @@ pub enum LibraryImportAction {
     SkipOwned,
 }
 
+impl LibraryImportAction {
+    pub fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::SkipCollision { .. } | Self::SkipOwned
+        )
+    }
+}
+
+/// How [`App::library_import`] handles name conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryImportOnConflict {
+    /// Abort the entire import when any conflict exists (default).
+    Fail,
+    /// Import non-conflicting rows; soft-skip conflicts.
+    Skip,
+    /// Resolve each conflict interactively, then apply atomically.
+    Prompt,
+}
+
+/// Resolution chosen for one import conflict under [`LibraryImportOnConflict::Prompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryImportConflictResolution {
+    Skip,
+    /// Import under a different Catalog name.
+    Rename(String),
+    /// Abort the whole import with no writes.
+    Abort,
+}
+
 /// One planned/applied row from [`App::library_import`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryImportItem {
@@ -2001,8 +2031,9 @@ impl App {
     /// Does not materialize Project/`--user` Installations. Works against a
     /// registered writable Library by name (no Managed Project required).
     ///
-    /// When `only_sources` is `Some`, only candidates whose canonical source
-    /// strings appear in that list are considered (order follows discovery).
+    /// Default [`LibraryImportOnConflict::Fail`] aborts the entire import when
+    /// any Owned name, different Upstream identity, or duplicate discovery name
+    /// conflicts — writing nothing. Same-identity refreshes still succeed.
     pub fn library_import(
         &self,
         source: &str,
@@ -2011,6 +2042,7 @@ impl App {
         dry_run: bool,
         tags: &[String],
         name_override: Option<&str>,
+        on_conflict: LibraryImportOnConflict,
     ) -> Result<LibraryImportReport> {
         self.library_import_filtered(
             source,
@@ -2020,6 +2052,8 @@ impl App {
             None,
             tags,
             name_override,
+            on_conflict,
+            None,
         )
     }
 
@@ -2032,6 +2066,10 @@ impl App {
         only_sources: Option<&[String]>,
         tags: &[String],
         name_override: Option<&str>,
+        on_conflict: LibraryImportOnConflict,
+        mut resolve_conflict: Option<
+            &mut dyn FnMut(&LibraryImportItem) -> Result<LibraryImportConflictResolution>,
+        >,
     ) -> Result<LibraryImportReport> {
         let lib_path = self.writable_registry_library(library_name)?;
         let mut candidates = self.library_import_discover(source, library_name, path_filter)?;
@@ -2042,14 +2080,15 @@ impl App {
         apply_library_import_name_override(&mut candidates, name_override)?;
         let assign_tags = catalog::normalize_tag_filters(tags);
 
-        let mut meta = LibraryMeta::load(&lib_path)?;
+        let meta = LibraryMeta::load(&lib_path)?;
         let owned_names: std::collections::BTreeSet<String> =
             catalog::list_owned_entries(library_name, &lib_path)?
                 .into_iter()
                 .map(|e| e.name)
                 .collect();
 
-        let mut items = Vec::new();
+        // Phase 1: plan against the catalog snapshot (no writes yet).
+        let mut planned: Vec<LibraryImportItem> = Vec::new();
         let mut seen_names: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
 
@@ -2082,6 +2121,123 @@ impl App {
                 LibraryImportAction::Add
             };
 
+            if matches!(
+                action,
+                LibraryImportAction::Add
+                    | LibraryImportAction::Update
+                    | LibraryImportAction::SkipIdentical
+            ) {
+                seen_names.insert(skill.name.clone());
+            }
+
+            planned.push(LibraryImportItem {
+                name: skill.name,
+                source: source_str,
+                action,
+            });
+        }
+
+        let conflicts: Vec<&LibraryImportItem> = planned
+            .iter()
+            .filter(|i| i.action.is_conflict())
+            .collect();
+
+        // Phase 2: resolve conflicts per policy (still no writes).
+        let mut apply_rows: Vec<(String, String, LibraryImportAction)> = Vec::new();
+        match on_conflict {
+            LibraryImportOnConflict::Fail if !conflicts.is_empty() => {
+                let mut lines = vec![format!(
+                    "library import aborted: {} conflict(s); no Catalog changes written",
+                    conflicts.len()
+                )];
+                for c in &conflicts {
+                    let detail = match &c.action {
+                        LibraryImportAction::SkipOwned => {
+                            "Owned Entry already exists".to_string()
+                        }
+                        LibraryImportAction::SkipCollision { existing_source } => {
+                            format!("name collision with `{existing_source}`")
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    lines.push(format!("  - {} ({}) — {detail}", c.name, c.source));
+                }
+                lines.push(
+                    "re-run with `--on-conflict skip` or `--on-conflict prompt` to proceed"
+                        .into(),
+                );
+                return Err(SkillzError::Message(lines.join("\n")));
+            }
+            LibraryImportOnConflict::Fail | LibraryImportOnConflict::Skip => {
+                for item in &planned {
+                    apply_rows.push((item.name.clone(), item.source.clone(), item.action.clone()));
+                }
+            }
+            LibraryImportOnConflict::Prompt => {
+                let resolver = resolve_conflict.as_mut().ok_or_else(|| {
+                    SkillzError::Message(
+                        "`--on-conflict prompt` requires an interactive resolver".into(),
+                    )
+                })?;
+                for item in &planned {
+                    if !item.action.is_conflict() {
+                        apply_rows.push((
+                            item.name.clone(),
+                            item.source.clone(),
+                            item.action.clone(),
+                        ));
+                        continue;
+                    }
+                    match resolver(item)? {
+                        LibraryImportConflictResolution::Skip => {
+                            apply_rows.push((
+                                item.name.clone(),
+                                item.source.clone(),
+                                item.action.clone(),
+                            ));
+                        }
+                        LibraryImportConflictResolution::Abort => {
+                            return Err(SkillzError::Message(
+                                "library import aborted during conflict prompt; no Catalog changes written"
+                                    .into(),
+                            ));
+                        }
+                        LibraryImportConflictResolution::Rename(new_name) => {
+                            skill::validate_skill_name(&new_name)?;
+                            if owned_names.contains(&new_name)
+                                || meta.upstream.iter().any(|e| e.name == new_name)
+                                || apply_rows.iter().any(|(n, _, a)| {
+                                    n == &new_name
+                                        && matches!(
+                                            a,
+                                            LibraryImportAction::Add
+                                                | LibraryImportAction::Update
+                                                | LibraryImportAction::SkipIdentical
+                                        )
+                                })
+                            {
+                                return Err(SkillzError::Message(format!(
+                                    "cannot rename `{}` to `{new_name}`: name already in use",
+                                    item.name
+                                )));
+                            }
+                            apply_rows.push((
+                                new_name,
+                                item.source.clone(),
+                                LibraryImportAction::Add,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 3: apply atomically (or report-only for dry-run).
+        let mut out_items = Vec::new();
+        let mut meta = meta;
+        for (name, source_str, action) in apply_rows {
+            let pinned = source::GithubSource::parse(&source_str)?;
+            let existing = meta.upstream.iter().find(|e| e.name == name).cloned();
             match &action {
                 LibraryImportAction::Add | LibraryImportAction::Update => {
                     if !dry_run {
@@ -2097,21 +2253,18 @@ impl App {
                             _ => assign_tags.clone(),
                         };
                         meta.upsert_upstream(crate::library::UpstreamEntry {
-                            name: skill.name.clone(),
+                            name: name.clone(),
                             source: source_str.clone(),
                             tags,
                         });
                     }
-                    seen_names.insert(skill.name.clone());
                 }
-                LibraryImportAction::SkipIdentical => {
-                    seen_names.insert(skill.name.clone());
-                }
-                LibraryImportAction::SkipCollision { .. } | LibraryImportAction::SkipOwned => {}
+                LibraryImportAction::SkipIdentical
+                | LibraryImportAction::SkipCollision { .. }
+                | LibraryImportAction::SkipOwned => {}
             }
-
-            items.push(LibraryImportItem {
-                name: skill.name,
+            out_items.push(LibraryImportItem {
+                name,
                 source: source_str,
                 action,
             });
@@ -2124,7 +2277,7 @@ impl App {
         Ok(LibraryImportReport {
             library: library_name.to_string(),
             dry_run,
-            items,
+            items: out_items,
         })
     }
 
@@ -3537,19 +3690,50 @@ exit 1
             .unwrap();
         let rev = seed_github_cache(&fx, "mattpocock", "skills");
 
-        // Dry-run leaves library.toml unchanged.
+        // Dry-run with skip policy leaves library.toml unchanged and reports conflicts.
         let before = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
         let dry = fx
             .app()
-            .library_import("github:mattpocock/skills", "personal", None, true, &[], None)
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                None,
+                true,
+                &[],
+                None,
+                LibraryImportOnConflict::Skip,
+            )
             .unwrap();
         assert!(dry.dry_run);
         assert!(dry.items.iter().any(|i| i.name == "grilling"));
         assert!(dry.items.iter().any(|i| i.name == "focus"));
+        assert!(dry.items.iter().any(|i| matches!(
+            i.action,
+            LibraryImportAction::SkipCollision { .. }
+        )));
         let after_dry = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
         assert_eq!(before, after_dry);
 
-        // HTTPS form + path filter.
+        // Fail-closed default aborts when discovery has duplicate names.
+        let fail = fx
+            .app()
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                None,
+                false,
+                &[],
+                None,
+                LibraryImportOnConflict::Fail,
+            )
+            .unwrap_err();
+        assert!(fail.to_string().contains("conflict"));
+        assert_eq!(
+            before,
+            fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap()
+        );
+
+        // HTTPS form + path filter (no conflicts).
         let filtered = fx
             .app()
             .library_import(
@@ -3559,6 +3743,7 @@ exit 1
                 false,
                 &["elixir".into()],
                 None,
+                LibraryImportOnConflict::Fail,
             )
             .unwrap();
         assert_eq!(
@@ -3580,8 +3765,7 @@ exit 1
         assert_eq!(meta.upstream[0].name, "grilling");
         assert_eq!(meta.upstream[0].tags, vec!["elixir".to_string()]);
 
-        // Full import: focus added; other grilling collides with existing / earlier.
-        // New tag on re-import merges onto grilling.
+        // Skip policy: focus added; duplicate grilling soft-skipped; same-identity tag merge.
         let full = fx
             .app()
             .library_import(
@@ -3591,6 +3775,7 @@ exit 1
                 false,
                 &["phoenix".into()],
                 None,
+                LibraryImportOnConflict::Skip,
             )
             .unwrap();
         let focus = full.items.iter().find(|i| i.name == "focus").unwrap();
@@ -3617,11 +3802,10 @@ exit 1
         let focus_up = meta.upstream.iter().find(|u| u.name == "focus").unwrap();
         assert_eq!(focus_up.tags, vec!["phoenix".to_string()]);
 
-        // No Project / user skills materialization.
         assert!(!fx.project_dir.join(".agents/skills").exists());
         assert!(!fx.home_dir.join(".agents/skills").exists());
 
-        // Name collision with different source skips.
+        // Different Upstream identity: Fail aborts; Skip soft-skips.
         let mut meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
         meta.upsert_upstream(crate::library::UpstreamEntry {
             name: "focus".into(),
@@ -3629,6 +3813,25 @@ exit 1
             tags: vec!["phoenix".into()],
         });
         meta.save(&fx.libs_dir.join("personal")).unwrap();
+        let before_collide =
+            fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
+        let fail_collide = fx
+            .app()
+            .library_import(
+                "github:mattpocock/skills",
+                "personal",
+                Some("skills/productivity"),
+                false,
+                &[],
+                None,
+                LibraryImportOnConflict::Fail,
+            )
+            .unwrap_err();
+        assert!(fail_collide.to_string().contains("conflict"));
+        assert_eq!(
+            before_collide,
+            fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap()
+        );
         let collide = fx
             .app()
             .library_import(
@@ -3638,6 +3841,7 @@ exit 1
                 false,
                 &[],
                 None,
+                LibraryImportOnConflict::Skip,
             )
             .unwrap();
         assert!(matches!(
@@ -3646,6 +3850,85 @@ exit 1
         ));
     }
 
+    #[test]
+    fn library_import_prompt_renames_then_applies_atomically() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        let rev = seed_github_cache(&fx, "mattpocock", "skills");
+        let mut meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        meta.upsert_upstream(crate::library::UpstreamEntry {
+            name: "grilling".into(),
+            source: "github:other/repo/grilling@abc".into(),
+            tags: vec![],
+        });
+        meta.save(&fx.libs_dir.join("personal")).unwrap();
+
+        let mut resolutions = vec![LibraryImportConflictResolution::Rename(
+            "renamed-grilling".into(),
+        )];
+        let mut resolver =
+            |item: &LibraryImportItem| -> Result<LibraryImportConflictResolution> {
+                assert_eq!(item.name, "grilling");
+                Ok(resolutions.remove(0))
+            };
+        let report = fx
+            .app()
+            .library_import_filtered(
+                "github:mattpocock/skills",
+                "personal",
+                Some("skills/engineering"),
+                false,
+                None,
+                &[],
+                None,
+                LibraryImportOnConflict::Prompt,
+                Some(&mut resolver),
+            )
+            .unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].name, "renamed-grilling");
+        assert!(matches!(report.items[0].action, LibraryImportAction::Add));
+        assert_eq!(
+            report.items[0].source,
+            format!("github:mattpocock/skills/skills/engineering/grilling@{rev}")
+        );
+        let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
+        assert!(meta.upstream.iter().any(|u| u.name == "renamed-grilling"));
+        assert!(meta.upstream.iter().any(|u| u.name == "grilling"));
+    }
+
+    #[test]
+    fn library_import_prompt_abort_writes_nothing() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        let _ = seed_github_cache(&fx, "mattpocock", "skills");
+        let before = fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap();
+        let mut resolver =
+            |_item: &LibraryImportItem| Ok(LibraryImportConflictResolution::Abort);
+        let err = fx
+            .app()
+            .library_import_filtered(
+                "github:mattpocock/skills",
+                "personal",
+                None,
+                false,
+                None,
+                &[],
+                None,
+                LibraryImportOnConflict::Prompt,
+                Some(&mut resolver),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("aborted"));
+        assert_eq!(
+            before,
+            fs::read_to_string(fx.libs_dir.join("personal/library.toml")).unwrap()
+        );
+    }
 
     #[test]
     fn library_import_name_override_avoids_collision() {
@@ -3673,7 +3956,7 @@ exit 1
                 true,
                 &[],
                 Some("renamed-grilling"),
-            )
+                crate::LibraryImportOnConflict::Fail)
             .unwrap_err();
         assert!(err.to_string().contains("exactly one skill"));
 
@@ -3686,7 +3969,7 @@ exit 1
                 false,
                 &["import".into()],
                 Some("renamed-grilling"),
-            )
+                crate::LibraryImportOnConflict::Fail)
             .unwrap();
         assert_eq!(report.items.len(), 1);
         assert_eq!(report.items[0].name, "renamed-grilling");
@@ -3721,7 +4004,15 @@ exit 1
         assert!(!fx.project_dir.join(".skillz/skillz.toml").is_file());
         let report = fx
             .app()
-            .library_import("github:acme/skills", "personal", None, false, &[], None)
+            .library_import(
+                "github:acme/skills",
+                "personal",
+                Some("skills/engineering"),
+                false,
+                &[],
+                None,
+                LibraryImportOnConflict::Fail,
+            )
             .unwrap();
         assert!(!report.items.is_empty());
     }
@@ -3743,6 +4034,8 @@ exit 1
                 None,
                 &[],
                 None,
+                LibraryImportOnConflict::Fail,
+                None,
                 &mut CancelPrompter,
             )
             .unwrap_err();
@@ -3761,6 +4054,8 @@ exit 1
                 "personal",
                 Some("skills/engineering"),
                 &["process".into()],
+                None,
+                LibraryImportOnConflict::Fail,
                 None,
                 &mut ui,
             )

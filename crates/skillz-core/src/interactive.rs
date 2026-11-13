@@ -54,6 +54,10 @@ impl App {
         path_filter: Option<&str>,
         tags: &[String],
         name_override: Option<&str>,
+        on_conflict: crate::LibraryImportOnConflict,
+        resolve_conflict: Option<
+            &mut dyn FnMut(&crate::LibraryImportItem) -> Result<crate::LibraryImportConflictResolution>,
+        >,
         prompler: &mut dyn Prompter,
     ) -> Result<LibraryImportReport> {
         let candidates = self.library_import_discover(source, library_name, path_filter)?;
@@ -94,6 +98,8 @@ impl App {
             Some(&sources),
             tags,
             name_override,
+            on_conflict,
+            resolve_conflict,
         )
     }
 

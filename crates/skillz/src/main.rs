@@ -7,8 +7,9 @@ mod tui;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use skillz_core::{
-    default_config_dir, AddOutcome, App, DriftReason, DriftScan, LibraryImportAction, ListRow,
-    Scope, SkillzPaths,
+    default_config_dir, AddOutcome, App, DriftReason, DriftScan, LibraryImportAction,
+    LibraryImportConflictResolution, LibraryImportItem, LibraryImportOnConflict, ListRow, Scope,
+    SkillzPaths,
 };
 use tui::RatatuiPrompter;
 
@@ -326,7 +327,23 @@ Examples:
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
     },
-    /// Bulk-add Upstream Catalog Entries from a GitHub skills repo
+    /// Bulk-add Upstream Catalog Entries from a GitHub skills repo (Catalog only)
+    #[command(after_help = "\
+Examples:
+  # Preview discovery (fail-closed still reports conflicts as an error)
+  skillz library import github:owner/skills -l personal --dry-run
+
+  # Default: abort entire import on any name conflict (no Catalog writes)
+  skillz library import github:owner/skills -l personal
+
+  # Import the non-conflicting subset only
+  skillz library import github:owner/skills -l personal --on-conflict skip
+
+  # Resolve each conflict (skip / rename / abort), then apply atomically
+  skillz library import github:owner/skills -l personal --on-conflict prompt
+
+  # Does not install into a Project or --user scope — Catalog Entries only
+")]
     Import {
         /// `github:owner/repo[/path][@rev]` or `https://github.com/owner/repo…`
         source: String,
@@ -348,7 +365,30 @@ Examples:
         /// Assign tags to imported Upstream entries (repeatable; comma-separated OK)
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
+        /// Conflict policy when a Catalog name is already taken
+        #[arg(long = "on-conflict", value_enum, default_value_t = CliImportOnConflict::Fail)]
+        on_conflict: CliImportOnConflict,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CliImportOnConflict {
+    /// Abort the entire import when any conflict exists (default)
+    Fail,
+    /// Import non-conflicting rows; soft-skip conflicts
+    Skip,
+    /// Resolve each conflict interactively, then apply atomically
+    Prompt,
+}
+
+impl From<CliImportOnConflict> for LibraryImportOnConflict {
+    fn from(value: CliImportOnConflict) -> Self {
+        match value {
+            CliImportOnConflict::Fail => LibraryImportOnConflict::Fail,
+            CliImportOnConflict::Skip => LibraryImportOnConflict::Skip,
+            CliImportOnConflict::Prompt => LibraryImportOnConflict::Prompt,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -567,6 +607,48 @@ fn resolve_missing_deps(
         }
     }
     Ok(())
+}
+
+fn resolve_import_conflict_stdin(
+    item: &LibraryImportItem,
+) -> skillz_core::Result<LibraryImportConflictResolution> {
+    use std::io::{self, Write};
+    let reason = match &item.action {
+        LibraryImportAction::SkipOwned => "Owned Entry already exists".to_string(),
+        LibraryImportAction::SkipCollision { existing_source } => {
+            format!("name collision with `{existing_source}`")
+        }
+        other => format!("{other:?}"),
+    };
+    eprintln!("conflict: `{}` ({}) — {reason}", item.name, item.source);
+    eprint!("  [s]kip / [r]ename / [a]bort > ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| skillz_core::SkillzError::Message(format!("failed to read stdin: {e}")))?;
+    match line.trim().to_ascii_lowercase().as_str() {
+        "s" | "skip" => Ok(LibraryImportConflictResolution::Skip),
+        "a" | "abort" | "q" => Ok(LibraryImportConflictResolution::Abort),
+        "r" | "rename" => {
+            eprint!("  new catalog name > ");
+            let _ = io::stderr().flush();
+            let mut name = String::new();
+            io::stdin().read_line(&mut name).map_err(|e| {
+                skillz_core::SkillzError::Message(format!("failed to read stdin: {e}"))
+            })?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(skillz_core::SkillzError::Message(
+                    "rename requires a non-empty catalog name".into(),
+                ));
+            }
+            Ok(LibraryImportConflictResolution::Rename(name.to_string()))
+        }
+        other => Err(skillz_core::SkillzError::Message(format!(
+            "unknown conflict choice `{other}` (use skip, rename, or abort)"
+        ))),
+    }
 }
 
 fn main() -> ExitCode {
@@ -1063,22 +1145,52 @@ fn run() -> skillz_core::Result<()> {
                 dry_run,
                 interactive,
                 tags,
+                on_conflict,
             } => {
                 if interactive && dry_run {
                     return Err(skillz_core::SkillzError::Message(
                         "`library import` refuses --dry-run with -i; omit one of them".into(),
                     ));
                 }
+                let on_conflict = LibraryImportOnConflict::from(on_conflict);
+                if on_conflict == LibraryImportOnConflict::Prompt && dry_run {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`library import` refuses --dry-run with --on-conflict prompt; omit one of them".into(),
+                    ));
+                }
                 let library = app.resolve_library_name(library.as_deref())?;
+                let mut prompt_resolver =
+                    |item: &LibraryImportItem| resolve_import_conflict_stdin(item);
                 let report = if interactive {
                     let mut ui = RatatuiPrompter;
+                    let resolver: Option<
+                        &mut dyn FnMut(&LibraryImportItem) -> skillz_core::Result<LibraryImportConflictResolution>,
+                    > = if on_conflict == LibraryImportOnConflict::Prompt {
+                        Some(&mut prompt_resolver)
+                    } else {
+                        None
+                    };
                     app.interactive_library_import(
                         &source,
                         &library,
                         path.as_deref(),
                         &tags,
                         name.as_deref(),
+                        on_conflict,
+                        resolver,
                         &mut ui,
+                    )?
+                } else if on_conflict == LibraryImportOnConflict::Prompt {
+                    app.library_import_filtered(
+                        &source,
+                        &library,
+                        path.as_deref(),
+                        dry_run,
+                        None,
+                        &tags,
+                        name.as_deref(),
+                        on_conflict,
+                        Some(&mut prompt_resolver),
                     )?
                 } else {
                     app.library_import(
@@ -1088,6 +1200,7 @@ fn run() -> skillz_core::Result<()> {
                         dry_run,
                         &tags,
                         name.as_deref(),
+                        on_conflict,
                     )?
                 };
                 let prefix = if report.dry_run { "dry-run " } else { "" };
