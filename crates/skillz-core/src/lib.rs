@@ -32,6 +32,7 @@ pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
 pub use skill::{
     CatalogSuggestion, DriftAction, DriftItem, DriftReason, EntryKind, InstallationLock,
+    LOCAL_LIBRARY,
 };
 pub use vcs::{infer_vcs, Vcs};
 
@@ -693,12 +694,89 @@ impl App {
             }
             EntryKind::Owned => None,
             EntryKind::Upstream => None,
+            EntryKind::Local => None,
         };
         Ok(Some(skill::CatalogSuggestion {
             library: row.entry.library,
             kind: row.entry.kind,
             exact_match,
         }))
+    }
+
+    /// Mark an on-disk skill as Local authored (membership only; no content hash).
+    pub fn set_local_authored(&self, name: &str) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let config = self.load_scope_config()?;
+        let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
+        if !dest.join("SKILL.md").is_file() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found under {}",
+                dest.display()
+            )));
+        }
+        let install = InstallationLock {
+            library: LOCAL_LIBRARY.into(),
+            entry_kind: EntryKind::Local,
+            content_hash: String::new(),
+            source: None,
+            rev: None,
+            branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
+        };
+        let mut lock = self.load_scope_lock()?;
+        lock.installations.insert(name.to_string(), install.clone());
+        self.save_scope_lock(&lock)?;
+        Ok(install)
+    }
+
+    /// Mark an on-disk skill as Local + real `github:` / `cmd:` provenance (no Library Entry).
+    pub fn set_local_source(&self, name: &str, source: &str) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let config = self.load_scope_config()?;
+        let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
+        if !dest.join("SKILL.md").is_file() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found under {}",
+                dest.display()
+            )));
+        }
+        let source = source.trim();
+        let (canonical, rev) = if source.starts_with("github:") || source.contains("github.com/") {
+            let parsed = source::GithubSource::parse_input(source)?;
+            if parsed.rev.as_deref().unwrap_or("").is_empty() {
+                return Err(SkillzError::Message(
+                    "Local + github: source requires @rev (commit SHA or tag) for provenance".into(),
+                ));
+            }
+            (parsed.render(), parsed.rev.clone())
+        } else if source.starts_with("cmd:") {
+            let parsed = source::CmdSource::parse(source)?;
+            if parsed.rev.as_deref().unwrap_or("").is_empty() {
+                return Err(SkillzError::Message(
+                    "Local + cmd: source requires @tool-version for provenance".into(),
+                ));
+            }
+            (parsed.render(), parsed.rev.clone())
+        } else {
+            return Err(SkillzError::Message(format!(
+                "Local source must be `github:…` or `cmd:…`, got `{source}`"
+            )));
+        };
+        let install = InstallationLock {
+            library: LOCAL_LIBRARY.into(),
+            entry_kind: EntryKind::Local,
+            content_hash: String::new(),
+            source: Some(canonical),
+            rev,
+            branch: None,
+            overlay_from_library: None,
+            overlay_from_entry: None,
+        };
+        let mut lock = self.load_scope_lock()?;
+        lock.installations.insert(name.to_string(), install.clone());
+        self.save_scope_lock(&lock)?;
+        Ok(install)
     }
 
     fn lock_unlocked_to_catalog(
@@ -793,6 +871,8 @@ impl App {
                         reason: DriftReason::Unlocked,
                         suggestion: None,
                     }),
+                    // Local membership is managed without content-hash Drift.
+                    Some(rec) if rec.entry_kind == EntryKind::Local => {}
                     Some(rec) => match skill::content_hash(&path) {
                         Ok(actual) if actual == rec.content_hash => {}
                         Ok(actual) => items.push(DriftItem {
@@ -2495,6 +2575,87 @@ mod tests {
             .project_init(&["missing".into()], None)
             .unwrap_err();
         assert!(err.to_string().contains("not in the local registry"));
+    }
+
+    #[test]
+    fn local_authored_and_source_clear_unlocked_drift() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        fx.app().skill_new("local-only", &[]).unwrap();
+        assert_eq!(
+            fx.app().detect_drift().unwrap()[0].reason,
+            DriftReason::Unlocked
+        );
+
+        let authored = fx.app().set_local_authored("local-only").unwrap();
+        assert_eq!(authored.entry_kind, EntryKind::Local);
+        assert_eq!(authored.library, LOCAL_LIBRARY);
+        assert!(authored.content_hash.is_empty());
+        assert!(authored.source.is_none());
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+
+        let lock_text = fs::read_to_string(fx.project_dir.join(".skillz/skillz.lock")).unwrap();
+        assert!(lock_text.contains("entry_kind = \"local\""));
+        assert!(!lock_text.contains("content_hash"));
+
+        // Edits to Local authored files are not hash Drift.
+        fs::write(
+            fx.project_dir
+                .join(".agents/skills/local-only/SKILL.md"),
+            "---\nname: local-only\n---\n# edited\n",
+        )
+        .unwrap();
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+
+        fx.app().skill_new("local-src", &[]).unwrap();
+        let sourced = fx
+            .app()
+            .set_local_source("local-src", "github:owner/repo/local-src@abc1234")
+            .unwrap();
+        assert_eq!(sourced.entry_kind, EntryKind::Local);
+        assert_eq!(
+            sourced.source.as_deref(),
+            Some("github:owner/repo/local-src@abc1234")
+        );
+        assert_eq!(sourced.rev.as_deref(), Some("abc1234"));
+        assert!(fx
+            .app()
+            .detect_drift()
+            .unwrap()
+            .iter()
+            .all(|d| d.name != "local-src"));
+
+        let err = fx
+            .app()
+            .set_local_source("local-src", "github:owner/repo/local-src")
+            .unwrap_err();
+        assert!(err.to_string().contains("@rev"));
+    }
+
+    #[test]
+    fn local_membership_works_in_user_scope() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        let user = fx.app().with_scope(Scope::User);
+        user.user_init(&["personal".into()]).unwrap();
+        user.skill_new("home-skill", &[]).unwrap();
+        assert_eq!(
+            user.detect_drift().unwrap()[0].reason,
+            DriftReason::Unlocked
+        );
+        user.set_local_authored("home-skill").unwrap();
+        assert!(user.detect_drift().unwrap().is_empty());
+        let lock_text = fs::read_to_string(fx.config_dir.join("user.lock")).unwrap();
+        assert!(lock_text.contains("home-skill"));
+        assert!(lock_text.contains("entry_kind = \"local\""));
     }
 
     #[test]

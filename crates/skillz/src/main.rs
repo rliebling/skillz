@@ -871,6 +871,7 @@ fn run() -> skillz_core::Result<()> {
                 let kind = match kind {
                     skillz_core::EntryKind::Owned => "owned",
                     skillz_core::EntryKind::Upstream => "upstream",
+                    skillz_core::EntryKind::Local => "local",
                 };
                 println!(
                     "tagged `{name}` ({kind}) in `{library}`: [{}]",

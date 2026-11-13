@@ -13,6 +13,8 @@ use crate::{Result, SkillzError};
 pub struct InstallationLock {
     pub library: String,
     pub entry_kind: EntryKind,
+    /// Empty for Local authored / Local+source (no content-hash Drift).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -35,7 +37,13 @@ pub struct InstallationLock {
 pub enum EntryKind {
     Owned,
     Upstream,
+    /// Scope-only membership (not a Library Catalog Entry). Authored Local has no
+    /// content hash; Local + source stores provenance/pin without Library linkage.
+    Local,
 }
+
+/// Sentinel `InstallationLock.library` value for [`EntryKind::Local`] membership.
+pub const LOCAL_LIBRARY: &str = "local";
 
 /// Why a skill is considered Drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +68,7 @@ impl CatalogSuggestion {
         let kind = match self.kind {
             EntryKind::Owned => "owned",
             EntryKind::Upstream => "upstream",
+            EntryKind::Local => "local",
         };
         let match_label = match self.exact_match {
             Some(true) => "exact",
