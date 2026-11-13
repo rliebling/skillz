@@ -3,6 +3,8 @@
 *.db-journal
 *.db-shm
 *.db-wal
+beads.db-*
+beads.db.*
 
 # Lock files
 *.lock
@@ -13,6 +15,7 @@ last-touched
 
 # Local history backups
 .br_history/
+.br_recovery/
 
 # Sync state (local-only, per-machine)
 .sync.lock
