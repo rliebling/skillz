@@ -295,15 +295,34 @@ Examples:
         #[arg(long)]
         read_only: bool,
     },
-    /// List registered Libraries, or a Library Catalog with `--catalog` / `--library`
-    List {
-        /// Library Catalog to list (defaults to the registered Library containing cwd)
-        #[arg(long)]
+    /// List Libraries in the machine registry
+    #[command(after_help = "\
+Examples:
+  # Machine registry only (name, rw/ro, VCS, path)
+  skillz library list
+
+  # Browse Catalog Entries instead:
+  skillz library catalog
+  skillz library catalog -l personal -t tools
+")]
+    List,
+    /// Browse Catalog Entries in a registered Library
+    #[command(after_help = "\
+Examples:
+  # Catalog of the registered Library covering cwd
+  skillz library catalog
+
+  # Explicit Library + tag filter (AND)
+  skillz library catalog -l personal -t tools
+
+  # Registry browse (not Catalog):
+  skillz library list
+")]
+    Catalog {
+        /// Library name (defaults to the registered Library containing cwd)
+        #[arg(short = 'l', long = "library")]
         library: Option<String>,
-        /// List Catalog Entries instead of the user registry
-        #[arg(long)]
-        catalog: bool,
-        /// Filter Catalog by tag (repeatable; comma-separated allowed; AND)
+        /// Filter by tag (repeatable; comma-separated allowed; AND)
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
     },
@@ -312,7 +331,7 @@ Examples:
         /// `github:owner/repo[/path][@rev]` or `https://github.com/owner/repo…`
         source: String,
         /// Target registered Library name (defaults to the Library containing cwd)
-        #[arg(long)]
+        #[arg(short = 'l', long = "library")]
         library: Option<String>,
         /// Limit discovery to this subtree (after any path in `source`)
         #[arg(long)]
@@ -1013,21 +1032,7 @@ fn run() -> skillz_core::Result<()> {
                 );
                 Ok(())
             }
-            LibraryCommands::List {
-                library,
-                catalog,
-                tags,
-            } => {
-                if catalog || library.is_some() {
-                    let name = app.resolve_library_name(library.as_deref())?;
-                    let rows = app.list_library_catalog(&name, &tags, false)?;
-                    if rows.is_empty() {
-                        println!("(no matching Catalog Entries in library `{name}`)");
-                        return Ok(());
-                    }
-                    print_skill_table(&rows);
-                    return Ok(());
-                }
+            LibraryCommands::List => {
                 let entries = app.library_list()?;
                 if entries.is_empty() {
                     println!("(no libraries registered)");
@@ -1038,6 +1043,16 @@ fn run() -> skillz_core::Result<()> {
                     let ro = if e.read_only { "ro" } else { "rw" };
                     println!("{}\t{ro}\t{vcs}\t{}", e.name, e.path.display());
                 }
+                Ok(())
+            }
+            LibraryCommands::Catalog { library, tags } => {
+                let name = app.resolve_library_name(library.as_deref())?;
+                let rows = app.list_library_catalog(&name, &tags, false)?;
+                if rows.is_empty() {
+                    println!("(no matching Catalog Entries in library `{name}`)");
+                    return Ok(());
+                }
+                print_skill_table(&rows);
                 Ok(())
             }
             LibraryCommands::Import {
@@ -1327,6 +1342,41 @@ mod tests {
         match cli.command {
             Some(Commands::List { tags, .. }) => assert_eq!(tags, vec!["elixir"]),
             other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn library_list_is_registry_only() {
+        let cli = Cli::try_parse_from(["skillz", "library", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Library {
+                command: LibraryCommands::List
+            })
+        ));
+        assert!(Cli::try_parse_from(["skillz", "library", "list", "--catalog"]).is_err());
+    }
+
+    #[test]
+    fn library_catalog_parses_short_library_and_tag() {
+        let cli = Cli::try_parse_from([
+            "skillz",
+            "library",
+            "catalog",
+            "-l",
+            "personal",
+            "-t",
+            "tools",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Library {
+                command: LibraryCommands::Catalog { library, tags },
+            }) => {
+                assert_eq!(library.as_deref(), Some("personal"));
+                assert_eq!(tags, vec!["tools"]);
+            }
+            other => panic!("expected library catalog, got {other:?}"),
         }
     }
 }

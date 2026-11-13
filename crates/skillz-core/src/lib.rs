@@ -3410,6 +3410,50 @@ exit 1
     }
 
     #[test]
+    fn library_list_is_registry_catalog_is_entries() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal", false).unwrap();
+        let mut meta = LibraryMeta::new();
+        meta.upstream = vec![
+            crate::library::UpstreamEntry {
+                name: "demo".into(),
+                source: "github:owner/repo/demo@abc".into(),
+                tags: vec!["tools".into()],
+            },
+            crate::library::UpstreamEntry {
+                name: "other".into(),
+                source: "github:owner/repo/other@abc".into(),
+                tags: vec!["misc".into()],
+            },
+        ];
+        meta.save(&lib).unwrap();
+
+        let registry = fx.app().library_list().unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name, "personal");
+
+        let all = fx
+            .app_at(&lib)
+            .list_library_catalog("personal", &[], false)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        let filtered = fx
+            .app()
+            .list_library_catalog("personal", &["tools".into()], false)
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].entry.name, "demo");
+
+        let via_cwd = fx
+            .app_at(&lib)
+            .resolve_library_name(None)
+            .unwrap();
+        assert_eq!(via_cwd, "personal");
+    }
+
+    #[test]
     fn library_init_rejects_duplicate_name() {
         let fx = Fixture::new();
         fx.app()
