@@ -9,6 +9,7 @@ Commit rules for beads work:
 - One leaf bead per commit (subject ends with exactly one `(<id>)`; do not bundle sibling leaves).
 - Close the bead before committing so `.beads/issues.jsonl` claim/close updates ship in the same commit as the implementation — never a follow-up beads-only `Close …` commit.
 - Never `br close` a bead unless the next step is committing that close with the implementation in the same revision. If you cannot commit yet (including when the user has not asked to commit), leave the bead `in_progress`.
+- Never reclaim or otherwise mutate a **closed** bead from a prior change (claim only the current open bead; see claim hygiene in `docs/agents/issue-tracker.md`).
 
 ### Triage labels
 

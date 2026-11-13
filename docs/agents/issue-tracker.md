@@ -26,6 +26,13 @@ Then inspect it:
 br show <id>
 ```
 
+Claim hygiene (agents):
+
+- Claim **only** the bead for the work you are about to do — the id just printed by `br create`, or an open id from `br ready` / the user.
+- **Never** `br update --claim` (or otherwise mutate) a bead from a prior finished change. Closed beads stay closed; reclaiming them rewrites `.beads/issues.jsonl` into the *next* change.
+- Before claiming, if unsure, `br show <id>` and confirm status is not `closed`.
+- Do not copy a previous `br update <old-id> --claim` from shell history when starting a new bead.
+
 ## Creating work
 
 ```bash
