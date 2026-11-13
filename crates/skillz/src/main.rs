@@ -248,16 +248,43 @@ enum LibcommitKind {
 
 #[derive(Debug, Subcommand)]
 enum LibraryCommands {
-    /// Create a Library skeleton and register it
+    /// Create or adopt a Library skeleton and register it
+    #[command(after_help = "\
+Examples:
+  # New empty Library (skeleton + machine registry entry)
+  skillz library init ~/code/personal-skills --name personal
+
+  # Adopt an existing skills/*/SKILL.md layout (no filesystem moves)
+  skillz library init ~/code/team-skills --name team
+
+  # Root-level */SKILL.md dirs must be relocated under skills/ explicitly
+  skillz library init ~/code/old-layout --name personal --move
+
+  # Path already has library.toml → use register instead
+  skillz library register ~/code/acme-skills --name company --read-only
+")]
     Init {
         /// Directory for the new Library
         path: PathBuf,
         /// Registry name for this Library
         #[arg(long)]
         name: String,
+        /// Relocate root-level skill directories into `skills/`
+        #[arg(long)]
+        r#move: bool,
     },
-    /// Register an existing Library checkout
-    #[command(visible_alias = "add")]
+    /// Register an existing Library checkout (requires library.toml)
+    #[command(after_help = "\
+Examples:
+  # Clone/checkout already has library.toml — only update this machine's registry
+  skillz library register ~/code/acme-skills --name company
+
+  # Bind a company Library without write expectations
+  skillz library register ~/code/acme-skills --name company --read-only
+
+  # Create a new Library (skeleton) instead of registering:
+  skillz library init ~/code/personal-skills --name personal
+")]
     Register {
         /// Path to an existing Library repo
         path: PathBuf,
@@ -952,9 +979,19 @@ fn run() -> skillz_core::Result<()> {
             resolve_missing_deps(&app, &names, library.as_deref(), deps_policy, None)?;
             Ok(())
         }
-        Some(Commands::Library { command }) => match command {
-            LibraryCommands::Init { path, name } => {
-                let entry = app.library_init(&path, &name)?;
+        Some(Commands::Library { command }) => {
+            if cli.user {
+                return Err(skillz_core::SkillzError::Message(
+                    "`skillz library …` is machine-global (registry + Library checkouts); omit `--user` (use `skillz user …` for the user-global skills scope)".into(),
+                ));
+            }
+            match command {
+            LibraryCommands::Init {
+                path,
+                name,
+                r#move,
+            } => {
+                let entry = app.library_init(&path, &name, r#move)?;
                 println!(
                     "initialized library `{}` at {}",
                     entry.name,
@@ -1091,7 +1128,8 @@ fn run() -> skillz_core::Result<()> {
                 );
                 Ok(())
             }
-        },
+            }
+        }
         Some(Commands::Project { command }) => match command {
             ProjectCommands::Init { bind, skills_dir } => {
                 let skills = if skills_dir == ".agents/skills" {

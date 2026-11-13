@@ -1850,15 +1850,25 @@ impl App {
         Ok(())
     }
 
-    /// Create a Library skeleton and register it.
-    pub fn library_init(&self, path: &Path, name: &str) -> Result<LibraryListEntry> {
+    /// Create or adopt a Library skeleton and register it.
+    ///
+    /// When skill directories sit at the Library root (`*/SKILL.md`), pass
+    /// `move_root_skills` to relocate them under `skills/`.
+    pub fn library_init(
+        &self,
+        path: &Path,
+        name: &str,
+        move_root_skills: bool,
+    ) -> Result<LibraryListEntry> {
         validate_library_name(name)?;
         let abs = resolve_path_against_cwd(&self.paths.cwd, path)?;
-        init_library_skeleton(&abs, name)?;
+        init_library_skeleton(&abs, move_root_skills)?;
         self.register_library(name, &abs, false)
     }
 
     /// Register an existing Library checkout (optionally read-only).
+    ///
+    /// Requires an existing `library.toml`; does not invent Library metadata.
     pub fn library_register(
         &self,
         path: &Path,
@@ -1873,7 +1883,7 @@ impl App {
                 abs.display()
             )));
         }
-        ensure_library_meta(&abs, name)?;
+        ensure_library_meta(&abs)?;
         self.register_library(name, &abs, read_only)
     }
 
@@ -2282,7 +2292,7 @@ mod tests {
     fn project_init_writes_config_lock_and_registry() {
         let fx = Fixture::new();
         let lib = fx.libs_dir.join("personal");
-        fx.app().library_init(&lib, "personal").unwrap();
+        fx.app().library_init(&lib, "personal", false).unwrap();
 
         let config = fx
             .app()
@@ -2314,7 +2324,7 @@ mod tests {
     fn project_init_honors_skills_dir_and_ro_bind() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("company"), "company")
+            .library_init(&fx.libs_dir.join("company"), "company", false)
             .unwrap();
         let config = fx
             .app()
@@ -2338,7 +2348,7 @@ mod tests {
     fn new_then_libcommit_authored_clears_drift() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2377,7 +2387,7 @@ mod tests {
     fn libcommit_and_tag_merge_owned_and_upstream_tags() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2455,7 +2465,7 @@ mod tests {
     fn unlocked_suggests_catalog_match_and_libcommit_without_lock() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2508,7 +2518,7 @@ mod tests {
     fn libcommit_rejects_read_only_library() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("company"), "company")
+            .library_init(&fx.libs_dir.join("company"), "company", false)
             .unwrap();
         // Mark registry record read-only via add path: re-register after init is blocked,
         // so mutate registry directly.
@@ -2541,7 +2551,7 @@ mod tests {
     fn remove_skill_deletes_installation_and_lock_keeps_library() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2571,7 +2581,7 @@ mod tests {
     fn reverse_deps_for_remove_skips_also_removing() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2625,7 +2635,7 @@ mod tests {
     fn interactive_add_uses_prompter_without_ratatui() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2676,7 +2686,7 @@ mod tests {
     fn project_import_skillfile_and_adopt_local() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2727,7 +2737,7 @@ mod tests {
     fn user_scope_init_list_add_and_libcommit() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         // Seed Library Catalog Entry via a temporary project.
         fx.app()
@@ -2760,8 +2770,8 @@ mod tests {
         let fx = Fixture::new();
         let company = fx.libs_dir.join("company");
         let personal = fx.libs_dir.join("personal");
-        fx.app().library_init(&company, "company").unwrap();
-        fx.app().library_init(&personal, "personal").unwrap();
+        fx.app().library_init(&company, "company", false).unwrap();
+        fx.app().library_init(&personal, "personal", false).unwrap();
         vcs_ops::init_git_repo(&personal).unwrap();
         std::process::Command::new("git")
             .args(["-C", personal.to_str().unwrap(), "add", "."])
@@ -2812,7 +2822,7 @@ mod tests {
     fn edit_libcommit_branch_promote_lock_main() {
         let fx = Fixture::new();
         let lib = fx.libs_dir.join("personal");
-        fx.app().library_init(&lib, "personal").unwrap();
+        fx.app().library_init(&lib, "personal", false).unwrap();
         vcs_ops::init_git_repo(&lib).unwrap();
         // library.toml + skills need to be on main before branching.
         std::process::Command::new("git")
@@ -2879,7 +2889,7 @@ mod tests {
     fn drift_check_and_hooks_install() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2902,7 +2912,7 @@ mod tests {
     fn drift_current_stays_local_global_sees_other_projects() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2936,7 +2946,7 @@ mod tests {
     fn hooks_install_jj_push_with_checks_alias() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2958,7 +2968,7 @@ mod tests {
     fn hooks_show_vcs_exclusive_dry_run() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -2991,7 +3001,7 @@ mod tests {
     fn fetch_local_nested_then_libcommit_upstream() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -3086,7 +3096,7 @@ exit 1
         let tool_s = tool.display().to_string();
 
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -3149,7 +3159,7 @@ exit 1
     fn cmd_upstream_libcommit_rejects_missing_tool() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -3176,7 +3186,7 @@ exit 1
     fn list_and_add_from_library_with_tags_and_second_project() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         fx.app()
             .project_init(&["personal".into()], None)
@@ -3251,7 +3261,7 @@ exit 1
         let lib_path = fx.libs_dir.join("personal");
         let entry = fx
             .app()
-            .library_init(&lib_path, "personal")
+            .library_init(&lib_path, "personal", false)
             .expect("init");
 
         assert_eq!(entry.name, "personal");
@@ -3260,7 +3270,10 @@ exit 1
         assert!(!entry.read_only);
 
         let meta = LibraryMeta::load(&lib_path).unwrap();
-        assert_eq!(meta.name, "personal");
+        assert_eq!(meta.version, 1);
+        let toml_text = fs::read_to_string(lib_path.join("library.toml")).unwrap();
+        assert!(toml_text.contains("version = 1"));
+        assert!(!toml_text.contains("name"));
 
         let listed = fx.app().library_list().unwrap();
         assert_eq!(listed.len(), 1);
@@ -3278,12 +3291,7 @@ exit 1
         let lib_path = fx.libs_dir.join("company");
         fs::create_dir_all(lib_path.join("skills")).unwrap();
         fs::create_dir_all(lib_path.join(".git")).unwrap();
-        LibraryMeta {
-            name: "company".into(),
-            upstream: Vec::new(),
-        }
-        .save(&lib_path)
-        .unwrap();
+        LibraryMeta::new().save(&lib_path).unwrap();
 
         let entry = fx
             .app()
@@ -3301,8 +3309,9 @@ exit 1
     fn library_register_infers_jj() {
         let fx = Fixture::new();
         let lib_path = fx.libs_dir.join("jj-lib");
-        fs::create_dir_all(&lib_path).unwrap();
+        fs::create_dir_all(lib_path.join("skills")).unwrap();
         fs::create_dir_all(lib_path.join(".jj")).unwrap();
+        LibraryMeta::new().save(&lib_path).unwrap();
 
         let entry = fx
             .app()
@@ -3310,14 +3319,65 @@ exit 1
             .unwrap();
         assert_eq!(entry.vcs, Some(Vcs::Jj));
         assert!(lib_path.join("library.toml").is_file());
-        assert!(lib_path.join("skills").is_dir());
+    }
+
+    #[test]
+    fn library_register_requires_library_toml() {
+        let fx = Fixture::new();
+        let lib_path = fx.libs_dir.join("bare");
+        fs::create_dir_all(lib_path.join("skills")).unwrap();
+        let err = fx
+            .app()
+            .library_register(&lib_path, "bare", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("no library.toml"));
+    }
+
+    #[test]
+    fn library_init_adopts_skills_and_moves_root_skills() {
+        let fx = Fixture::new();
+        let adopt = fx.libs_dir.join("adopt");
+        let skill = adopt.join("skills/demo");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        fx.app()
+            .library_init(&adopt, "adopt", false)
+            .expect("adopt skills/");
+        assert!(skill.join("SKILL.md").is_file());
+
+        let rooted = fx.libs_dir.join("rooted");
+        let root_skill = rooted.join("demo");
+        fs::create_dir_all(&root_skill).unwrap();
+        fs::write(root_skill.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        let err = fx
+            .app()
+            .library_init(&rooted, "rooted", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("--move"));
+        fx.app()
+            .library_init(&rooted, "rooted", true)
+            .expect("move root skills");
+        assert!(rooted.join("skills/demo/SKILL.md").is_file());
+        assert!(!root_skill.exists());
+    }
+
+    #[test]
+    fn library_init_refuses_existing_library_toml() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal", false).unwrap();
+        let err = fx
+            .app()
+            .library_init(&lib, "other", false)
+            .unwrap_err();
+        assert!(err.to_string().contains("library register"));
     }
 
     #[test]
     fn resolve_library_name_defaults_to_cwd_library() {
         let fx = Fixture::new();
         let lib = fx.libs_dir.join("personal");
-        fx.app().library_init(&lib, "personal").unwrap();
+        fx.app().library_init(&lib, "personal", false).unwrap();
         let nested = lib.join("skills");
         let name = fx
             .app_at(&nested)
@@ -3332,17 +3392,14 @@ exit 1
     fn list_skills_from_library_cwd_without_project() {
         let fx = Fixture::new();
         let lib = fx.libs_dir.join("personal");
-        fx.app().library_init(&lib, "personal").unwrap();
-        LibraryMeta {
-            name: "personal".into(),
-            upstream: vec![crate::library::UpstreamEntry {
-                name: "demo".into(),
-                source: "github:owner/repo/demo@abc".into(),
-                tags: vec!["tools".into()],
-            }],
-        }
-        .save(&lib)
-        .unwrap();
+        fx.app().library_init(&lib, "personal", false).unwrap();
+        let mut meta = LibraryMeta::new();
+        meta.upstream = vec![crate::library::UpstreamEntry {
+            name: "demo".into(),
+            source: "github:owner/repo/demo@abc".into(),
+            tags: vec!["tools".into()],
+        }];
+        meta.save(&lib).unwrap();
 
         let rows = fx
             .app_at(&lib)
@@ -3356,11 +3413,11 @@ exit 1
     fn library_init_rejects_duplicate_name() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("a"), "personal")
+            .library_init(&fx.libs_dir.join("a"), "personal", false)
             .unwrap();
         let err = fx
             .app()
-            .library_init(&fx.libs_dir.join("b"), "personal")
+            .library_init(&fx.libs_dir.join("b"), "personal", false)
             .unwrap_err();
         assert!(err.to_string().contains("already registered"));
     }
@@ -3432,7 +3489,7 @@ exit 1
     fn library_import_discovers_upserts_dry_run_path_and_collision() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         let rev = seed_github_cache(&fx, "mattpocock", "skills");
 
@@ -3550,7 +3607,7 @@ exit 1
     fn library_import_name_override_avoids_collision() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         let rev = seed_github_cache(&fx, "mattpocock", "skills");
 
@@ -3613,7 +3670,7 @@ exit 1
     fn library_import_does_not_require_managed_project() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         let _ = seed_github_cache(&fx, "acme", "skills");
         // cwd project is unmanaged — import still works.
@@ -3629,7 +3686,7 @@ exit 1
     fn interactive_library_import_selects_subset_and_cancel() {
         let fx = Fixture::new();
         fx.app()
-            .library_init(&fx.libs_dir.join("personal"), "personal")
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
             .unwrap();
         let _ = seed_github_cache(&fx, "mattpocock", "skills");
 
