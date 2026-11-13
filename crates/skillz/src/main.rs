@@ -177,6 +177,12 @@ Examples:
   # Replaces `skillz project import` for unmanaged → managed
 ")]
     Migrate {
+        /// Optional single skill for `migrate NAME --source`
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Set Local + source provenance for NAME
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
         /// Print the plan only; write nothing
         #[arg(long)]
         dry_run: bool,
@@ -186,6 +192,9 @@ Examples:
         /// Do not read Skillfile signals
         #[arg(long)]
         ignore_skillfile: bool,
+        /// Fail-closed: abort with no writes if any skill needs a prompt
+        #[arg(long)]
+        no_prompt: bool,
     },
     /// List skills in this Project (default) or the bound Library Catalog
     List {
@@ -644,6 +653,53 @@ fn reject_nonsensical_user_flag(subcommand: &str, hint: &str) -> skillz_core::Re
     )))
 }
 
+fn resolve_migrate_prompt_stdin(
+    row: &skillz_core::MigrateSkillPlan,
+) -> skillz_core::Result<skillz_core::MigratePromptAnswer> {
+    use std::io::{self, Write};
+    eprintln!(
+        "migrate prompt `{}` [{}]: {}",
+        row.name,
+        row.matrix,
+        row.recommended.label()
+    );
+    if row.alternatives.is_empty() {
+        return Err(skillz_core::SkillzError::Message(format!(
+            "no alternatives for indeterminate skill `{}`",
+            row.name
+        )));
+    }
+    for (i, alt) in row.alternatives.iter().enumerate() {
+        eprintln!("  {}. {}", i + 1, alt.label());
+    }
+    eprint!("  choose 1-{} / aN=all remaining / q=cancel > ", row.alternatives.len());
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| skillz_core::SkillzError::Message(format!("failed to read stdin: {e}")))?;
+    let line = line.trim().to_ascii_lowercase();
+    if line == "q" || line == "cancel" {
+        return Ok(skillz_core::MigratePromptAnswer::Cancel);
+    }
+    let (all, num) = if let Some(rest) = line.strip_prefix('a') {
+        (true, rest)
+    } else {
+        (false, line.as_str())
+    };
+    let idx: usize = num.parse().map_err(|_| {
+        skillz_core::SkillzError::Message(format!("invalid migrate choice `{line}`"))
+    })?;
+    let action = row.alternatives.get(idx.wrapping_sub(1)).ok_or_else(|| {
+        skillz_core::SkillzError::Message(format!("migrate choice `{idx}` out of range"))
+    })?;
+    Ok(if all {
+        skillz_core::MigratePromptAnswer::AllRemaining(action.clone())
+    } else {
+        skillz_core::MigratePromptAnswer::This(action.clone())
+    })
+}
+
 fn resolve_import_conflict_stdin(
     item: &LibraryImportItem,
 ) -> skillz_core::Result<LibraryImportConflictResolution> {
@@ -1022,10 +1078,31 @@ fn run() -> skillz_core::Result<()> {
             }
         }
         Some(Commands::Migrate {
+            name,
+            source,
             dry_run,
             authored,
             ignore_skillfile,
+            no_prompt,
         }) => {
+            if let Some(source) = source {
+                let Some(name) = name else {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`migrate --source` requires exactly one NAME".into(),
+                    ));
+                };
+                let lock = app.migrate_set_source(&name, &source)?;
+                println!(
+                    "set Local + source for `{name}` ({})",
+                    lock.source.as_deref().unwrap_or("-")
+                );
+                return Ok(());
+            }
+            if name.is_some() {
+                return Err(skillz_core::SkillzError::Message(
+                    "`migrate NAME` currently requires `--source` (full single-skill migrate comes later)".into(),
+                ));
+            }
             let opts = MigrateOptions {
                 ignore_skillfile,
                 authored,
@@ -1039,10 +1116,7 @@ fn run() -> skillz_core::Result<()> {
                 return Ok(());
             }
             for row in &plan.rows {
-                let sf = row
-                    .skillfile_source
-                    .as_deref()
-                    .unwrap_or("-");
+                let sf = row.skillfile_source.as_deref().unwrap_or("-");
                 println!(
                     "{}\t{}\t{}\t{}",
                     row.name,
@@ -1059,7 +1133,20 @@ fn run() -> skillz_core::Result<()> {
                 );
                 return Ok(());
             }
-            let applied = app.migrate_apply(&plan, false)?;
+            let mut resolver =
+                |row: &skillz_core::MigrateSkillPlan| resolve_migrate_prompt_stdin(row);
+            let resolve = if no_prompt {
+                None
+            } else {
+                Some(
+                    &mut resolver
+                        as &mut dyn FnMut(
+                            &skillz_core::MigrateSkillPlan,
+                        )
+                            -> skillz_core::Result<skillz_core::MigratePromptAnswer>,
+                )
+            };
+            let applied = app.migrate_apply(&plan, false, no_prompt, resolve)?;
             for (name, msg) in applied {
                 println!("{name}: {msg}");
             }

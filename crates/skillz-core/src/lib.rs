@@ -24,7 +24,8 @@ pub mod vcs_ops;
 
 pub use import::{AdoptAs, ImportPlan, SkillfileEntry};
 pub use migrate::{
-    CatalogMatch, MgmtState, MigrateAction, MigrateOptions, MigratePlan, MigrateSkillPlan,
+    CatalogMatch, MgmtState, MigrateAction, MigrateOptions, MigratePlan, MigratePromptAnswer,
+    MigrateSituationClass, MigrateSkillPlan,
 };
 pub use ui::{
     CancelPrompter, Prompter, SelectAllPrompter, SelectFirstNPrompter, SelectItem,
@@ -909,7 +910,6 @@ impl App {
             }
         }
 
-        // Catalog rows by name (non-deduped) for ambiguity detection.
         let catalog_rows = self.list_skills(None, &[], false, false)?;
         let mut by_name: std::collections::BTreeMap<String, Vec<&ListRow>> =
             std::collections::BTreeMap::new();
@@ -959,33 +959,8 @@ impl App {
                 Some(_) => CatalogMatch::Ambiguous,
             };
 
-            let (matrix, recommended) = match (&mgmt, &catalog, &skillfile_source) {
-                (MgmtState::LibraryLocked { clean: true }, _, _) => {
-                    ("B1", MigrateAction::NoOp)
-                }
-                (
-                    MgmtState::Unmanaged,
-                    CatalogMatch::Single {
-                        library,
-                        kind: EntryKind::Owned,
-                        exact_match: Some(true),
-                    },
-                    _,
-                ) => (
-                    if skillfile_source.is_some() {
-                        "A6"
-                    } else {
-                        "A3"
-                    },
-                    MigrateAction::AttachIdentical {
-                        library: library.clone(),
-                    },
-                ),
-                (MgmtState::Unmanaged, CatalogMatch::None, None) if opts.authored => {
-                    ("A1", MigrateAction::SetLocalAuthored)
-                }
-                _ => ("?", MigrateAction::NeedsPrompt),
-            };
+            let (matrix, situation, recommended, alternatives) =
+                Self::classify_migrate_row(opts, &mgmt, &catalog, skillfile_source.as_deref());
 
             rows.push(MigrateSkillPlan {
                 name,
@@ -994,6 +969,8 @@ impl App {
                 skillfile_source,
                 catalog,
                 recommended,
+                situation,
+                alternatives,
             });
         }
 
@@ -1005,38 +982,388 @@ impl App {
         })
     }
 
-    /// Apply safe migrate actions (A1, A3/A6, B1). Skips NeedsPrompt rows.
-    pub fn migrate_apply(&self, plan: &MigratePlan, dry_run: bool) -> Result<Vec<(String, String)>> {
+    fn classify_migrate_row(
+        opts: &MigrateOptions,
+        mgmt: &MgmtState,
+        catalog: &CatalogMatch,
+        skillfile_source: Option<&str>,
+    ) -> (
+        &'static str,
+        MigrateSituationClass,
+        MigrateAction,
+        Vec<MigrateAction>,
+    ) {
+        match (mgmt, catalog, skillfile_source) {
+            (MgmtState::LibraryLocked { clean: true }, _, _) => {
+                ("B1", MigrateSituationClass::Other, MigrateAction::NoOp, vec![])
+            }
+            (MgmtState::LibraryLocked { clean: false }, _, _) => (
+                "B2",
+                MigrateSituationClass::Other,
+                MigrateAction::NeedsPrompt,
+                vec![],
+            ),
+            (
+                MgmtState::Unmanaged,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Owned,
+                    exact_match: Some(true),
+                },
+                _,
+            ) => (
+                if skillfile_source.is_some() { "A6" } else { "A3" },
+                MigrateSituationClass::Other,
+                MigrateAction::AttachIdentical {
+                    library: library.clone(),
+                },
+                vec![],
+            ),
+            (
+                MgmtState::Unmanaged,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Owned,
+                    exact_match: Some(false),
+                },
+                None,
+            ) => (
+                "A4",
+                MigrateSituationClass::A4OwnedDiffers,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::UseLibraryFiles {
+                        library: library.clone(),
+                    },
+                    MigrateAction::PublishToLibrary {
+                        library: library.clone(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            (
+                MgmtState::Unmanaged,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Owned,
+                    exact_match: Some(false),
+                },
+                Some(src),
+            ) => (
+                "A7",
+                MigrateSituationClass::A7OwnedDiffersWithSkillfile,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::UseLibraryFiles {
+                        library: library.clone(),
+                    },
+                    MigrateAction::PublishToLibrary {
+                        library: library.clone(),
+                    },
+                    MigrateAction::SetLocalSource {
+                        source: src.to_string(),
+                    },
+                ],
+            ),
+            (
+                MgmtState::Unmanaged,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Upstream,
+                    ..
+                },
+                None,
+            ) => (
+                "A5",
+                MigrateSituationClass::A5UpstreamUncompared,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::AttachUpstream {
+                        library: library.clone(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            (
+                MgmtState::Unmanaged,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Upstream,
+                    ..
+                },
+                Some(src),
+            ) => {
+                // A8/A9: identity match vs mismatch (best-effort via source prefix).
+                let cat_src = None::<String>; // identity compared at apply time when attaching
+                let _ = cat_src;
+                (
+                    "A8",
+                    MigrateSituationClass::Other,
+                    MigrateAction::AttachUpstream {
+                        library: library.clone(),
+                    },
+                    vec![MigrateAction::SetLocalSource {
+                        source: src.to_string(),
+                    }],
+                )
+            }
+            (MgmtState::Unmanaged, CatalogMatch::Ambiguous, _) => (
+                "A10",
+                MigrateSituationClass::A10Ambiguous,
+                MigrateAction::NeedsPrompt,
+                vec![],
+            ),
+            (MgmtState::Unmanaged, CatalogMatch::None, Some(src)) => (
+                "A2",
+                MigrateSituationClass::A2SkillfileOnly,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::SetLocalSource {
+                        source: src.to_string(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            (MgmtState::Unmanaged, CatalogMatch::None, None) if opts.authored => (
+                "A1",
+                MigrateSituationClass::A1NoSignals,
+                MigrateAction::SetLocalAuthored,
+                vec![],
+            ),
+            (MgmtState::Unmanaged, CatalogMatch::None, None) => (
+                "A1",
+                MigrateSituationClass::A1NoSignals,
+                MigrateAction::NeedsPrompt,
+                vec![MigrateAction::SetLocalAuthored, MigrateAction::KeepLocalAuthored],
+            ),
+            (
+                MgmtState::LocalAuthored,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Owned,
+                    exact_match: Some(true),
+                },
+                _,
+            ) => (
+                "B3",
+                MigrateSituationClass::B3LocalToOwnedIdentical,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::AttachIdentical {
+                        library: library.clone(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            (
+                MgmtState::LocalAuthored,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Owned,
+                    exact_match: Some(false),
+                },
+                _,
+            ) => (
+                "B4",
+                MigrateSituationClass::B4LocalOwnedDiffers,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::UseLibraryFiles {
+                        library: library.clone(),
+                    },
+                    MigrateAction::PublishToLibrary {
+                        library: library.clone(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            (MgmtState::LocalAuthored, _, Some(src)) => (
+                "B5",
+                MigrateSituationClass::B5LocalToSource,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::SetLocalSource {
+                        source: src.to_string(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            (MgmtState::LocalAuthored | MgmtState::LocalSource, CatalogMatch::None, None) => (
+                "B8",
+                MigrateSituationClass::Other,
+                MigrateAction::NoOp,
+                vec![],
+            ),
+            (
+                MgmtState::LocalSource,
+                CatalogMatch::Single {
+                    library,
+                    kind: EntryKind::Upstream,
+                    ..
+                },
+                _,
+            ) => (
+                "B6",
+                MigrateSituationClass::Other,
+                MigrateAction::NeedsPrompt,
+                vec![
+                    MigrateAction::AttachUpstream {
+                        library: library.clone(),
+                    },
+                    MigrateAction::KeepLocalAuthored,
+                ],
+            ),
+            _ => (
+                "?",
+                MigrateSituationClass::Other,
+                MigrateAction::NeedsPrompt,
+                vec![],
+            ),
+        }
+    }
+
+    /// Apply migrate actions. When `no_prompt` is true, any NeedsPrompt aborts with no writes.
+    /// `resolve` answers indeterminate rows; Cancel enables partial apply.
+    pub fn migrate_apply(
+        &self,
+        plan: &MigratePlan,
+        dry_run: bool,
+        no_prompt: bool,
+        mut resolve: Option<
+            &mut dyn FnMut(&MigrateSkillPlan) -> Result<MigratePromptAnswer>,
+        >,
+    ) -> Result<Vec<(String, String)>> {
         if !dry_run {
             self.ensure_skills_dir_clean()?;
         }
-        let mut out = Vec::new();
-        for row in &plan.rows {
-            match &row.recommended {
-                MigrateAction::NoOp => {
-                    out.push((row.name.clone(), "no-op".into()));
-                }
-                MigrateAction::SetLocalAuthored => {
-                    if !dry_run {
-                        self.set_local_authored(&row.name)?;
-                    }
-                    out.push((row.name.clone(), "set Local authored".into()));
-                }
-                MigrateAction::AttachIdentical { library } => {
-                    if !dry_run {
-                        self.attach_to_catalog(&row.name, library, EntryKind::Owned)?;
-                    }
-                    out.push((
-                        row.name.clone(),
-                        format!("attached to `{library}`"),
-                    ));
-                }
-                MigrateAction::NeedsPrompt => {
-                    out.push((row.name.clone(), "skipped (needs prompt)".into()));
-                }
+        if no_prompt {
+            let unclear: Vec<_> = plan
+                .rows
+                .iter()
+                .filter(|r| !r.recommended.is_determinate())
+                .map(|r| r.name.as_str())
+                .collect();
+            if !unclear.is_empty() {
+                return Err(SkillzError::Message(format!(
+                    "migrate --no-prompt aborted; indeterminate skill(s): {}",
+                    unclear.join(", ")
+                )));
             }
         }
+
+        let mut class_answers: std::collections::HashMap<
+            MigrateSituationClass,
+            MigrateAction,
+        > = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for row in &plan.rows {
+            let action = if row.recommended.is_determinate() {
+                row.recommended.clone()
+            } else if let Some(ans) = class_answers.get(&row.situation) {
+                ans.clone()
+            } else if dry_run {
+                MigrateAction::NeedsPrompt
+            } else {
+                let resolver = resolve.as_mut().ok_or_else(|| {
+                    SkillzError::Message(
+                        "migrate has indeterminate skills; pass a prompt resolver, --dry-run, or --no-prompt".into(),
+                    )
+                })?;
+                match resolver(row)? {
+                    MigratePromptAnswer::This(action) => action,
+                    MigratePromptAnswer::AllRemaining(action) => {
+                        class_answers.insert(row.situation, action.clone());
+                        action
+                    }
+                    MigratePromptAnswer::Cancel => {
+                        out.push((row.name.clone(), "cancelled (partial apply)".into()));
+                        break;
+                    }
+                }
+            };
+
+            if matches!(action, MigrateAction::NeedsPrompt) {
+                out.push((row.name.clone(), "needs prompt".into()));
+                continue;
+            }
+            if !dry_run {
+                self.apply_migrate_action(&row.name, &action)?;
+            }
+            out.push((row.name.clone(), action.label()));
+        }
         Ok(out)
+    }
+
+    fn apply_migrate_action(&self, name: &str, action: &MigrateAction) -> Result<()> {
+        match action {
+            MigrateAction::NoOp | MigrateAction::KeepLocalAuthored => {
+                if matches!(action, MigrateAction::KeepLocalAuthored) {
+                    let _ = self.set_local_authored(name)?;
+                }
+                Ok(())
+            }
+            MigrateAction::SetLocalAuthored => {
+                self.set_local_authored(name)?;
+                Ok(())
+            }
+            MigrateAction::SetLocalSource { source } => {
+                self.set_local_source(name, source)?;
+                Ok(())
+            }
+            MigrateAction::AttachIdentical { library }
+            | MigrateAction::AttachUpstream { library } => {
+                let kind = if matches!(action, MigrateAction::AttachUpstream { .. }) {
+                    EntryKind::Upstream
+                } else {
+                    EntryKind::Owned
+                };
+                self.attach_to_catalog(name, library, kind)?;
+                Ok(())
+            }
+            MigrateAction::UseLibraryFiles { library } => {
+                let rows = self.list_skills(Some(library), &[], true, false)?;
+                let entry = rows
+                    .into_iter()
+                    .find(|r| r.entry.name == *name)
+                    .ok_or_else(|| {
+                        SkillzError::Message(format!(
+                            "Catalog Entry `{name}` missing from library `{library}`"
+                        ))
+                    })?;
+                if entry.entry.kind != EntryKind::Owned {
+                    return Err(SkillzError::Message(format!(
+                        "cannot overwrite from non-Owned Catalog Entry `{name}` in `{library}`"
+                    )));
+                }
+                let config = self.load_scope_config()?;
+                let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
+                skill::copy_skill_tree(&entry.entry.skill_path, &dest)?;
+                self.attach_to_catalog(name, library, EntryKind::Owned)?;
+                Ok(())
+            }
+            MigrateAction::PublishToLibrary { library } => {
+                self.libcommit_authored(name, library, &[])?;
+                Ok(())
+            }
+            MigrateAction::NeedsPrompt => Err(SkillzError::Message(
+                "internal: cannot apply NeedsPrompt".into(),
+            )),
+        }
+    }
+
+    /// `migrate NAME --source`: Local+source for unmanaged / Local authored / update Local+source.
+    pub fn migrate_set_source(&self, name: &str, source: &str) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
+        let lock = self.load_scope_lock()?;
+        if let Some(rec) = lock.installations.get(name) {
+            if rec.entry_kind != EntryKind::Local {
+                return Err(SkillzError::Message(format!(
+                    "refuse `migrate {name} --source`: skill is Library-backed (`{}`); detach is not supported in this slice",
+                    rec.library
+                )));
+            }
+        }
+        self.set_local_source(name, source)
     }
 
     /// Detect Drift for skills present under skills_dir vs the Lock (current scope).
@@ -2934,11 +3261,16 @@ mod tests {
             MigrateAction::AttachIdentical { .. }
         ));
 
-        let dry = fx.app().migrate_apply(&plan, true).unwrap();
+        let dry = fx
+            .app()
+            .migrate_apply(&plan, true, false, None)
+            .unwrap();
         assert!(dry.iter().any(|(n, m)| n == "local-a1" && m.contains("Local")));
         assert!(fx.app().detect_drift().unwrap().iter().any(|d| d.name == "local-a1"));
 
-        fx.app().migrate_apply(&plan, false).unwrap();
+        fx.app()
+            .migrate_apply(&plan, false, false, None)
+            .unwrap();
         assert!(fx
             .app()
             .detect_drift()
@@ -2957,6 +3289,139 @@ mod tests {
         let b1 = again.rows.iter().find(|r| r.name == "owned-skill").unwrap();
         assert_eq!(b1.matrix, "B1");
         assert!(matches!(b1.recommended, MigrateAction::NoOp));
+    }
+
+    #[test]
+    fn migrate_no_prompt_aborts_indeterminate_without_writes() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("ambiguous", &[]).unwrap();
+        let before = fs::read_to_string(fx.project_dir.join(".skillz/skillz.lock")).unwrap();
+        let plan = fx
+            .app()
+            .migrate_plan(&MigrateOptions::default())
+            .unwrap();
+        assert!(plan
+            .rows
+            .iter()
+            .any(|r| matches!(r.recommended, MigrateAction::NeedsPrompt)));
+        let err = fx
+            .app()
+            .migrate_apply(&plan, false, true, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("--no-prompt"));
+        assert_eq!(
+            before,
+            fs::read_to_string(fx.project_dir.join(".skillz/skillz.lock")).unwrap()
+        );
+    }
+
+    #[test]
+    fn migrate_prompt_all_remaining_and_cancel_partial() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("one", &[]).unwrap();
+        fx.app().skill_new("two", &[]).unwrap();
+        fx.app().skill_new("three", &[]).unwrap();
+        let plan = fx
+            .app()
+            .migrate_plan(&MigrateOptions {
+                authored: false,
+                ignore_skillfile: true,
+            })
+            .unwrap();
+        let mut answers = vec![
+            MigratePromptAnswer::AllRemaining(MigrateAction::SetLocalAuthored),
+        ];
+        let mut resolver = |row: &MigrateSkillPlan| {
+            assert_eq!(row.situation, MigrateSituationClass::A1NoSignals);
+            Ok(answers.remove(0))
+        };
+        let out = fx
+            .app()
+            .migrate_apply(&plan, false, false, Some(&mut resolver))
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+
+        // Cancel after first apply → partial.
+        fx.app().skill_new("four", &[]).unwrap();
+        fx.app().skill_new("five", &[]).unwrap();
+        let plan2 = fx
+            .app()
+            .migrate_plan(&MigrateOptions {
+                authored: false,
+                ignore_skillfile: true,
+            })
+            .unwrap();
+        let pending: Vec<_> = plan2
+            .rows
+            .iter()
+            .filter(|r| matches!(r.recommended, MigrateAction::NeedsPrompt))
+            .map(|r| r.name.clone())
+            .collect();
+        assert!(pending.len() >= 2);
+        let mut answers2 = vec![
+            MigratePromptAnswer::This(MigrateAction::SetLocalAuthored),
+            MigratePromptAnswer::Cancel,
+        ];
+        let mut resolver2 = |_row: &MigrateSkillPlan| Ok(answers2.remove(0));
+        let out2 = fx
+            .app()
+            .migrate_apply(&plan2, false, false, Some(&mut resolver2))
+            .unwrap();
+        assert!(out2.iter().any(|(_, m)| m.contains("Local authored")));
+        assert!(out2.iter().any(|(_, m)| m.contains("cancelled")));
+        assert!(fx
+            .app()
+            .detect_drift()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "five" || d.name == "four"));
+    }
+
+    #[test]
+    fn migrate_set_source_c1_c2_c4() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("src-skill", &[]).unwrap();
+        let lock = fx
+            .app()
+            .migrate_set_source("src-skill", "github:owner/repo/src-skill@abc")
+            .unwrap();
+        assert_eq!(lock.entry_kind, EntryKind::Local);
+        assert!(lock.source.as_ref().unwrap().contains("@abc"));
+
+        fx.app().set_local_authored("src-skill").unwrap();
+        let lock = fx
+            .app()
+            .migrate_set_source("src-skill", "github:owner/repo/src-skill@def")
+            .unwrap();
+        assert_eq!(lock.rev.as_deref(), Some("def"));
+
+        fx.app()
+            .libcommit_authored("src-skill", "personal", &[])
+            .unwrap();
+        let err = fx
+            .app()
+            .migrate_set_source("src-skill", "github:owner/repo/src-skill@ghi")
+            .unwrap_err();
+        assert!(err.to_string().contains("Library-backed"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Migrate planner: unmanaged → managed recommendations (MVP safe applies).
+//! Migrate planner: unmanaged → managed recommendations.
 
 use std::path::PathBuf;
 
@@ -33,17 +33,35 @@ pub enum CatalogMatch {
     Ambiguous,
 }
 
-/// Recommended migrate action (MVP subset).
+/// Recommended / chosen migrate action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateAction {
-    /// A1 — Local authored membership.
     SetLocalAuthored,
-    /// A3/A6 — attach identical Owned (Lock only; keep files).
+    SetLocalSource { source: String },
     AttachIdentical { library: String },
-    /// B1 — already Library-locked and clean.
+    AttachUpstream { library: String },
+    UseLibraryFiles { library: String },
+    PublishToLibrary { library: String },
+    KeepLocalAuthored,
     NoOp,
-    /// Deferred to prompt / later beads.
+    /// Indeterminate — requires prompt (or `--no-prompt` abort).
     NeedsPrompt,
+}
+
+/// Situation class for “all remaining” prompt answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MigrateSituationClass {
+    A1NoSignals,
+    A2SkillfileOnly,
+    A4OwnedDiffers,
+    A5UpstreamUncompared,
+    A7OwnedDiffersWithSkillfile,
+    A9UpstreamIdentityMismatch,
+    A10Ambiguous,
+    B3LocalToOwnedIdentical,
+    B4LocalOwnedDiffers,
+    B5LocalToSource,
+    Other,
 }
 
 /// One planned skill row.
@@ -55,6 +73,9 @@ pub struct MigrateSkillPlan {
     pub skillfile_source: Option<String>,
     pub catalog: CatalogMatch,
     pub recommended: MigrateAction,
+    pub situation: MigrateSituationClass,
+    /// Alternatives when the row needs a prompt.
+    pub alternatives: Vec<MigrateAction>,
 }
 
 /// Full migrate plan for a scope.
@@ -66,13 +87,57 @@ pub struct MigratePlan {
     pub warnings: Vec<String>,
 }
 
+/// How a prompt resolver answers one indeterminate skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigratePromptAnswer {
+    /// Apply this action for this skill only.
+    This(MigrateAction),
+    /// Apply this action for this skill and all remaining in the same situation class.
+    AllRemaining(MigrateAction),
+    /// Stop prompting; keep already-applied skills (partial apply).
+    Cancel,
+}
+
 impl MigrateAction {
     pub fn label(&self) -> String {
         match self {
             Self::SetLocalAuthored => "set Local authored".into(),
-            Self::AttachIdentical { library } => format!("attach identical Owned (`{library}`)"),
+            Self::SetLocalSource { source } => format!("set Local + source (`{source}`)"),
+            Self::AttachIdentical { library } => {
+                format!("attach identical (`{library}`)")
+            }
+            Self::AttachUpstream { library } => format!("attach Upstream (`{library}`)"),
+            Self::UseLibraryFiles { library } => {
+                format!("use Library files (`{library}`)")
+            }
+            Self::PublishToLibrary { library } => {
+                format!("publish local → Library (`{library}`)")
+            }
+            Self::KeepLocalAuthored => "keep Local authored".into(),
             Self::NoOp => "no-op (already managed)".into(),
             Self::NeedsPrompt => "needs prompt".into(),
+        }
+    }
+
+    pub fn is_determinate(&self) -> bool {
+        !matches!(self, Self::NeedsPrompt)
+    }
+}
+
+impl MigrateSituationClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::A1NoSignals => "A1",
+            Self::A2SkillfileOnly => "A2",
+            Self::A4OwnedDiffers => "A4",
+            Self::A5UpstreamUncompared => "A5",
+            Self::A7OwnedDiffersWithSkillfile => "A7",
+            Self::A9UpstreamIdentityMismatch => "A9",
+            Self::A10Ambiguous => "A10",
+            Self::B3LocalToOwnedIdentical => "B3",
+            Self::B4LocalOwnedDiffers => "B4",
+            Self::B5LocalToSource => "B5",
+            Self::Other => "?",
         }
     }
 }
