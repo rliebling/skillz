@@ -230,6 +230,82 @@ fn stdout_jj(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Snapshot the working copy when using jj (`jj status`); no-op for git/none.
+pub fn snapshot_working_copy(repo: &Path) -> Result<()> {
+    match infer_vcs(repo) {
+        Some(Vcs::Jj) => run_jj(repo, &["status"]),
+        Some(Vcs::Git) | None => Ok(()),
+    }
+}
+
+/// Tracked files under `skills_rel` (repo-relative) that differ from HEAD/@-.
+///
+/// Untracked paths are ignored so brand-new skill trees can be migrated.
+pub fn dirty_tracked_under(repo: &Path, skills_rel: &str) -> Result<Vec<String>> {
+    let skills_rel = skills_rel.trim_matches('/');
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => dirty_tracked_git(repo, skills_rel),
+        Some(Vcs::Jj) => {
+            snapshot_working_copy(repo)?;
+            dirty_tracked_jj(repo, skills_rel)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn under_skills_prefix(path: &str, skills_rel: &str) -> bool {
+    path == skills_rel || path.starts_with(&format!("{skills_rel}/"))
+}
+
+fn dirty_tracked_git(repo: &Path, skills_rel: &str) -> Result<Vec<String>> {
+    // `-uno` omits untracked; still shows modified/deleted/staged tracked files.
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(repo)
+        .args(["status", "--porcelain=v1", "-uno", "--", skills_rel])
+        .output()
+        .map_err(|e| SkillzError::Message(format!("git status failed: {e}")))?;
+    if !output.status.success() {
+        return Err(SkillzError::Message(format!(
+            "git status failed in {}",
+            repo.display()
+        )));
+    }
+    let mut dirty = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let path = line[3..].trim();
+        // Rename lines: `R  old -> new`
+        let path = path
+            .rsplit_once(" -> ")
+            .map(|(_, new)| new)
+            .unwrap_or(path);
+        if under_skills_prefix(path, skills_rel) {
+            dirty.push(path.to_string());
+        }
+    }
+    dirty.sort();
+    dirty.dedup();
+    Ok(dirty)
+}
+
+fn dirty_tracked_jj(repo: &Path, skills_rel: &str) -> Result<Vec<String>> {
+    let parent_files = stdout_jj(repo, &["file", "list", "-r", "@-"])?;
+    let tracked: std::collections::BTreeSet<&str> = parent_files.lines().collect();
+    let changed = stdout_jj(repo, &["diff", "--name-only", "--from", "@-"])?;
+    let mut dirty = Vec::new();
+    for path in changed.lines() {
+        if under_skills_prefix(path, skills_rel) && tracked.contains(path) {
+            dirty.push(path.to_string());
+        }
+    }
+    dirty.sort();
+    dirty.dedup();
+    Ok(dirty)
+}
+
 /// Initialize a bare-minimum git repo with an empty main commit (tests).
 pub fn init_git_repo(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).ok();

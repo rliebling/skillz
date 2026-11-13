@@ -8,8 +8,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use skillz_core::{
     default_config_dir, AddOutcome, App, DriftReason, DriftScan, LibraryImportAction,
-    LibraryImportConflictResolution, LibraryImportItem, LibraryImportOnConflict, ListRow, Scope,
-    SkillzPaths,
+    LibraryImportConflictResolution, LibraryImportItem, LibraryImportOnConflict, ListRow,
+    MigrateOptions, Scope, SkillzPaths,
 };
 use tui::RatatuiPrompter;
 
@@ -158,6 +158,34 @@ Hooks already pass `--project` for the repo being gated.
     Hooks {
         #[command(subcommand)]
         command: HooksCommands,
+    },
+    /// Plan/apply unmanaged → managed recommendations for this scope
+    #[command(after_help = "\
+Examples:
+  # Review plan (signals + recommended actions); no writes
+  skillz migrate --dry-run
+
+  # Safe auto-applies (Local authored with --authored, identical Owned attach)
+  skillz migrate --authored
+
+  # User-global skills scope
+  skillz migrate --user --authored --dry-run
+
+  # Ignore Skillfile origins when classifying
+  skillz migrate --ignore-skillfile --authored
+
+  # Replaces `skillz project import` for unmanaged → managed
+")]
+    Migrate {
+        /// Print the plan only; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Default no-catalog / no-source outcomes to Local authored
+        #[arg(long)]
+        authored: bool,
+        /// Do not read Skillfile signals
+        #[arg(long)]
+        ignore_skillfile: bool,
     },
     /// List skills in this Project (default) or the bound Library Catalog
     List {
@@ -410,7 +438,8 @@ enum ProjectCommands {
         #[arg(long, default_value = ".agents/skills")]
         skills_dir: String,
     },
-    /// Import skills from Skillfile / adopt local leftovers
+    /// Deprecated: use `skillz migrate`
+    #[command(hide = true)]
     Import {
         /// Report detection only
         #[arg(long)]
@@ -992,6 +1021,50 @@ fn run() -> skillz_core::Result<()> {
             }
             }
         }
+        Some(Commands::Migrate {
+            dry_run,
+            authored,
+            ignore_skillfile,
+        }) => {
+            let opts = MigrateOptions {
+                ignore_skillfile,
+                authored,
+            };
+            let plan = app.migrate_plan(&opts)?;
+            for w in &plan.warnings {
+                eprintln!("warning: {w}");
+            }
+            if plan.rows.is_empty() && plan.warnings.is_empty() {
+                println!("(nothing to migrate under {})", plan.skills_dir.display());
+                return Ok(());
+            }
+            for row in &plan.rows {
+                let sf = row
+                    .skillfile_source
+                    .as_deref()
+                    .unwrap_or("-");
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    row.name,
+                    row.matrix,
+                    row.recommended.label(),
+                    sf
+                );
+            }
+            if dry_run {
+                println!(
+                    "dry-run: {} skill(s) planned under {}",
+                    plan.rows.len(),
+                    plan.skills_dir.display()
+                );
+                return Ok(());
+            }
+            let applied = app.migrate_apply(&plan, false)?;
+            for (name, msg) in applied {
+                println!("{name}: {msg}");
+            }
+            Ok(())
+        }
         Some(Commands::List {
             library,
             tags,
@@ -1306,6 +1379,9 @@ fn run() -> skillz_core::Result<()> {
                 adopt_local,
                 interactive,
             } => {
+                eprintln!(
+                    "warning: `skillz project import` is deprecated; prefer `skillz migrate` (and `migrate --user`)"
+                );
                 if interactive {
                     let library = library.as_deref().ok_or_else(|| {
                         skillz_core::SkillzError::Message(

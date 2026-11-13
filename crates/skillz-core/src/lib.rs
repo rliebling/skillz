@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod import;
 pub mod interactive;
 pub mod library;
+pub mod migrate;
 pub mod project;
 pub mod registry;
 pub mod skill;
@@ -22,6 +23,9 @@ pub mod vcs;
 pub mod vcs_ops;
 
 pub use import::{AdoptAs, ImportPlan, SkillfileEntry};
+pub use migrate::{
+    CatalogMatch, MgmtState, MigrateAction, MigrateOptions, MigratePlan, MigrateSkillPlan,
+};
 pub use ui::{
     CancelPrompter, Prompter, SelectAllPrompter, SelectFirstNPrompter, SelectItem,
 };
@@ -779,6 +783,23 @@ impl App {
         Ok(install)
     }
 
+    /// Attach an Installation to a bound Catalog Entry without rewriting files.
+    pub fn attach_to_catalog(
+        &self,
+        name: &str,
+        library: &str,
+        kind: EntryKind,
+    ) -> Result<InstallationLock> {
+        self.lock_unlocked_to_catalog(
+            name,
+            &skill::CatalogSuggestion {
+                library: library.to_string(),
+                kind,
+                exact_match: Some(true),
+            },
+        )
+    }
+
     fn lock_unlocked_to_catalog(
         &self,
         name: &str,
@@ -811,6 +832,211 @@ impl App {
         lock.installations.insert(name.to_string(), install.clone());
         self.save_scope_lock(&lock)?;
         Ok(install)
+    }
+
+    /// Abort if tracked files under `skills_dir` are dirty in git/jj.
+    pub fn ensure_skills_dir_clean(&self) -> Result<()> {
+        let config = self.load_scope_config()?;
+        let repo = match self.scope {
+            Scope::Project => self.paths.cwd.clone(),
+            Scope::User => self.paths.home_dir.join(".agents"),
+        };
+        // Prefer Project/user skills root for pathspec; fall back to cwd repo.
+        let repo_root = match vcs::infer_vcs(&self.paths.cwd) {
+            Some(_) => self.paths.cwd.clone(),
+            None => {
+                if vcs::infer_vcs(&repo).is_some() {
+                    repo
+                } else {
+                    return Ok(());
+                }
+            }
+        };
+        let skills_root = self.scope_skills_root(&config);
+        let skills_rel = skills_root
+            .strip_prefix(&repo_root)
+            .unwrap_or(Path::new(&config.skills_dir))
+            .to_string_lossy()
+            .into_owned();
+        let dirty = vcs_ops::dirty_tracked_under(&repo_root, &skills_rel)?;
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        Err(SkillzError::Message(format!(
+            "migrate refused: tracked files under `{skills_rel}` are dirty (commit or stash first):\n  - {}",
+            dirty.join("\n  - ")
+        )))
+    }
+
+    /// Build a migrate plan for the current scope (no writes).
+    pub fn migrate_plan(&self, opts: &MigrateOptions) -> Result<MigratePlan> {
+        self.ensure_skills_dir_clean()?;
+        let config = self.load_scope_config()?;
+        let skills_dir = self.scope_skills_root(&config);
+        let lock = self.load_scope_lock()?;
+        let drift: std::collections::BTreeSet<String> = self
+            .detect_drift()?
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+
+        let (skillfile, skillfile_entries) = if opts.ignore_skillfile {
+            (None, Vec::new())
+        } else {
+            let path = self.paths.cwd.join("Skillfile");
+            if path.is_file() {
+                let text = std::fs::read_to_string(&path).map_err(|e| {
+                    SkillzError::Message(format!("failed to read {}: {e}", path.display()))
+                })?;
+                (Some(path), import::parse_skillfile(&text)?)
+            } else {
+                (None, Vec::new())
+            }
+        };
+        let skillfile_by_name: std::collections::BTreeMap<String, String> = skillfile_entries
+            .iter()
+            .map(|e| (e.name.clone(), e.source.clone()))
+            .collect();
+
+        let on_disk = import::list_local_skill_names(&skills_dir)?;
+        let mut warnings = Vec::new();
+        for entry in &skillfile_entries {
+            if !on_disk.iter().any(|n| n == &entry.name) {
+                warnings.push(format!(
+                    "Skillfile entry `{}` has no on-disk Installation; skipped (migrate does not fetch)",
+                    entry.name
+                ));
+            }
+        }
+
+        // Catalog rows by name (non-deduped) for ambiguity detection.
+        let catalog_rows = self.list_skills(None, &[], false, false)?;
+        let mut by_name: std::collections::BTreeMap<String, Vec<&ListRow>> =
+            std::collections::BTreeMap::new();
+        for row in &catalog_rows {
+            by_name.entry(row.entry.name.clone()).or_default().push(row);
+        }
+
+        let mut rows = Vec::new();
+        for name in on_disk {
+            let skillfile_source = skillfile_by_name.get(&name).cloned();
+            let mgmt = match lock.installations.get(&name) {
+                None => MgmtState::Unmanaged,
+                Some(rec) if rec.entry_kind == EntryKind::Local => {
+                    if rec.source.is_some() {
+                        MgmtState::LocalSource
+                    } else {
+                        MgmtState::LocalAuthored
+                    }
+                }
+                Some(_) => MgmtState::LibraryLocked {
+                    clean: !drift.contains(&name),
+                },
+            };
+
+            let catalog = match by_name.get(&name).map(|v| v.as_slice()) {
+                None | Some([]) => CatalogMatch::None,
+                Some([row]) => {
+                    let exact = match row.entry.kind {
+                        EntryKind::Owned if row.entry.skill_path.join("SKILL.md").is_file() => {
+                            let project_skill = skill::skill_dir(&skills_dir, &name);
+                            match (
+                                skill::content_hash(&project_skill),
+                                skill::content_hash(&row.entry.skill_path),
+                            ) {
+                                (Ok(a), Ok(b)) => Some(a == b),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    CatalogMatch::Single {
+                        library: row.entry.library.clone(),
+                        kind: row.entry.kind,
+                        exact_match: exact,
+                    }
+                }
+                Some(_) => CatalogMatch::Ambiguous,
+            };
+
+            let (matrix, recommended) = match (&mgmt, &catalog, &skillfile_source) {
+                (MgmtState::LibraryLocked { clean: true }, _, _) => {
+                    ("B1", MigrateAction::NoOp)
+                }
+                (
+                    MgmtState::Unmanaged,
+                    CatalogMatch::Single {
+                        library,
+                        kind: EntryKind::Owned,
+                        exact_match: Some(true),
+                    },
+                    _,
+                ) => (
+                    if skillfile_source.is_some() {
+                        "A6"
+                    } else {
+                        "A3"
+                    },
+                    MigrateAction::AttachIdentical {
+                        library: library.clone(),
+                    },
+                ),
+                (MgmtState::Unmanaged, CatalogMatch::None, None) if opts.authored => {
+                    ("A1", MigrateAction::SetLocalAuthored)
+                }
+                _ => ("?", MigrateAction::NeedsPrompt),
+            };
+
+            rows.push(MigrateSkillPlan {
+                name,
+                matrix,
+                mgmt,
+                skillfile_source,
+                catalog,
+                recommended,
+            });
+        }
+
+        Ok(MigratePlan {
+            skills_dir,
+            skillfile,
+            rows,
+            warnings,
+        })
+    }
+
+    /// Apply safe migrate actions (A1, A3/A6, B1). Skips NeedsPrompt rows.
+    pub fn migrate_apply(&self, plan: &MigratePlan, dry_run: bool) -> Result<Vec<(String, String)>> {
+        if !dry_run {
+            self.ensure_skills_dir_clean()?;
+        }
+        let mut out = Vec::new();
+        for row in &plan.rows {
+            match &row.recommended {
+                MigrateAction::NoOp => {
+                    out.push((row.name.clone(), "no-op".into()));
+                }
+                MigrateAction::SetLocalAuthored => {
+                    if !dry_run {
+                        self.set_local_authored(&row.name)?;
+                    }
+                    out.push((row.name.clone(), "set Local authored".into()));
+                }
+                MigrateAction::AttachIdentical { library } => {
+                    if !dry_run {
+                        self.attach_to_catalog(&row.name, library, EntryKind::Owned)?;
+                    }
+                    out.push((
+                        row.name.clone(),
+                        format!("attached to `{library}`"),
+                    ));
+                }
+                MigrateAction::NeedsPrompt => {
+                    out.push((row.name.clone(), "skipped (needs prompt)".into()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Detect Drift for skills present under skills_dir vs the Lock (current scope).
@@ -2656,6 +2882,120 @@ mod tests {
         let lock_text = fs::read_to_string(fx.config_dir.join("user.lock")).unwrap();
         assert!(lock_text.contains("home-skill"));
         assert!(lock_text.contains("entry_kind = \"local\""));
+    }
+
+    #[test]
+    fn migrate_mvp_authored_attach_noop_and_skillfile_skip() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        // Seed an Owned Catalog Entry for attach-identical.
+        fx.app().skill_new("owned-skill", &[]).unwrap();
+        fx.app()
+            .libcommit_authored("owned-skill", "personal", &[])
+            .unwrap();
+        // Re-create as unmanaged Installation with identical content.
+        let mut lock = ProjectLock::load(&fx.project_dir).unwrap();
+        lock.installations.remove("owned-skill");
+        lock.save(&fx.project_dir).unwrap();
+
+        fx.app().skill_new("local-a1", &[]).unwrap();
+        fs::write(
+            fx.project_dir.join("Skillfile"),
+            "github skill owner/repo skills/missing-only\n",
+        )
+        .unwrap();
+
+        let plan = fx
+            .app()
+            .migrate_plan(&MigrateOptions {
+                ignore_skillfile: false,
+                authored: true,
+            })
+            .unwrap();
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|w| w.contains("missing-only")));
+        let a1 = plan.rows.iter().find(|r| r.name == "local-a1").unwrap();
+        assert_eq!(a1.matrix, "A1");
+        assert!(matches!(
+            a1.recommended,
+            MigrateAction::SetLocalAuthored
+        ));
+        let a3 = plan.rows.iter().find(|r| r.name == "owned-skill").unwrap();
+        assert!(matches!(
+            a3.recommended,
+            MigrateAction::AttachIdentical { .. }
+        ));
+
+        let dry = fx.app().migrate_apply(&plan, true).unwrap();
+        assert!(dry.iter().any(|(n, m)| n == "local-a1" && m.contains("Local")));
+        assert!(fx.app().detect_drift().unwrap().iter().any(|d| d.name == "local-a1"));
+
+        fx.app().migrate_apply(&plan, false).unwrap();
+        assert!(fx
+            .app()
+            .detect_drift()
+            .unwrap()
+            .iter()
+            .all(|d| d.name != "local-a1" && d.name != "owned-skill"));
+
+        // B1: already attached owned-skill is no-op.
+        let again = fx
+            .app()
+            .migrate_plan(&MigrateOptions {
+                ignore_skillfile: true,
+                authored: false,
+            })
+            .unwrap();
+        let b1 = again.rows.iter().find(|r| r.name == "owned-skill").unwrap();
+        assert_eq!(b1.matrix, "B1");
+        assert!(matches!(b1.recommended, MigrateAction::NoOp));
+    }
+
+    #[test]
+    fn migrate_refuses_dirty_tracked_skills_dir() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        vcs_ops::init_git_repo(&fx.project_dir).unwrap();
+        fx.app().skill_new("tracked", &[]).unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&fx.project_dir)
+            .args(["add", ".agents/skills/tracked"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&fx.project_dir)
+            .args(["commit", "-m", "track skill"])
+            .status()
+            .unwrap();
+        fs::write(
+            fx.project_dir
+                .join(".agents/skills/tracked/SKILL.md"),
+            "---\nname: tracked\n---\n# dirty\n",
+        )
+        .unwrap();
+        // Dirty outside skills_dir is OK to leave; gate only checks skills_dir.
+        fs::write(fx.project_dir.join("README.md"), "hi\n").unwrap();
+        let err = fx
+            .app()
+            .migrate_plan(&MigrateOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("dirty"));
+        assert!(err.to_string().contains("tracked"));
     }
 
     #[test]
