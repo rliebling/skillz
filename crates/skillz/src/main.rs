@@ -609,6 +609,12 @@ fn resolve_missing_deps(
     Ok(())
 }
 
+fn reject_nonsensical_user_flag(subcommand: &str, hint: &str) -> skillz_core::Result<()> {
+    Err(skillz_core::SkillzError::Message(format!(
+        "`skillz {subcommand} … --user` is invalid; {hint}"
+    )))
+}
+
 fn resolve_import_conflict_stdin(
     item: &LibraryImportItem,
 ) -> skillz_core::Result<LibraryImportConflictResolution> {
@@ -952,7 +958,14 @@ fn run() -> skillz_core::Result<()> {
             }
             Ok(())
         }
-        Some(Commands::Hooks { command }) => match command {
+        Some(Commands::Hooks { command }) => {
+            if cli.user {
+                return reject_nonsensical_user_flag(
+                    "hooks",
+                    "hooks attach to a Managed Project's VCS — omit `--user`",
+                );
+            }
+            match command {
             HooksCommands::Install => {
                 let paths = app.hooks_install()?;
                 for path in paths {
@@ -976,7 +989,8 @@ fn run() -> skillz_core::Result<()> {
                 }
                 Ok(())
             }
-        },
+            }
+        }
         Some(Commands::List {
             library,
             tags,
@@ -1258,7 +1272,14 @@ fn run() -> skillz_core::Result<()> {
             }
             }
         }
-        Some(Commands::Project { command }) => match command {
+        Some(Commands::Project { command }) => {
+            if cli.user {
+                return reject_nonsensical_user_flag(
+                    "project",
+                    "use `skillz user init` for the user-global skills scope, or omit `--user`",
+                );
+            }
+            match command {
             ProjectCommands::Init { bind, skills_dir } => {
                 let skills = if skills_dir == ".agents/skills" {
                     None
@@ -1356,7 +1377,8 @@ fn run() -> skillz_core::Result<()> {
                 }
                 Ok(())
             }
-        },
+            }
+        }
         Some(Commands::User { command }) => match command {
             UserCommands::Init { bind } => {
                 let config = app.user_init(&bind)?;
@@ -1491,5 +1513,62 @@ mod tests {
             }
             other => panic!("expected library catalog, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_and_hooks_parse_with_user_flag_for_rejection() {
+        // clap still accepts the global flag; run() rejects it.
+        let project = Cli::try_parse_from([
+            "skillz",
+            "--user",
+            "project",
+            "init",
+            "--binding",
+            "personal",
+        ])
+        .unwrap();
+        assert!(project.user);
+        assert!(matches!(
+            project.command,
+            Some(Commands::Project {
+                command: ProjectCommands::Init { .. }
+            })
+        ));
+
+        let hooks = Cli::try_parse_from(["skillz", "hooks", "show", "--user"]).unwrap();
+        assert!(hooks.user);
+        assert!(matches!(
+            hooks.command,
+            Some(Commands::Hooks {
+                command: HooksCommands::Show
+            })
+        ));
+
+        let user_init =
+            Cli::try_parse_from(["skillz", "user", "init", "--binding", "personal"]).unwrap();
+        assert!(!user_init.user);
+        assert!(matches!(
+            user_init.command,
+            Some(Commands::User {
+                command: UserCommands::Init { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_nonsensical_user_flag_message() {
+        let err = reject_nonsensical_user_flag(
+            "project",
+            "use `skillz user init` for the user-global skills scope, or omit `--user`",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("project"));
+        assert!(err.to_string().contains("user init"));
+        let err = reject_nonsensical_user_flag(
+            "hooks",
+            "hooks attach to a Managed Project's VCS — omit `--user`",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("hooks"));
     }
 }
