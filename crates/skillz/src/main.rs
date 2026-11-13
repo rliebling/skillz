@@ -165,11 +165,20 @@ Examples:
   # Review plan (signals + recommended actions); no writes
   skillz migrate --dry-run
 
-  # Safe auto-applies (Local authored with --authored, identical Owned attach)
+  # Safe auto-applies + prompt for indeterminate skills
   skillz migrate --authored
+
+  # Same plan in a TUI chooser (Ratatui)
+  skillz migrate -i --authored
+
+  # Fail-closed scripts: abort if anything needs a prompt
+  skillz migrate --authored --no-prompt
 
   # User-global skills scope
   skillz migrate --user --authored --dry-run
+
+  # Attach provenance to one Local/unmanaged skill
+  skillz migrate grilling --source github:owner/repo/grilling@abc1234
 
   # Ignore Skillfile origins when classifying
   skillz migrate --ignore-skillfile --authored
@@ -195,6 +204,9 @@ Examples:
         /// Fail-closed: abort with no writes if any skill needs a prompt
         #[arg(long)]
         no_prompt: bool,
+        /// Interactive review of indeterminate skills (Ratatui)
+        #[arg(short = 'i', long, conflicts_with = "no_prompt")]
+        interactive: bool,
     },
     /// List skills in this Project (default) or the bound Library Catalog
     List {
@@ -1084,7 +1096,13 @@ fn run() -> skillz_core::Result<()> {
             authored,
             ignore_skillfile,
             no_prompt,
+            interactive,
         }) => {
+            if interactive && dry_run {
+                return Err(skillz_core::SkillzError::Message(
+                    "`migrate` refuses --dry-run with -i; omit one of them".into(),
+                ));
+            }
             if let Some(source) = source {
                 let Some(name) = name else {
                     return Err(skillz_core::SkillzError::Message(
@@ -1107,6 +1125,14 @@ fn run() -> skillz_core::Result<()> {
                 ignore_skillfile,
                 authored,
             };
+            if interactive {
+                let mut ui = RatatuiPrompter;
+                let applied = app.interactive_migrate(&opts, false, &mut ui)?;
+                for (name, msg) in applied {
+                    println!("{name}: {msg}");
+                }
+                return Ok(());
+            }
             let plan = app.migrate_plan(&opts)?;
             for w in &plan.warnings {
                 eprintln!("warning: {w}");

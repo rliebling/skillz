@@ -1,9 +1,12 @@
 //! `-i` orchestration over [`crate::ui::Prompter`] (testable without Ratatui).
 //!
-//! Drift review uses a dedicated board UI in the CLI crate; add/import still use Prompter.
+//! Drift review uses a dedicated board UI in the CLI crate; add/import/migrate still use Prompter.
 
 use crate::ui::{Prompter, SelectItem};
-use crate::{AddOutcome, AdoptAs, App, LibraryImportReport, Result};
+use crate::{
+    AddOutcome, AdoptAs, App, LibraryImportReport, MigrateOptions, MigratePromptAnswer,
+    MigrateSkillPlan, Result,
+};
 
 impl App {
     /// Interactive add: multi-select among Catalog Entries.
@@ -132,5 +135,37 @@ impl App {
             results.extend(one);
         }
         Ok(results)
+    }
+
+    /// Interactive migrate: Prompter chooses among alternatives for indeterminate rows.
+    pub fn interactive_migrate(
+        &self,
+        opts: &MigrateOptions,
+        dry_run: bool,
+        prompler: &mut dyn Prompter,
+    ) -> Result<Vec<(String, String)>> {
+        let plan = self.migrate_plan(opts)?;
+        let mut resolver = |row: &MigrateSkillPlan| -> Result<MigratePromptAnswer> {
+            if row.alternatives.is_empty() {
+                return Ok(MigratePromptAnswer::Cancel);
+            }
+            let mut options: Vec<String> = row.alternatives.iter().map(|a| a.label()).collect();
+            for alt in &row.alternatives {
+                options.push(format!("{} (all remaining)", alt.label()));
+            }
+            options.push("cancel".into());
+            let title = format!("Migrate `{}` [{}]", row.name, row.matrix);
+            let idx = prompler.choose(&title, &options)?;
+            let n = row.alternatives.len();
+            if idx == options.len() - 1 {
+                return Ok(MigratePromptAnswer::Cancel);
+            }
+            if idx < n {
+                return Ok(MigratePromptAnswer::This(row.alternatives[idx].clone()));
+            }
+            let alt = &row.alternatives[idx - n];
+            Ok(MigratePromptAnswer::AllRemaining(alt.clone()))
+        };
+        self.migrate_apply(&plan, dry_run, false, Some(&mut resolver))
     }
 }

@@ -3292,6 +3292,32 @@ mod tests {
     }
 
     #[test]
+    fn interactive_migrate_uses_prompter_without_ratatui() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("pick-me", &[]).unwrap();
+        let mut ui = SelectAllPrompter;
+        let out = fx
+            .app()
+            .interactive_migrate(
+                &MigrateOptions {
+                    authored: false,
+                    ignore_skillfile: true,
+                },
+                false,
+                &mut ui,
+            )
+            .unwrap();
+        assert!(!out.is_empty());
+        assert!(fx.app().detect_drift().unwrap().is_empty());
+    }
+
+    #[test]
     fn migrate_no_prompt_aborts_indeterminate_without_writes() {
         let fx = Fixture::new();
         fx.app()
