@@ -800,27 +800,53 @@ impl App {
     pub fn apply_drift_action(&self, name: &str, action: DriftAction) -> Result<&'static str> {
         match action {
             DriftAction::Skip => Ok("skipped"),
-            DriftAction::Libcommit => {
-                // Exact Catalog match → record Lock only (no Branch Lock needed).
-                if let Some(sug) = self.suggest_catalog_match(name)? {
-                    if sug.exact_match == Some(true) {
-                        self.lock_unlocked_to_catalog(name, &sug)?;
-                        return Ok("locked to catalog");
+            DriftAction::Attach => {
+                let sug = self.suggest_catalog_match(name)?.ok_or_else(|| {
+                    SkillzError::Message(format!(
+                        "no Catalog match for `{name}`; cannot `add --attach`"
+                    ))
+                })?;
+                self.attach_to_catalog(name, &sug.library, sug.kind)?;
+                Ok("attached")
+            }
+            DriftAction::Publish => {
+                let lock = self.load_scope_lock()?;
+                if let Some(rec) = lock.installations.get(name) {
+                    if rec.entry_kind == EntryKind::Local
+                        || rec.entry_kind == EntryKind::Owned
+                        || rec.entry_kind == EntryKind::Upstream
+                    {
+                        let library = if rec.entry_kind == EntryKind::Local {
+                            self.first_writable_binding(&self.load_scope_config()?)?
+                                .to_string()
+                        } else {
+                            rec.library.clone()
+                        };
+                        self.publish_skills(
+                            &[name.to_string()],
+                            &library,
+                            PublishMode::Auto,
+                            Some("interactive publish"),
+                        )?;
+                        return Ok("published");
                     }
+                }
+                // Unlocked / no Local: Branch Lock edit path via first writable Binding.
+                if let Some(sug) = self.suggest_catalog_match(name)? {
                     self.libcommit_branch(
                         name,
                         Some(&sug.library),
-                        Some("interactive libcommit"),
+                        Some("interactive publish"),
                         &[],
                     )?;
-                    return Ok("libcommitted");
+                    return Ok("published");
                 }
-                self.libcommit_branch(name, None, Some("interactive libcommit"), &[])?;
-                Ok("libcommitted")
+                self.libcommit_branch(name, None, Some("interactive publish"), &[])?;
+                Ok("published")
             }
-            DriftAction::Promote => {
-                self.promote_skill(name)?;
-                Ok("promoted")
+            DriftAction::Update => {
+                self.update_skill(name)?;
+                Ok("updated")
             }
             DriftAction::Remove => {
                 self.remove_skill_files(name)?;
@@ -4432,12 +4458,12 @@ mod tests {
         assert_eq!(sug.library, "personal");
         assert_eq!(sug.exact_match, Some(true));
 
-        // Drift -i libcommit must work without an existing Lock.
+        // Drift -i attach must work without an existing Lock.
         let msg = fx
             .app()
-            .apply_drift_action("demo-skill", DriftAction::Libcommit)
+            .apply_drift_action("demo-skill", DriftAction::Attach)
             .unwrap();
-        assert!(msg.contains("locked") || msg.contains("libcommit"));
+        assert!(msg.contains("attach"), "{msg}");
         assert!(fx.app().detect_drift().unwrap().is_empty());
 
         // Divergent content → differs.

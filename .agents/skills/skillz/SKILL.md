@@ -8,81 +8,101 @@ description: >-
 
 # Managing skills with skillz
 
-Prefer **skillz** over hand-copying skills between projects. Libraries are the union catalog; Managed Projects install and Lock skills into `skills_dir` (default `.agents/skills`).
+Prefer **skillz** over hand-copying skills between projects. Libraries are the
+union catalog; Managed Projects install and Lock skills into `skills_dir`
+(default `.agents/skills`).
 
 ## When to use skillz
 
 - Discover or install skills into a Managed Project or user-global scope
-- Formalize a tested Installation into a Library (`libcommit`)
-- Record Drift / Branch Lock / Promote instead of silent edits to a Library
-- Catalog a Tool-Provided skill so it can be re-installed from the providing tool
+- Publish a managed Installation into a Library (`publish`)
+- Refresh from Library main (`update`) or link an on-disk tree (`add --attach`)
+- Report Drift / pending review instead of silent edits to a Library
 
-Do **not** invent Locks, silently vendor Upstream into a Library `skills/` tree, or copy skills between repos without going through Catalog Entry + Lock.
+Do **not** invent Locks, silently vendor Upstream into a Library `skills/` tree,
+or copy skills between repos without Catalog Entry + Lock.
 
 ## Core scopes
 
 | Scope | Meaning |
 | --- | --- |
-| **Library** | Catalog: Owned content and/or Upstream references |
+| **Library** | Catalog: Owned content and/or Upstream references (`contribution = direct\|review`) |
 | **Managed Project** | Repo with Bindings; Installations + Locks under `.skillz/` |
 | **User-global** | `skillz --user` / `skillz user …` for `~/.agents/skills` |
+
+## Decision tree (everyday verbs)
+
+```text
+Need skill files in this Project?
+  missing on disk → skillz add NAME
+  already on disk, link to Catalog → skillz add NAME --attach [-l LIB]
+  take Catalog files while linking → skillz add NAME --attach --from-library
+  stage github/path/cmd (Unlocked) → skillz add --source … [NAME]
+  scaffold Authored (Unlocked) → skillz new NAME
+  mark Local immediately → add --local / new --local
+
+Send Project → Library?
+  managed Local / Library-backed → skillz publish NAME… -l LIB
+  review Libraries push/PR by default (--no-push / --no-pr to skip)
+
+Refresh from Library main?
+  skillz update NAME…
+
+Clean up Project only?
+  skillz remove NAME…   (Catalog Entry stays)
+```
+
+There is **no** `fetch`, `libcommit`, `promote`, or `lock --main`.
 
 ## Common commands
 
 ```bash
-skillz status
+skillz status [--json]
 skillz list --catalog
 skillz list --tag TAG
 skillz add NAME
-skillz add --tag TAG
-skillz new NAME --tag topic
-skillz fetch github:owner/repo SKILLNAME
-skillz libcommit NAME --as authored --library LIBRARY
-skillz libcommit NAME --as upstream --library LIBRARY --source 'github:…@rev'
+skillz add NAME --attach -l LIBRARY
+skillz add --source github:owner/repo/path@rev
+skillz add --source 'cmd:tool skill install --dir {dir}' NAME --local
+skillz new NAME --local
+skillz publish NAME -l LIBRARY
+skillz publish NAME -l LIBRARY --dry-run
+skillz update NAME
+skillz remove NAME
 skillz drift
-skillz drift -i
-skillz drift -g
-skillz promote NAME
-skillz lock NAME --main
+skillz drift --check          # exit 2 on hard Drift only (pending ≠ 2)
+skillz drift -i               # TTY only; actions: publish / add --attach / update / remove
+skillz migrate --dry-run [--json]
 skillz hooks show
 skillz hooks install
 skillz skill show
 skillz skill install
 ```
 
-Library registry / bootstrap: `skillz library init|register|list|import` (from inside a registered Library, `--library` defaults to that checkout).  
-Project bootstrap: `skillz project init --binding LIBRARY`.
-User-global: `skillz user init --binding LIBRARY`.
+Non-interactive agents: pass `--no-prompt` (or run non-TTY). Prefer `--with-deps` /
+`--no-deps` on `add` rather than y/N prompts. Use `--json` on status / drift / list /
+migrate --dry-run / publish.
 
-This skill ships inside the `skillz` binary. Humans can inspect it with `skillz skill show`; agents/tools materialize it with `skillz skill install --dir {dir}` (Tool-Provided `cmd:` template).
+Library registry / bootstrap: `skillz library init|register|list|import`.  
+Project bootstrap: `skillz project init --binding LIBRARY`.  
+User-global: `skillz user init --binding LIBRARY`.
 
 ## Authored vs Upstream vs Tool-Provided
 
-- **Authored** (`libcommit --as authored`): Owned Entry; skill files live in the Library.
-- **Upstream github** (`--source github:owner/repo[/path]@rev`): Catalog reference; Project `add` fetches that revision. No Library mirror of the files.
-- **Tool-Provided** (`--source 'cmd:…'`): Catalog reference whose source is an install **command template** (ADR 0005). Example:
-
-  ```bash
-  skillz libcommit skillz --as upstream --library personal \
-    --source 'cmd:skillz skill install --dir {dir}'
-  # or another tool, e.g. rexpad:
-  skillz libcommit rexpad --as upstream --library personal \
-    --source 'cmd:rexpad skill install --dir {dir}'
-  ```
-
-  - Placeholders: `{dir}` = Installation path, `{name}` = skill name.
-  - Optional version probe override: `|version:rexpad version` (default `{argv0} --version`).
-  - Catalog stores the template **without** `@rev`; Locks pin an observational **tool version**.
-  - libcommit **eagerly validates** install + version probe (same spirit as checking `github:…` when cataloging).
-  - Later `skillz add` **re-runs** the template; missing tools fail clearly. Collaborators still get committed Project Installations without running the tool.
+- **Owned / Authored**: Local authored → `publish` creates Owned Entry under Library `skills/`.
+- **Upstream github**: Local+source `github:…@rev` → `publish` writes Catalog reference (no Library file mirror).
+- **Tool-Provided**: Local+source `cmd:…` → Catalog stores install template; Locks pin tool version; `add` re-runs the template.
 
 ## Edit / Drift flow
 
 1. Edit the Installation in the Project (or user) skills dir.
-2. `skillz libcommit` → Branch Lock or Overlay Fork (honest Lock).
-3. `skillz promote` → Library main; then `skillz lock NAME --main`.
-4. Drift gates (`hooks install`) block publishing dishonest skill paths unless explicitly allowed.
+2. `skillz publish NAME -l LIBRARY` → direct main or review Branch Lock (+ push/PR).
+3. After review merge: `skillz update NAME` to take Library main tip.
+4. Pending review shows in `status` / `drift` but does **not** fail `drift --check`.
+5. Drift gates (`hooks install`) block dishonest paths unless explicitly allowed.
 
 ## Availability
 
-`list` / `add` show where a skill is already visible (Project `skills_dir`, `~/.agents/skills`, other agent roots). Project Installations are what collaborators receive on clone.
+`list` / `add` show where a skill is already visible (Project `skills_dir`,
+`~/.agents/skills`, other agent roots). Project Installations are what
+collaborators receive on clone.

@@ -18,7 +18,17 @@ use tui::RatatuiPrompter;
     name = "skillz",
     version,
     about = "Manage agent skill Libraries and Managed Projects",
-    long_about = None
+    after_help = "\
+Direction of data flow (everyday verbs):
+  add NAME                 Catalog → Project (install when missing)
+  add NAME --attach        link on-disk skill → Catalog Lock (no Library write)
+  add --source …           stage Upstream into skills_dir (optional --local)
+  publish NAME -l LIB      Project → Library (direct main / review Branch Lock)
+  update NAME              Library main tip → Project Installation + Lock
+  remove NAME              drop Installation + Lock (Catalog unchanged)
+
+There is no fetch / libcommit / promote / lock --main command.
+"
 )]
 struct Cli {
     /// Override skillz config directory (default: ~/.config/skillz)
@@ -28,6 +38,14 @@ struct Cli {
     /// Operate on the user-global skills scope (`~/.agents/skills`)
     #[arg(long, global = true)]
     user: bool,
+
+    /// Machine-readable JSON on stdout (status / drift / list / migrate / publish)
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Never prompt (non-interactive); same default as non-TTY stdin
+    #[arg(long, global = true)]
+    no_prompt: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -71,6 +89,17 @@ Examples:
 ")]
     Update {
         /// Skill name(s) to refresh from their Library Lock
+        #[arg(value_name = "NAME", required = true)]
+        names: Vec<String>,
+    },
+    /// Drop Installation + Lock (Catalog Entry unchanged)
+    #[command(after_help = "\
+Examples:
+  skillz remove grilling
+  skillz remove a b c
+")]
+    Remove {
+        /// Skill name(s) to remove from this scope
         #[arg(value_name = "NAME", required = true)]
         names: Vec<String>,
     },
@@ -792,18 +821,28 @@ fn resolve_import_conflict_stdin(
     }
 }
 
+const HARD_DRIFT_EXIT: u8 = 2;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
+            let msg = err.to_string();
+            if msg.starts_with("HARD_DRIFT:") {
+                eprintln!("error: {}", msg.trim_start_matches("HARD_DRIFT:").trim());
+                ExitCode::from(HARD_DRIFT_EXIT)
+            } else {
+                eprintln!("error: {err}");
+                ExitCode::from(1)
+            }
         }
     }
 }
 
 fn run() -> skillz_core::Result<()> {
     let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
+    let json = cli.json;
+    let no_prompt = cli.no_prompt || !std::io::IsTerminal::is_terminal(&std::io::stdin());
 
     if let Some(Commands::Completions { shell }) = cli.command {
         let mut cmd = command();
@@ -858,6 +897,26 @@ fn run() -> skillz_core::Result<()> {
         Some(Commands::Skill { .. }) => unreachable!("handled above"),
         Some(Commands::Status) => {
             let report = app.status()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "cwd": report.cwd,
+                        "config": report.config_dir,
+                        "managed": report.managed,
+                        "skills_dir": report.skills_dir,
+                        "bindings": report.bindings.iter().map(|b| serde_json::json!({
+                            "name": b.name,
+                            "url": b.url,
+                            "read_only": b.read_only,
+                        })).collect::<Vec<_>>(),
+                        "installations": report.installations,
+                        "pending_review": report.pending_review,
+                        "message": report.message,
+                    })
+                );
+                return Ok(());
+            }
             println!("cwd: {}", report.cwd.display());
             println!("config: {}", report.config_dir.display());
             if report.managed {
@@ -914,6 +973,14 @@ fn run() -> skillz_core::Result<()> {
             }
             Ok(())
         }
+        Some(Commands::Remove { names }) => {
+            for (i, name) in names.iter().enumerate() {
+                let also: Vec<String> = names[i + 1..].to_vec();
+                app.remove_skill_with_context(name, &also)?;
+                println!("removed `{name}` (Catalog Entry unchanged)");
+            }
+            Ok(())
+        }
         Some(Commands::Publish {
             names,
             library,
@@ -947,6 +1014,34 @@ fn run() -> skillz_core::Result<()> {
                     mock_pr: None,
                 },
             )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "library": report.library,
+                        "contribution": report.contribution.as_str(),
+                        "rev": report.rev,
+                        "branch": report.branch,
+                        "dry_run": report.dry_run,
+                        "pushed": report.pushed,
+                        "pr_url": report.pr_url,
+                        "missing_deps": report.missing_deps,
+                        "warnings": report.warnings,
+                        "next_steps": report.next_steps,
+                        "skills": report.skills.iter().map(|s| serde_json::json!({
+                            "name": s.name,
+                            "kind": match s.kind {
+                                skillz_core::EntryKind::Owned => "owned",
+                                skillz_core::EntryKind::Upstream => "upstream",
+                                skillz_core::EntryKind::Local => "local",
+                            },
+                            "created": s.created,
+                            "content_hash": s.lock.content_hash,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+                return Ok(());
+            }
             if !report.missing_deps.is_empty() {
                 eprintln!(
                     "warning: possible sibling dependencies not in this publish batch: {} (consider including them in a follow-up `publish`)",
@@ -1024,6 +1119,12 @@ fn run() -> skillz_core::Result<()> {
                 return Ok(());
             }
             if interactive {
+                if no_prompt {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`drift -i` requires an interactive TTY; omit -i or run without --no-prompt"
+                            .into(),
+                    ));
+                }
                 // Current App scope only (Project cwd or --user) — same as default report.
                 tui::run_drift_board(&app)?;
                 return Ok(());
@@ -1036,53 +1137,75 @@ fn run() -> skillz_core::Result<()> {
                 DriftScan::Current
             };
             let report = app.drift_report(scan)?;
-            if report.is_empty() {
-                println!("no drift");
-                return Ok(());
-            }
-            let user_skills = app.paths().user_skills_dir();
-            let mut hard = false;
-            for proj in &report {
-                let label = if proj.project == user_skills {
-                    format!("user-global: {}", proj.project.display())
-                } else {
-                    format!("project: {}", proj.project.display())
-                };
-                println!("{label}");
-                let name_width = proj
-                    .items
+            let hard = report
+                .iter()
+                .flat_map(|p| &p.items)
+                .any(|i| i.reason.fails_check());
+            if json {
+                let projects: Vec<_> = report
                     .iter()
-                    .map(|item| item.name.len())
-                    .max()
-                    .unwrap_or(0);
-                for item in &proj.items {
-                    let reason = match &item.reason {
-                        DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
-                        DriftReason::MissingFiles => "missing installation files".into(),
-                        DriftReason::HashMismatch { .. } => {
-                            "content hash differs from Lock".into()
-                        }
-                        DriftReason::PendingReview {
-                            library,
-                            branch,
-                            rev,
-                        } => format!(
-                            "pending review ({library} `{branch}` @{})",
-                            &rev[..rev.len().min(12)]
-                        ),
-                        DriftReason::SquashFallout { recovery, .. } => {
-                            format!("squash fallout — {recovery}")
-                        }
+                    .map(|proj| {
+                        serde_json::json!({
+                            "project": proj.project,
+                            "items": proj.items.iter().map(|item| serde_json::json!({
+                                "name": item.name,
+                                "reason": item.reason.label(),
+                                "fails_check": item.reason.fails_check(),
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "projects": projects,
+                        "hard_drift": hard,
+                        "check": check,
+                    })
+                );
+            } else if report.is_empty() {
+                println!("no drift");
+            } else {
+                let user_skills = app.paths().user_skills_dir();
+                for proj in &report {
+                    let label = if proj.project == user_skills {
+                        format!("user-global: {}", proj.project.display())
+                    } else {
+                        format!("project: {}", proj.project.display())
                     };
-                    println!("  {:<width$}  {reason}", item.name, width = name_width);
-                    if item.reason.fails_check() {
-                        hard = true;
+                    println!("{label}");
+                    let name_width = proj
+                        .items
+                        .iter()
+                        .map(|item| item.name.len())
+                        .max()
+                        .unwrap_or(0);
+                    for item in &proj.items {
+                        let reason = match &item.reason {
+                            DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
+                            DriftReason::MissingFiles => "missing installation files".into(),
+                            DriftReason::HashMismatch { .. } => {
+                                "content hash differs from Lock".into()
+                            }
+                            DriftReason::PendingReview {
+                                library,
+                                branch,
+                                rev,
+                            } => format!(
+                                "pending review ({library} `{branch}` @{})",
+                                &rev[..rev.len().min(12)]
+                            ),
+                            DriftReason::SquashFallout { recovery, .. } => {
+                                format!("squash fallout — {recovery}")
+                            }
+                        };
+                        println!("  {:<width$}  {reason}", item.name, width = name_width);
                     }
                 }
             }
             if check && hard {
                 return Err(skillz_core::SkillzError::Message(
-                    "drift detected; commit blocked (use --allow-drift or SKILLZ_ALLOW_DRIFT=1)"
+                    "HARD_DRIFT: drift detected; commit blocked (use --allow-drift or SKILLZ_ALLOW_DRIFT=1)"
                         .into(),
                 ));
             }
@@ -1127,12 +1250,19 @@ fn run() -> skillz_core::Result<()> {
             dry_run,
             authored,
             ignore_skillfile,
-            no_prompt,
+            no_prompt: migrate_no_prompt,
             interactive,
         }) => {
+            let no_prompt = no_prompt || migrate_no_prompt;
             if interactive && dry_run {
                 return Err(skillz_core::SkillzError::Message(
                     "`migrate` refuses --dry-run with -i; omit one of them".into(),
+                ));
+            }
+            if interactive && no_prompt {
+                return Err(skillz_core::SkillzError::Message(
+                    "`migrate -i` requires an interactive TTY; omit -i or run without --no-prompt"
+                        .into(),
                 ));
             }
             if let Some(source) = source {
@@ -1184,11 +1314,27 @@ fn run() -> skillz_core::Result<()> {
                 );
             }
             if dry_run {
-                println!(
-                    "dry-run: {} skill(s) planned under {}",
-                    plan.rows.len(),
-                    plan.skills_dir.display()
-                );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "skills_dir": plan.skills_dir,
+                            "warnings": plan.warnings,
+                            "rows": plan.rows.iter().map(|row| serde_json::json!({
+                                "name": row.name,
+                                "matrix": row.matrix,
+                                "recommended": row.recommended.label(),
+                                "skillfile_source": row.skillfile_source,
+                            })).collect::<Vec<_>>(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "dry-run: {} skill(s) planned under {}",
+                        plan.rows.len(),
+                        plan.skills_dir.display()
+                    );
+                }
                 return Ok(());
             }
             let mut resolver =
@@ -1217,6 +1363,26 @@ fn run() -> skillz_core::Result<()> {
             catalog,
         }) => {
             let rows = app.list_skills(library.as_deref(), &tags, dedupe, !catalog)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "catalog": catalog,
+                        "skills": rows.iter().map(|r| serde_json::json!({
+                            "name": r.entry.name,
+                            "library": r.entry.library,
+                            "kind": match r.entry.kind {
+                                skillz_core::EntryKind::Owned => "owned",
+                                skillz_core::EntryKind::Upstream => "upstream",
+                                skillz_core::EntryKind::Local => "local",
+                            },
+                            "tags": r.entry.tags,
+                            "source": r.entry.source,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+                return Ok(());
+            }
             if rows.is_empty() {
                 if catalog {
                     println!("(no matching Catalog Entries)");
@@ -1260,6 +1426,12 @@ fn run() -> skillz_core::Result<()> {
             {
                 return Err(skillz_core::SkillzError::Message(
                     "`add --source` cannot combine with --attach / --from-library / --tag / -i / --library".into(),
+                ));
+            }
+            if interactive && no_prompt {
+                return Err(skillz_core::SkillzError::Message(
+                    "`add -i` requires an interactive TTY; omit -i or run without --no-prompt"
+                        .into(),
                 ));
             }
             if attach && (interactive || !tags.is_empty()) {
@@ -1310,7 +1482,7 @@ fn run() -> skillz_core::Result<()> {
             }
             let deps_policy = if with_deps {
                 DepsPolicy::Always
-            } else if no_deps {
+            } else if no_deps || no_prompt {
                 DepsPolicy::Never
             } else {
                 DepsPolicy::Prompt

@@ -122,8 +122,12 @@ impl DriftReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftAction {
     Skip,
-    Libcommit,
-    Promote,
+    /// Project → Library (`publish`).
+    Publish,
+    /// Link on-disk skill to Catalog (`add --attach`).
+    Attach,
+    /// Library → Project refresh (`update`).
+    Update,
     Remove,
 }
 
@@ -131,17 +135,19 @@ impl DriftAction {
     pub fn label(self) -> &'static str {
         match self {
             DriftAction::Skip => "skip",
-            DriftAction::Libcommit => "libcommit",
-            DriftAction::Promote => "promote",
+            DriftAction::Publish => "publish",
+            DriftAction::Attach => "add --attach",
+            DriftAction::Update => "update",
             DriftAction::Remove => "remove",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            DriftAction::Skip => DriftAction::Libcommit,
-            DriftAction::Libcommit => DriftAction::Promote,
-            DriftAction::Promote => DriftAction::Remove,
+            DriftAction::Skip => DriftAction::Publish,
+            DriftAction::Publish => DriftAction::Attach,
+            DriftAction::Attach => DriftAction::Update,
+            DriftAction::Update => DriftAction::Remove,
             DriftAction::Remove => DriftAction::Skip,
         }
     }
@@ -149,9 +155,10 @@ impl DriftAction {
     pub fn prev(self) -> Self {
         match self {
             DriftAction::Skip => DriftAction::Remove,
-            DriftAction::Libcommit => DriftAction::Skip,
-            DriftAction::Promote => DriftAction::Libcommit,
-            DriftAction::Remove => DriftAction::Promote,
+            DriftAction::Publish => DriftAction::Skip,
+            DriftAction::Attach => DriftAction::Publish,
+            DriftAction::Update => DriftAction::Attach,
+            DriftAction::Remove => DriftAction::Update,
         }
     }
 }

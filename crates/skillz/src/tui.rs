@@ -25,8 +25,9 @@ const DRIFT_HELP: &[&str] = &[
     "Actions (per selected skill)",
     "  ← → / [ ] / h l   cycle planned action",
     "  s                 skip",
-    "  c                 libcommit (Branch Lock / Overlay Fork)",
-    "  p                 promote Branch Lock to Library main",
+    "  p                 publish (Project → Library)",
+    "  a                 add --attach (link to Catalog)",
+    "  u                 update (Library main → Project)",
     "  r                 mark remove (dep options if others depend on it)",
     "",
     "Apply / quit",
@@ -34,7 +35,7 @@ const DRIFT_HELP: &[&str] = &[
     "  q / Esc           quit without further applies",
     "",
     "Unlocked rows show a Catalog suggestion: library (owned|upstream, exact|differs).",
-    "Libcommit on an exact match records a Lock; otherwise Branch Lock / Overlay Fork.",
+    "publish / add --attach / update / remove match the everyday CLI verbs.",
     "Remove keeps the Library Catalog Entry; only Project files + Lock go away.",
     "",
     "Press ? or Esc to close this help.",
@@ -203,7 +204,12 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                             }
                             (Some(_), _) => Style::default().fg(Color::Green),
                             (_, DriftAction::Remove) => Style::default().fg(Color::Red),
-                            (_, DriftAction::Libcommit | DriftAction::Promote) => {
+                            (
+                                _,
+                                DriftAction::Publish
+                                | DriftAction::Attach
+                                | DriftAction::Update,
+                            ) => {
                                 Style::default().fg(Color::Cyan)
                             }
                             _ => Style::default().fg(Color::DarkGray),
@@ -422,16 +428,23 @@ pub fn run_drift_board(app: &App) -> Result<()> {
                         status_line = default_status_line(&rows);
                     }
                 }
-                KeyCode::Char('c') => {
+                KeyCode::Char('p') => {
                     if let Some(i) = state.selected() {
-                        rows[i].action = DriftAction::Libcommit;
+                        rows[i].action = DriftAction::Publish;
                         rows[i].outcome = None;
                         status_line = default_status_line(&rows);
                     }
                 }
-                KeyCode::Char('p') => {
+                KeyCode::Char('a') => {
                     if let Some(i) = state.selected() {
-                        rows[i].action = DriftAction::Promote;
+                        rows[i].action = DriftAction::Attach;
+                        rows[i].outcome = None;
+                        status_line = default_status_line(&rows);
+                    }
+                }
+                KeyCode::Char('u') => {
+                    if let Some(i) = state.selected() {
+                        rows[i].action = DriftAction::Update;
                         rows[i].outcome = None;
                         status_line = default_status_line(&rows);
                     }

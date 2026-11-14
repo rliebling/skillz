@@ -59,6 +59,14 @@ mod tests {
     fn skill_md_has_frontmatter_name() {
         assert!(SKILL_MD.contains("name: skillz"));
         assert!(SKILL_MD.contains("# Managing skills with skillz"));
+        assert!(SKILL_MD.contains("skillz publish"));
+        assert!(SKILL_MD.contains("skillz update"));
+        assert!(SKILL_MD.contains("add --attach"));
+        assert!(SKILL_MD.contains("skillz remove"));
+        assert!(!SKILL_MD.contains("skillz libcommit"));
+        assert!(!SKILL_MD.contains("skillz fetch "));
+        assert!(!SKILL_MD.contains("skillz promote "));
+        assert!(SKILL_MD.contains("no") && SKILL_MD.contains("libcommit"));
     }
 
     #[test]
