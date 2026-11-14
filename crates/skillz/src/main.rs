@@ -112,19 +112,6 @@ Examples:
         #[arg(long)]
         library: Option<String>,
     },
-    /// Merge a skill's Library Branch Lock into Library main (does not re-Lock the Project)
-    Promote {
-        /// Skill name whose Branch Lock should land on Library main
-        name: String,
-    },
-    /// After promote: point the Project Lock at Library main and refresh the Installation
-    Lock {
-        /// Skill name
-        name: String,
-        /// Re-Lock to Library main and refresh Installation files from main
-        #[arg(long)]
-        main: bool,
-    },
     /// Report Installation Drift against Locks
     #[command(after_help = "\
 Scope (default matches interactive `-i` — current scope only):
@@ -878,6 +865,14 @@ fn run() -> skillz_core::Result<()> {
                         println!("  - {name}");
                     }
                 }
+                println!("pending review:");
+                if report.pending_review.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for name in &report.pending_review {
+                        println!("  - {name}");
+                    }
+                }
             }
             println!("{}", report.message);
             Ok(())
@@ -988,24 +983,6 @@ fn run() -> skillz_core::Result<()> {
             }
             Ok(())
         }
-        Some(Commands::Promote { name }) => {
-            let rev = app.promote_skill(&name)?;
-            println!("promoted `{name}` to library main ({rev})");
-            Ok(())
-        }
-        Some(Commands::Lock { name, main }) => {
-            if !main {
-                return Err(skillz_core::SkillzError::Message(
-                    "only `skillz lock --main` is supported".into(),
-                ));
-            }
-            let lock = app.lock_main(&name)?;
-            println!(
-                "locked `{name}` to main ({})",
-                lock.rev.as_deref().unwrap_or("?")
-            );
-            Ok(())
-        },
         Some(Commands::Drift {
             check,
             project,
@@ -1037,6 +1014,7 @@ fn run() -> skillz_core::Result<()> {
                 return Ok(());
             }
             let user_skills = app.paths().user_skills_dir();
+            let mut hard = false;
             for proj in &report {
                 let label = if proj.project == user_skills {
                     format!("user-global: {}", proj.project.display())
@@ -1052,14 +1030,30 @@ fn run() -> skillz_core::Result<()> {
                     .unwrap_or(0);
                 for item in &proj.items {
                     let reason = match &item.reason {
-                        DriftReason::Unlocked => "unlocked (not in skillz.lock)",
-                        DriftReason::MissingFiles => "missing installation files",
-                        DriftReason::HashMismatch { .. } => "content hash differs from Lock",
+                        DriftReason::Unlocked => "unlocked (not in skillz.lock)".to_string(),
+                        DriftReason::MissingFiles => "missing installation files".into(),
+                        DriftReason::HashMismatch { .. } => {
+                            "content hash differs from Lock".into()
+                        }
+                        DriftReason::PendingReview {
+                            library,
+                            branch,
+                            rev,
+                        } => format!(
+                            "pending review ({library} `{branch}` @{})",
+                            &rev[..rev.len().min(12)]
+                        ),
+                        DriftReason::SquashFallout { recovery, .. } => {
+                            format!("squash fallout — {recovery}")
+                        }
                     };
                     println!("  {:<width$}  {reason}", item.name, width = name_width);
+                    if item.reason.fails_check() {
+                        hard = true;
+                    }
                 }
             }
-            if check {
+            if check && hard {
                 return Err(skillz_core::SkillzError::Message(
                     "drift detected; commit blocked (use --allow-drift or SKILLZ_ALLOW_DRIFT=1)"
                         .into(),

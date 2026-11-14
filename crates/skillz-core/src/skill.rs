@@ -51,6 +51,18 @@ pub enum DriftReason {
     Unlocked,
     MissingFiles,
     HashMismatch { locked: String, actual: String },
+    /// Branch Lock rev is not yet an ancestor of Library main (review in flight).
+    PendingReview {
+        library: String,
+        branch: String,
+        rev: String,
+    },
+    /// Lock rev will never become an ancestor of main (squash/rebase-merge fallout).
+    SquashFallout {
+        library: String,
+        rev: String,
+        recovery: String,
+    },
 }
 
 /// Suggested Catalog Entry for an unlocked Installation.
@@ -92,7 +104,17 @@ impl DriftReason {
             DriftReason::Unlocked => "unlocked",
             DriftReason::MissingFiles => "missing files",
             DriftReason::HashMismatch { .. } => "hash mismatch",
+            DriftReason::PendingReview { .. } => "pending review",
+            DriftReason::SquashFallout { .. } => "squash fallout",
         }
+    }
+
+    /// Soft statuses that must not fail `drift --check`.
+    pub fn fails_check(&self) -> bool {
+        !matches!(
+            self,
+            DriftReason::PendingReview { .. } | DriftReason::SquashFallout { .. }
+        )
     }
 }
 

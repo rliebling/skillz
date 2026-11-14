@@ -153,6 +153,122 @@ pub fn checkout_rev(repo: &Path, rev: &str) -> Result<()> {
     }
 }
 
+/// Fetch from `origin` (or configured remote) so ancestry checks see remote main.
+pub fn fetch_remote(repo: &Path, remote: &str) -> Result<()> {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => {
+            // Best-effort: local-only repos have no origin.
+            let _ = run(repo, &["fetch", remote, "--prune"]);
+            Ok(())
+        }
+        Some(Vcs::Jj) => {
+            let _ = run_jj(repo, &["git", "fetch", "--remote", remote]);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// True if `rev` is an ancestor of Library main (inclusive).
+pub fn is_ancestor_of_main(repo: &Path, rev: &str) -> Result<bool> {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => {
+            let main = git_main_branch(repo)?;
+            let status = Command::new("git")
+                .args(["-C"])
+                .arg(repo)
+                .args(["merge-base", "--is-ancestor", rev, &main])
+                .status()
+                .map_err(|e| SkillzError::Message(format!("git merge-base failed: {e}")))?;
+            Ok(status.success())
+        }
+        Some(Vcs::Jj) => {
+            let main = jj_main_bookmark(repo)?;
+            // `jj log -r 'rev & ::main'` non-empty ⇒ ancestor (or equal).
+            let out = stdout_jj(
+                repo,
+                &[
+                    "log",
+                    "-r",
+                    &format!("{rev} & ::bookmarks({main})"),
+                    "-T",
+                    "commit_id",
+                    "--no-graph",
+                ],
+            )?;
+            Ok(!out.trim().is_empty())
+        }
+        None => Err(SkillzError::Message(
+            "cannot check ancestry without git/jj".into(),
+        )),
+    }
+}
+
+/// Ensure `rev` exists locally; try fetching it from origin when missing.
+pub fn ensure_rev(repo: &Path, rev: &str) -> Result<()> {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => {
+            if run(repo, &["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_ok() {
+                return Ok(());
+            }
+            fetch_remote(repo, "origin")?;
+            if run(repo, &["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_ok() {
+                return Ok(());
+            }
+            // Last resort: fetch the SHA directly.
+            let _ = run(repo, &["fetch", "origin", rev]);
+            if run(repo, &["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_ok() {
+                Ok(())
+            } else {
+                Err(SkillzError::Message(format!(
+                    "Lock rev `{rev}` is not present locally or on origin; fetch the Branch Lock branch or re-publish"
+                )))
+            }
+        }
+        Some(Vcs::Jj) => {
+            fetch_remote(repo, "origin")?;
+            let out = stdout_jj(
+                repo,
+                &["log", "-r", rev, "-T", "commit_id", "--no-graph"],
+            );
+            if out.map(|s| !s.trim().is_empty()).unwrap_or(false) {
+                Ok(())
+            } else {
+                Err(SkillzError::Message(format!(
+                    "Lock rev `{rev}` is not present in the jj repo; fetch or re-publish"
+                )))
+            }
+        }
+        None => Ok(()),
+    }
+}
+
+/// Whether `refs/remotes/origin/<branch>` (or jj remote bookmark) exists.
+pub fn remote_branch_exists(repo: &Path, branch: &str) -> bool {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => run(
+            repo,
+            &["rev-parse", "--verify", &format!("refs/remotes/origin/{branch}")],
+        )
+        .is_ok(),
+        Some(Vcs::Jj) => run_jj(repo, &["bookmark", "list", branch]).is_ok(),
+        None => false,
+    }
+}
+
+/// Whether the branch/bookmark exists locally.
+pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => run(
+            repo,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .is_ok(),
+        Some(Vcs::Jj) => run_jj(repo, &["bookmark", "list", branch]).is_ok(),
+        None => false,
+    }
+}
+
 /// Push a local branch to `remote` (best-effort; caller may soft-fail).
 pub fn push_branch(repo: &Path, branch: &str, remote: &str) -> Result<()> {
     match infer_vcs(repo) {

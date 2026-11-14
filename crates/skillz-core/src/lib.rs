@@ -170,6 +170,8 @@ pub struct StatusReport {
     pub skills_dir: Option<String>,
     pub bindings: Vec<Binding>,
     pub installations: Vec<String>,
+    /// Branch Locks waiting for merge onto Library main (not hard Drift).
+    pub pending_review: Vec<String>,
     pub message: String,
 }
 
@@ -356,16 +358,19 @@ impl App {
                     skills_dir: None,
                     bindings: Vec::new(),
                     installations: Vec::new(),
+                    pending_review: Vec::new(),
                     message: "User scope not initialized (no user.toml)".to_string(),
                 });
             }
             let config = self.load_scope_config()?;
             let lock = self.load_scope_lock()?;
             let installations = lock.installation_names();
+            let pending_review = self.pending_review_names(&lock)?;
             let message = format!(
-                "User scope; {} binding(s); {} installation(s)",
+                "User scope; {} binding(s); {} installation(s); {} pending review",
                 config.bindings.len(),
-                installations.len()
+                installations.len(),
+                pending_review.len()
             );
             return Ok(StatusReport {
                 cwd: self.paths.user_skills_dir(),
@@ -374,6 +379,7 @@ impl App {
                 skills_dir: Some(config.skills_dir),
                 bindings: config.bindings,
                 installations,
+                pending_review,
                 message,
             });
         }
@@ -386,16 +392,19 @@ impl App {
                 skills_dir: None,
                 bindings: Vec::new(),
                 installations: Vec::new(),
+                pending_review: Vec::new(),
                 message: "Not a Managed Project (no .skillz/skillz.toml)".to_string(),
             });
         }
         let config = ProjectConfig::load(&self.paths.cwd)?;
         let lock = self.load_scope_lock()?;
         let installations = lock.installation_names();
+        let pending_review = self.pending_review_names(&lock)?;
         let message = format!(
-            "Managed Project; {} binding(s); {} installation(s)",
+            "Managed Project; {} binding(s); {} installation(s); {} pending review",
             config.bindings.len(),
-            installations.len()
+            installations.len(),
+            pending_review.len()
         );
         Ok(StatusReport {
             cwd: self.paths.cwd.clone(),
@@ -404,8 +413,78 @@ impl App {
             skills_dir: Some(config.skills_dir),
             bindings: config.bindings,
             installations,
+            pending_review,
             message,
         })
+    }
+
+    fn pending_review_names(&self, lock: &ProjectLock) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (name, rec) in &lock.installations {
+            if rec.branch.is_none() {
+                continue;
+            }
+            if let Some(reason) = self.classify_branch_lock(name, rec)? {
+                if matches!(
+                    reason,
+                    DriftReason::PendingReview { .. } | DriftReason::SquashFallout { .. }
+                ) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Classify a Branch Lock against Library main after consulting the remote.
+    fn classify_branch_lock(
+        &self,
+        name: &str,
+        rec: &InstallationLock,
+    ) -> Result<Option<DriftReason>> {
+        let branch = match &rec.branch {
+            Some(b) => b.clone(),
+            None => return Ok(None),
+        };
+        let rev = match &rec.rev {
+            Some(r) => r.clone(),
+            None => {
+                return Ok(Some(DriftReason::PendingReview {
+                    library: rec.library.clone(),
+                    branch,
+                    rev: "(missing rev)".into(),
+                }));
+            }
+        };
+        let registry = self.load_registry()?;
+        let record = registry.libraries.get(&rec.library).ok_or_else(|| {
+            SkillzError::Message(format!(
+                "library `{}` is not in the local registry (needed to check pending review for `{name}`)",
+                rec.library
+            ))
+        })?;
+        vcs_ops::fetch_remote(&record.path, "origin")?;
+        vcs_ops::ensure_rev(&record.path, &rev)?;
+        if vcs_ops::is_ancestor_of_main(&record.path, &rev)? {
+            return Ok(None);
+        }
+        let remote_ok = vcs_ops::remote_branch_exists(&record.path, &branch);
+        let local_ok = vcs_ops::local_branch_exists(&record.path, &branch);
+        if !remote_ok && !local_ok {
+            return Ok(Some(DriftReason::SquashFallout {
+                library: rec.library.clone(),
+                rev: rev.clone(),
+                recovery: format!(
+                    "Lock rev `{rev}` is not an ancestor of main (squash/rebase-merge?). Run `skillz update {name}` to take main tip, or re-`publish` onto a new review branch"
+                ),
+            }));
+        }
+        Ok(Some(DriftReason::PendingReview {
+            library: rec.library.clone(),
+            branch,
+            rev,
+        }))
     }
 
     /// Initialize user-global skills scope (`user.toml` / `user.lock`).
@@ -1443,6 +1522,7 @@ impl App {
         let lock = self.load_scope_lock()?;
         let root = self.scope_skills_root(&config);
         let mut items = Self::drift_items_for(&root, &lock)?;
+        self.append_branch_lock_status(&lock, &mut items)?;
         self.attach_unlocked_suggestions(&mut items)?;
         Ok(items)
     }
@@ -1460,10 +1540,38 @@ impl App {
         let root = project_root.join(&config.skills_dir);
         // Suggestions need App paths; attach only when cwd matches project.
         let mut items = Self::drift_items_for(&root, &lock)?;
+        // Branch-lock pending checks need registry paths from this App.
+        self.append_branch_lock_status(&lock, &mut items)?;
         if self.paths.cwd == project_root {
             self.attach_unlocked_suggestions(&mut items)?;
         }
         Ok(items)
+    }
+
+    fn append_branch_lock_status(
+        &self,
+        lock: &ProjectLock,
+        items: &mut Vec<DriftItem>,
+    ) -> Result<()> {
+        let hard: std::collections::HashSet<String> = items
+            .iter()
+            .filter(|i| i.reason.fails_check())
+            .map(|i| i.name.clone())
+            .collect();
+        for (name, rec) in &lock.installations {
+            if hard.contains(name) {
+                continue;
+            }
+            if let Some(reason) = self.classify_branch_lock(name, rec)? {
+                items.push(DriftItem {
+                    name: name.clone(),
+                    reason,
+                    suggestion: None,
+                });
+            }
+        }
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(())
     }
 
     fn attach_unlocked_suggestions(&self, items: &mut [DriftItem]) -> Result<()> {
@@ -4646,7 +4754,17 @@ mod tests {
             .unwrap();
         assert!(branch_lock.branch.as_deref().unwrap().contains("grilling"));
         assert!(branch_lock.rev.is_some());
-        assert!(fx.app().detect_drift().unwrap().is_empty());
+        let after_branch = fx.app().detect_drift().unwrap();
+        assert!(
+            after_branch.iter().all(|d| !d.reason.fails_check()),
+            "Branch Lock should not be hard Drift: {after_branch:?}"
+        );
+        assert!(
+            after_branch
+                .iter()
+                .any(|d| matches!(d.reason, DriftReason::PendingReview { .. })),
+            "expected pending review: {after_branch:?}"
+        );
 
         let main_rev = fx.app().promote_skill("grilling").unwrap();
         assert!(!main_rev.is_empty());
@@ -5343,6 +5461,110 @@ exit 1
         assert_eq!(up.skills[0].kind, EntryKind::Upstream);
         let meta = LibraryMeta::load(&lib).unwrap();
         assert!(meta.upstream.iter().any(|e| e.name == "upskill"));
+    }
+
+    #[test]
+    fn pending_review_visible_but_check_soft_and_squash_message() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("team");
+        fx.app().library_init(&lib, "team", false).unwrap();
+        let mut meta = LibraryMeta::load(&lib).unwrap();
+        meta.contribution = Contribution::Review;
+        meta.save(&lib).unwrap();
+        vcs_ops::init_git_repo(&lib).unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "commit", "-m", "skeleton"])
+            .status()
+            .unwrap();
+        fx.app()
+            .project_init(&["team".into()], None)
+            .unwrap();
+        fx.app()
+            .skill_new_with_local("pending", &[], true)
+            .unwrap();
+        let report = fx
+            .app()
+            .publish_with_options(
+                &["pending".into()],
+                "team",
+                &PublishOptions {
+                    no_push: true,
+                    no_pr: true,
+                    ..PublishOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(report.branch.is_some());
+
+        let status = fx.app().status().unwrap();
+        assert!(
+            status.pending_review.iter().any(|n| n == "pending"),
+            "{:?}",
+            status.pending_review
+        );
+
+        let drift = fx.app().detect_drift().unwrap();
+        assert!(
+            drift.iter().any(|d| {
+                d.name == "pending"
+                    && matches!(d.reason, DriftReason::PendingReview { .. })
+                    && !d.reason.fails_check()
+            }),
+            "{drift:?}"
+        );
+        // Pending-only must not count as hard Drift for --check.
+        assert!(
+            !drift.iter().any(|d| d.reason.fails_check()),
+            "pending-only should be soft: {drift:?}"
+        );
+
+        // Squash fallout: delete the review branch so neither local nor remote exists.
+        let branch = report.branch.clone().unwrap();
+        let rev = report.rev.clone();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "checkout", "main"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "branch", "-D", &branch])
+            .status()
+            .unwrap();
+        // Keep Lock pointing at orphaned rev.
+        let mut lock = fx.app().load_scope_lock().unwrap();
+        let rec = lock.installations.get_mut("pending").unwrap();
+        rec.branch = Some(branch);
+        rec.rev = Some(rev);
+        fx.app().save_scope_lock(&lock).unwrap();
+
+        let drift = fx.app().detect_drift().unwrap();
+        let squash = drift
+            .iter()
+            .find(|d| d.name == "pending")
+            .expect("squash item");
+        match &squash.reason {
+            DriftReason::SquashFallout { recovery, .. } => {
+                assert!(recovery.contains("update") || recovery.contains("publish"), "{recovery}");
+                assert!(!squash.reason.fails_check());
+            }
+            other => panic!("expected SquashFallout, got {other:?}"),
+        }
+
+        // Missing Lock SHA errors clearly after remote consult.
+        let mut lock = fx.app().load_scope_lock().unwrap();
+        lock.installations.get_mut("pending").unwrap().rev =
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());
+        lock.installations.get_mut("pending").unwrap().branch =
+            Some("skillz/missing".into());
+        fx.app().save_scope_lock(&lock).unwrap();
+        let err = fx.app().detect_drift().unwrap_err();
+        assert!(
+            err.to_string().contains("not present") || err.to_string().contains("deadbeef"),
+            "{err}"
+        );
     }
 
     #[test]
