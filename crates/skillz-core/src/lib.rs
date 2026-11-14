@@ -579,11 +579,25 @@ impl App {
         ProjectConfig::load(&self.paths.cwd)
     }
 
-    /// Scaffold a new Authored skill in the Project skills dir (Drift until libcommit).
+    /// Scaffold a new Authored skill in the Project skills dir (Unlocked until managed).
     pub fn skill_new(&self, name: &str, tags: &[String]) -> Result<PathBuf> {
+        self.skill_new_with_local(name, tags, false)
+    }
+
+    /// Scaffold a skill; with `local`, mark Local authored membership immediately.
+    pub fn skill_new_with_local(
+        &self,
+        name: &str,
+        tags: &[String],
+        local: bool,
+    ) -> Result<PathBuf> {
         let config = self.load_scope_config()?;
         let root = self.scope_skills_root(&config);
-        skill::scaffold_skill(&root, name, tags)
+        let path = skill::scaffold_skill(&root, name, tags)?;
+        if local {
+            self.set_local_authored(name)?;
+        }
+        Ok(path)
     }
 
     /// Remove a skill Installation + Lock from the current scope (Library untouched).
@@ -2130,10 +2144,11 @@ impl App {
         Ok((config, record.path.clone()))
     }
 
-    /// Fetch an Upstream skill into the Project skills dir (Drift until libcommit).
+    /// Stage an Upstream skill into the Project skills dir (Unlocked until managed).
     ///
-    /// `source` is a filesystem path or `github:owner/repo…`. Optional `skill_name`
-    /// enables nested name lookup (`skillz fetch github:owner/repo NAME`).
+    /// `source` is a filesystem path, `github:owner/repo…`, or `cmd:…`. Optional
+    /// `skill_name` enables nested name lookup / cmd install name
+    /// (`skillz add --source github:owner/repo NAME`).
     pub fn fetch_skill(
         &self,
         source: &str,
@@ -2147,6 +2162,25 @@ impl App {
                 skills_root.display()
             ))
         })?;
+
+        if source.starts_with("cmd:") {
+            let name = skill_name.ok_or_else(|| {
+                SkillzError::Message(
+                    "`add --source cmd:…` requires a skill NAME".into(),
+                )
+            })?;
+            skill::validate_skill_name(name)?;
+            let dest = skill::skill_dir(&skills_root, name);
+            let mut parsed = source::CmdSource::parse(source)?;
+            let version = parsed.validate_install_and_probe(&dest, name)?;
+            parsed = parsed.with_rev(version);
+            let pinned = parsed.render();
+            let sidecar = dest.join(".skillz-source");
+            std::fs::write(&sidecar, &pinned).map_err(|e| {
+                SkillzError::Message(format!("failed to write {}: {e}", sidecar.display()))
+            })?;
+            return Ok((dest, Some(pinned)));
+        }
 
         if source.starts_with("github:") {
             let parsed = source::GithubSource::parse(source)?;
@@ -2180,6 +2214,36 @@ impl App {
             let dest = fetch::stage_skill(&skills_root, &skill_path, skill_name)?;
             Ok((dest, None))
         }
+    }
+
+    /// `add --source`: stage into skills_dir; with `local`, mark Local+source.
+    ///
+    /// Without `local`, the skill stays Unlocked (no Installation Lock).
+    pub fn add_from_source(
+        &self,
+        source: &str,
+        skill_name: Option<&str>,
+        local: bool,
+    ) -> Result<(PathBuf, Option<String>)> {
+        let (dest, pinned) = self.fetch_skill(source, skill_name)?;
+        if local {
+            let name = dest
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| {
+                    SkillzError::Message(format!(
+                        "staged skill path has non-utf8 name: {}",
+                        dest.display()
+                    ))
+                })?;
+            let provenance = pinned.as_deref().ok_or_else(|| {
+                SkillzError::Message(
+                    "`add --source … --local` requires `github:` or `cmd:` provenance (filesystem path staging cannot use --local; use `new --local` for Local authored)".into(),
+                )
+            })?;
+            self.set_local_source(name, provenance)?;
+        }
+        Ok((dest, pinned))
     }
 
     /// Formalize a tested Installation into a writable Library as an Owned Entry.
@@ -4184,7 +4248,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_local_nested_then_libcommit_upstream() {
+    fn add_from_source_stages_unlocked_and_local_variants() {
         let fx = Fixture::new();
         fx.app()
             .library_init(&fx.libs_dir.join("personal"), "personal", false)
@@ -4193,7 +4257,7 @@ mod tests {
             .project_init(&["personal".into()], None)
             .unwrap();
 
-        // Nested "Pocock-style" layout on disk.
+        // Nested layout on disk → stage without --local → Unlocked.
         let upstream_root = fx.libs_dir.join("upstream-repo");
         let nested = upstream_root.join("skills").join("ecto-thinking");
         fs::create_dir_all(&nested).unwrap();
@@ -4205,13 +4269,53 @@ mod tests {
 
         let (dest, _) = fx
             .app()
-            .fetch_skill(upstream_root.to_str().unwrap(), Some("ecto-thinking"))
+            .add_from_source(upstream_root.to_str().unwrap(), Some("ecto-thinking"), false)
             .unwrap();
         assert!(dest.join("SKILL.md").is_file());
         let drift = fx.app().detect_drift().unwrap();
-        assert!(drift.iter().any(|d| d.name == "ecto-thinking"));
+        assert!(
+            drift.iter().any(|d| {
+                d.name == "ecto-thinking" && d.reason == DriftReason::Unlocked
+            }),
+            "{drift:?}"
+        );
+        assert!(fx
+            .app()
+            .load_scope_lock()
+            .unwrap()
+            .installations
+            .get("ecto-thinking")
+            .is_none());
 
-        let lock = fx
+        // Path staging cannot use --local (needs github:/cmd: provenance).
+        let err = fx
+            .app()
+            .add_from_source(upstream_root.to_str().unwrap(), Some("ecto-thinking"), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("--local"), "{err}");
+
+        // new without --local → Unlocked; with --local → Local authored.
+        fx.app().skill_new("plain-new", &[]).unwrap();
+        assert_eq!(
+            fx.app().detect_drift().unwrap().iter().find(|d| d.name == "plain-new").unwrap().reason,
+            DriftReason::Unlocked
+        );
+        fx.app()
+            .skill_new_with_local("local-new", &[], true)
+            .unwrap();
+        let lock = fx.app().load_scope_lock().unwrap();
+        let rec = lock.installations.get("local-new").unwrap();
+        assert_eq!(rec.entry_kind, EntryKind::Local);
+        assert_eq!(rec.library, LOCAL_LIBRARY);
+        assert!(!fx
+            .app()
+            .detect_drift()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "local-new"));
+
+        // Still formalize staged skill as Upstream Catalog Entry.
+        let up_lock = fx
             .app()
             .libcommit_upstream(
                 "ecto-thinking",
@@ -4220,19 +4324,56 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(lock.entry_kind, EntryKind::Upstream);
+        assert_eq!(up_lock.entry_kind, EntryKind::Upstream);
         assert_eq!(
-            lock.source.as_deref(),
+            up_lock.source.as_deref(),
             Some("github:acme/skills/skills/ecto-thinking@deadbeef")
         );
         let meta = LibraryMeta::load(&fx.libs_dir.join("personal")).unwrap();
         assert_eq!(meta.upstream.len(), 1);
-        assert!(fx.app().detect_drift().unwrap().is_empty());
-        // Upstream is a reference — not vendored under Library skills/.
         assert!(!fx
             .libs_dir
             .join("personal/skills/ecto-thinking")
             .exists());
+    }
+
+    #[test]
+    fn add_from_source_cmd_with_local() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        let bin_dir = fx.libs_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("fake-tool");
+        write_fake_tool(&bin);
+        let source = format!(
+            "cmd:{} skill install --dir {{dir}}",
+            bin.display()
+        );
+
+        let (dest, pinned) = fx
+            .app()
+            .add_from_source(&source, Some("fake-skill"), true)
+            .unwrap();
+        assert!(dest.join("SKILL.md").is_file());
+        let pinned = pinned.expect("cmd pin");
+        assert!(pinned.contains('@'), "{pinned}");
+        let lock = fx.app().load_scope_lock().unwrap();
+        let rec = lock.installations.get("fake-skill").unwrap();
+        assert_eq!(rec.entry_kind, EntryKind::Local);
+        assert_eq!(rec.library, LOCAL_LIBRARY);
+        assert_eq!(rec.source.as_deref(), Some(pinned.as_str()));
+        assert!(!fx
+            .app()
+            .detect_drift()
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "fake-skill"));
     }
 
     fn write_fake_tool(bin: &Path) {

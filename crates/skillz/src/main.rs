@@ -38,22 +38,25 @@ enum Commands {
     /// Show Managed Project bindings and installations
     Status,
     /// Scaffold a new Authored skill in the Project skills dir
+    #[command(after_help = "\
+Notes:
+  Without --local the skill stays Unlocked until migrate / Local / add --attach / publish.
+  With --local, marks Local authored membership immediately.
+
+Examples:
+  skillz new grilling
+  skillz new grilling --local
+  skillz new grilling -t elixir -t phoenix --local
+")]
     New {
         /// Skill name (directory under skills_dir)
         name: String,
         /// Optional tags written into SKILL.md frontmatter
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
-    },
-    /// Fetch an Upstream skill into the Project skills dir (Drift until libcommit)
-    Fetch {
-        /// Filesystem path or `github:owner/repo[/path][@rev]`
-        source: String,
-        /// Skill name for nested lookup (`github:owner/repo NAME`)
-        skill_name: Option<String>,
-        /// Also fetch detected sibling dependencies when resolvable locally (best-effort)
+        /// Mark Local authored membership immediately (otherwise Unlocked)
         #[arg(long)]
-        with_deps: bool,
+        local: bool,
     },
     /// Formalize a tested Installation into a Library Catalog Entry + Lock
     #[command(after_help = "\
@@ -223,22 +226,27 @@ Examples:
         #[arg(long)]
         catalog: bool,
     },
-    /// Install or link Catalog Entries into this Managed Project
+    /// Install, link, or stage skills into this Managed Project
     #[command(after_help = "\
 Notes:
   Plain `add NAME` installs from a bound Catalog when the skill dir is missing.
   If the skill dir already exists, it errors — use --attach or --attach --from-library.
   `add NAME --attach` Locks an on-disk skill to a Catalog Entry (does not publish).
   `add NAME --attach --from-library` replaces Installation files from the Catalog, then Locks.
-  There is no standalone `attach` command.
+  `add --source SOURCE [NAME]` stages github/path/cmd into skills_dir (replaces `fetch`).
+  With `--source --local`, marks Local+source (github:/cmd: only). Without --local, Unlocked.
+  There is no standalone `attach` or `fetch` command.
 
 Examples:
   skillz add grilling
   skillz add grilling --attach -l personal
   skillz add grilling --attach --from-library -l personal
+  skillz add --source github:owner/repo/skills/foo@abc1234
+  skillz add --source ./vendor/skills ecto-thinking
+  skillz add --source 'cmd:tool skill install --dir {dir}' my-skill --local
 ")]
     Add {
-        /// Skill name(s) to install (omit when using --tag or -i)
+        /// Skill name(s) to install (omit when using --tag, -i, or --source alone)
         #[arg(value_name = "NAME")]
         names: Vec<String>,
         /// Restrict / disambiguate Library Binding
@@ -247,6 +255,12 @@ Examples:
         /// Add all Catalog Entries matching tags (AND)
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
+        /// Stage from filesystem path, `github:…`, or `cmd:…` (not Catalog install)
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
+        /// With --source: Local+source membership; with catalog add, not applicable
+        #[arg(long)]
+        local: bool,
         /// Lock an on-disk skill to a Catalog Entry (no Library write)
         #[arg(long)]
         attach: bool,
@@ -871,54 +885,14 @@ fn run() -> skillz_core::Result<()> {
             println!("{}", report.message);
             Ok(())
         }
-        Some(Commands::New { name, tags }) => {
-            let path = app.skill_new(&name, &tags)?;
+        Some(Commands::New { name, tags, local }) => {
+            let path = app.skill_new_with_local(&name, &tags, local)?;
             println!("scaffolded skill at {}", path.display());
-            println!("(Drift until `skillz libcommit`)");
-            Ok(())
-        }
-        Some(Commands::Fetch {
-            source,
-            skill_name,
-            with_deps,
-        }) => {
-            let (dest, pinned) = app.fetch_skill(&source, skill_name.as_deref())?;
-            println!("fetched skill into {}", dest.display());
-            if let Some(src) = pinned {
-                println!("source: {src}");
+            if local {
+                println!("(Local authored)");
+            } else {
+                println!("(Unlocked until migrate / Local / `add --attach` / publish)");
             }
-            // Best-effort sibling warnings / local with-deps from same tree root.
-            if let Some(parent) = dest.parent() {
-                let known = skillz_core::deps::list_skill_names(parent).unwrap_or_default();
-                let present = known.clone();
-                let missing = app
-                    .sibling_dep_warnings(&dest, &known, &present)
-                    .unwrap_or_default();
-                if !missing.is_empty() {
-                    eprintln!(
-                        "warning: possible sibling deps not present: {} (best-effort)",
-                        missing.join(", ")
-                    );
-                }
-                if with_deps {
-                    let root = if source.starts_with("github:") {
-                        None
-                    } else {
-                        Some(std::path::PathBuf::from(&source))
-                    };
-                    if let Some(root) = root {
-                        for dep in missing {
-                            if app
-                                .fetch_skill(root.to_str().unwrap_or(""), Some(&dep))
-                                .is_ok()
-                            {
-                                println!("fetched dependency `{dep}`");
-                            }
-                        }
-                    }
-                }
-            }
-            println!("(Drift until `skillz libcommit`)");
             Ok(())
         }
         Some(Commands::Libcommit {
@@ -1224,6 +1198,8 @@ fn run() -> skillz_core::Result<()> {
             names,
             library,
             tags,
+            source,
+            local,
             attach,
             from_library,
             with_deps,
@@ -1240,10 +1216,63 @@ fn run() -> skillz_core::Result<()> {
                     "`--from-library` requires `--attach`".into(),
                 ));
             }
+            if local && source.is_none() {
+                return Err(skillz_core::SkillzError::Message(
+                    "`add --local` requires `--source` (or use `skillz new NAME --local`)".into(),
+                ));
+            }
+            if source.is_some()
+                && (attach || from_library || interactive || !tags.is_empty() || library.is_some())
+            {
+                return Err(skillz_core::SkillzError::Message(
+                    "`add --source` cannot combine with --attach / --from-library / --tag / -i / --library".into(),
+                ));
+            }
             if attach && (interactive || !tags.is_empty()) {
                 return Err(skillz_core::SkillzError::Message(
                     "`add --attach` takes skill name(s); omit -i / --tag".into(),
                 ));
+            }
+            if let Some(source) = source.as_deref() {
+                if names.len() > 1 {
+                    return Err(skillz_core::SkillzError::Message(
+                        "`add --source` takes at most one skill NAME".into(),
+                    ));
+                }
+                let skill_name = names.first().map(String::as_str);
+                let (dest, pinned) = app.add_from_source(source, skill_name, local)?;
+                println!("staged skill into {}", dest.display());
+                if let Some(src) = &pinned {
+                    println!("source: {src}");
+                }
+                if let Some(parent) = dest.parent() {
+                    let known = skillz_core::deps::list_skill_names(parent).unwrap_or_default();
+                    let present = known.clone();
+                    let missing = app
+                        .sibling_dep_warnings(&dest, &known, &present)
+                        .unwrap_or_default();
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "warning: possible sibling deps not present: {} (best-effort)",
+                            missing.join(", ")
+                        );
+                    }
+                    if with_deps && !source.starts_with("github:") && !source.starts_with("cmd:") {
+                        let root = std::path::PathBuf::from(source);
+                        for dep in missing {
+                            if app.add_from_source(root.to_str().unwrap_or(""), Some(&dep), local).is_ok()
+                            {
+                                println!("staged dependency `{dep}`");
+                            }
+                        }
+                    }
+                }
+                if local {
+                    println!("(Local + source)");
+                } else {
+                    println!("(Unlocked until migrate / Local / `add --attach` / publish)");
+                }
+                return Ok(());
             }
             let deps_policy = if with_deps {
                 DepsPolicy::Always
