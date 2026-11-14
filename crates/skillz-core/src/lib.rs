@@ -1852,22 +1852,37 @@ impl App {
     }
 
     /// Install a Catalog Entry into the Managed Project (copy + Lock).
+    ///
+    /// Errors if the skill directory already exists — use
+    /// [`Self::add_skill_with_deps`] with `attach` / `from_library` to link or replace.
     pub fn add_skill(
         &self,
         name: &str,
         library_filter: Option<&str>,
     ) -> Result<(AddOutcome, Option<String>)> {
-        self.add_skill_with_deps(name, library_filter, false)
+        self.add_skill_with_deps(name, library_filter, false, false, false)
             .map(|(outcome, warn, _)| (outcome, warn))
     }
 
+    /// Install, attach, or replace-from-Catalog a skill.
+    ///
+    /// - Plain install (`attach=false`): skill dir must be missing.
+    /// - `--attach`: Lock on-disk skill to Catalog Entry (no Library write); clears Local.
+    /// - `--attach --from-library`: overwrite Installation from Catalog, then Lock.
     pub fn add_skill_with_deps(
         &self,
         name: &str,
         library_filter: Option<&str>,
         with_deps: bool,
+        attach: bool,
+        from_library: bool,
     ) -> Result<(AddOutcome, Option<String>, Vec<String>)> {
         skill::validate_skill_name(name)?;
+        if from_library && !attach {
+            return Err(SkillzError::Message(
+                "`--from-library` requires `--attach` (link an on-disk skill, optionally replacing files from the Catalog)".into(),
+            ));
+        }
         let config = self.load_scope_config()?;
         let rows = self.list_skills(library_filter, &[], false, false)?;
         let matches: Vec<_> = rows.into_iter().filter(|r| r.entry.name == name).collect();
@@ -1896,31 +1911,15 @@ impl App {
         };
 
         let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
-        let outcome = if row.entry.kind == EntryKind::Upstream {
+        let outcome = if attach {
+            self.add_attach_skill(&config, name, &row.entry, from_library)?
+        } else if dest.exists() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` already exists at {}; use `skillz add {name} --attach` to Lock the on-disk skill to a Catalog Entry, or `skillz add {name} --attach --from-library` to replace it from the Catalog",
+                dest.display()
+            )));
+        } else if row.entry.kind == EntryKind::Upstream {
             self.add_upstream_installation(&config, name, &row.entry)?
-        } else if dest.join("SKILL.md").is_file() {
-            let existing = skill::content_hash(&dest)?;
-            if existing == row.entry.content_hash {
-                let mut lock = self.load_scope_lock()?;
-                let install = InstallationLock {
-                    library: row.entry.library.clone(),
-                    entry_kind: EntryKind::Owned,
-                    content_hash: row.entry.content_hash.clone(),
-                    source: None,
-                    rev: None,
-                    branch: None,
-                    overlay_from_library: None,
-                    overlay_from_entry: None,
-                };
-                lock.installations
-                    .insert(name.to_string(), install.clone());
-                self.save_scope_lock(&lock)?;
-                AddOutcome::AlreadyPresent(install)
-            } else {
-                skill::copy_skill_tree(&row.entry.skill_path, &dest)?;
-                let install = self.write_owned_lock(name, &row.entry)?;
-                AddOutcome::Refreshed(install)
-            }
         } else {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -1955,9 +1954,13 @@ impl App {
         let mut pulled = Vec::new();
         if with_deps {
             for dep in missing.clone() {
-                if let Ok((dep_outcome, _, nested)) =
-                    self.add_skill_with_deps(&dep, library_filter.or(Some(&row.entry.library)), true)
-                {
+                if let Ok((dep_outcome, _, nested)) = self.add_skill_with_deps(
+                    &dep,
+                    library_filter.or(Some(&row.entry.library)),
+                    true,
+                    false,
+                    false,
+                ) {
                     let _ = dep_outcome;
                     pulled.push(dep);
                     pulled.extend(nested);
@@ -1966,6 +1969,42 @@ impl App {
             missing.retain(|m| !pulled.iter().any(|p| p == m));
         }
         Ok((outcome, warn, missing))
+    }
+
+    /// `--attach` / `--attach --from-library`: Lock on-disk skill; never write Library.
+    fn add_attach_skill(
+        &self,
+        config: &ProjectConfig,
+        name: &str,
+        entry: &CatalogEntry,
+        from_library: bool,
+    ) -> Result<AddOutcome> {
+        let dest = skill::skill_dir(&self.scope_skills_root(config), name);
+        if from_library {
+            if entry.kind == EntryKind::Upstream {
+                return self.add_upstream_installation(config, name, entry);
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    SkillzError::Message(format!(
+                        "failed to create {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            skill::copy_skill_tree(&entry.skill_path, &dest)?;
+            let install = self.write_owned_lock(name, entry)?;
+            return Ok(AddOutcome::Installed(install));
+        }
+        if !dest.join("SKILL.md").is_file() {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` not found under {}; `--attach` requires an on-disk skill (or pass `--from-library` to take Catalog files)",
+                dest.display()
+            )));
+        }
+        // Lock to Catalog Entry using on-disk hash; clears Local membership.
+        let install = self.attach_to_catalog(name, &entry.library, entry.kind)?;
+        Ok(AddOutcome::Installed(install))
     }
 
     /// Add every Catalog Entry matching tag filters.
@@ -4290,7 +4329,7 @@ exit 1
             .unwrap();
         let (outcome, _, _) = fx
             .app_at(&other)
-            .add_skill_with_deps("fake-skill", None, false)
+            .add_skill_with_deps("fake-skill", None, false, false, false)
             .unwrap();
         match outcome {
             AddOutcome::Installed(l) | AddOutcome::Refreshed(l) | AddOutcome::AlreadyPresent(l) => {
@@ -4397,9 +4436,92 @@ exit 1
             .join(".agents/skills/demo-skill/SKILL.md")
             .is_file());
 
-        // Already present → no-op/refresh.
-        let (again, _) = fx.app().add_skill("demo-skill", None).unwrap();
-        assert!(matches!(again, AddOutcome::AlreadyPresent(_)));
+        // Skill dir already exists → error with attach / from-library hint.
+        let err = fx.app().add_skill("demo-skill", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already exists"), "{msg}");
+        assert!(msg.contains("--attach"), "{msg}");
+        assert!(msg.contains("--from-library"), "{msg}");
+    }
+
+    #[test]
+    fn add_attach_and_from_library() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app().skill_new("demo", &[]).unwrap();
+        fx.app()
+            .libcommit_authored("demo", "personal", &[])
+            .unwrap();
+
+        let project_skill = fx.project_dir.join(".agents/skills/demo");
+        let lib_skill = fx.libs_dir.join("personal/skills/demo");
+        let lib_before = fs::read_to_string(lib_skill.join("SKILL.md")).unwrap();
+
+        // Local membership then attach: Lock to Catalog, clear Local, leave Library untouched.
+        fx.app().set_local_authored("demo").unwrap();
+        assert_eq!(
+            fx.app()
+                .load_scope_lock()
+                .unwrap()
+                .installations
+                .get("demo")
+                .unwrap()
+                .entry_kind,
+            EntryKind::Local
+        );
+        // Divergent on-disk content vs Catalog.
+        fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: local edit\n---\n# local\n",
+        )
+        .unwrap();
+        let local_hash = skill::content_hash(&project_skill).unwrap();
+
+        let (attached, _) = fx
+            .app()
+            .add_skill_with_deps("demo", Some("personal"), false, true, false)
+            .map(|(o, w, _)| (o, w))
+            .unwrap();
+        assert!(matches!(attached, AddOutcome::Installed(_)));
+        let lock = fx.app().load_scope_lock().unwrap();
+        let rec = lock.installations.get("demo").unwrap();
+        assert_eq!(rec.library, "personal");
+        assert_eq!(rec.entry_kind, EntryKind::Owned);
+        assert_eq!(rec.content_hash, local_hash);
+        assert_ne!(rec.library, LOCAL_LIBRARY);
+        assert_eq!(
+            fs::read_to_string(lib_skill.join("SKILL.md")).unwrap(),
+            lib_before,
+            "attach must not write Project tree into Library"
+        );
+        assert!(
+            fs::read_to_string(project_skill.join("SKILL.md"))
+                .unwrap()
+                .contains("local edit"),
+            "attach without --from-library keeps on-disk files"
+        );
+
+        // --attach --from-library replaces Installation from Catalog.
+        let (replaced, _) = fx
+            .app()
+            .add_skill_with_deps("demo", Some("personal"), false, true, true)
+            .map(|(o, w, _)| (o, w))
+            .unwrap();
+        assert!(matches!(replaced, AddOutcome::Installed(_)));
+        let after = fs::read_to_string(project_skill.join("SKILL.md")).unwrap();
+        assert_eq!(after, lib_before);
+        let lock = fx.app().load_scope_lock().unwrap();
+        let rec = lock.installations.get("demo").unwrap();
+        assert_eq!(rec.entry_kind, EntryKind::Owned);
+        assert_eq!(
+            rec.content_hash,
+            skill::content_hash(&lib_skill).unwrap()
+        );
     }
 
     #[test]

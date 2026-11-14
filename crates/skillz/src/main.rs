@@ -223,7 +223,20 @@ Examples:
         #[arg(long)]
         catalog: bool,
     },
-    /// Install Catalog Entries into this Managed Project
+    /// Install or link Catalog Entries into this Managed Project
+    #[command(after_help = "\
+Notes:
+  Plain `add NAME` installs from a bound Catalog when the skill dir is missing.
+  If the skill dir already exists, it errors — use --attach or --attach --from-library.
+  `add NAME --attach` Locks an on-disk skill to a Catalog Entry (does not publish).
+  `add NAME --attach --from-library` replaces Installation files from the Catalog, then Locks.
+  There is no standalone `attach` command.
+
+Examples:
+  skillz add grilling
+  skillz add grilling --attach -l personal
+  skillz add grilling --attach --from-library -l personal
+")]
     Add {
         /// Skill name(s) to install (omit when using --tag or -i)
         #[arg(value_name = "NAME")]
@@ -234,6 +247,12 @@ Examples:
         /// Add all Catalog Entries matching tags (AND)
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
+        /// Lock an on-disk skill to a Catalog Entry (no Library write)
+        #[arg(long)]
+        attach: bool,
+        /// With --attach: replace Installation files from the Catalog
+        #[arg(long)]
+        from_library: bool,
         /// Automatically add detected sibling dependencies (no prompt)
         #[arg(long)]
         with_deps: bool,
@@ -645,7 +664,7 @@ fn resolve_missing_deps(
         return Ok(());
     }
     for dep in &missing {
-        match app.add_skill_with_deps(dep, library, true) {
+        match app.add_skill_with_deps(dep, library, true, false, false) {
             Ok((outcome, warn, still_missing)) => {
                 if let Some(w) = warn {
                     eprintln!("warning: {w}");
@@ -1205,6 +1224,8 @@ fn run() -> skillz_core::Result<()> {
             names,
             library,
             tags,
+            attach,
+            from_library,
             with_deps,
             no_deps,
             interactive,
@@ -1212,6 +1233,16 @@ fn run() -> skillz_core::Result<()> {
             if with_deps && no_deps {
                 return Err(skillz_core::SkillzError::Message(
                     "pass only one of --with-deps or --no-deps".into(),
+                ));
+            }
+            if from_library && !attach {
+                return Err(skillz_core::SkillzError::Message(
+                    "`--from-library` requires `--attach`".into(),
+                ));
+            }
+            if attach && (interactive || !tags.is_empty()) {
+                return Err(skillz_core::SkillzError::Message(
+                    "`add --attach` takes skill name(s); omit -i / --tag".into(),
                 ));
             }
             let deps_policy = if with_deps {
@@ -1276,8 +1307,13 @@ fn run() -> skillz_core::Result<()> {
                 ));
             }
             for name in &names {
-                let (outcome, warn, _) =
-                    app.add_skill_with_deps(name, library.as_deref(), false)?;
+                let (outcome, warn, _) = app.add_skill_with_deps(
+                    name,
+                    library.as_deref(),
+                    false,
+                    attach,
+                    from_library,
+                )?;
                 if let Some(w) = warn {
                     eprintln!("warning: {w}");
                 }
