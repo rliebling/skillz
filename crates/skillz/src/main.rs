@@ -58,6 +58,22 @@ Examples:
         #[arg(long)]
         local: bool,
     },
+    /// Refresh Installation + Lock from Library Catalog main tip
+    #[command(after_help = "\
+Notes:
+  Library → Project refresh (remote-aware main tip). Distinct from:
+    publish -u   Project → Library update
+    add --attach link on-disk skill without taking Catalog files as day-to-day refresh
+
+Examples:
+  skillz update grilling
+  skillz update grilling domain-modeling
+")]
+    Update {
+        /// Skill name(s) to refresh from their Library Lock
+        #[arg(value_name = "NAME", required = true)]
+        names: Vec<String>,
+    },
     /// Publish managed skills to a Library Catalog (Project → Library)
     #[command(after_help = "\
 Notes:
@@ -884,6 +900,17 @@ fn run() -> skillz_core::Result<()> {
                 println!("(Local authored)");
             } else {
                 println!("(Unlocked until migrate / Local / `add --attach` / publish)");
+            }
+            Ok(())
+        }
+        Some(Commands::Update { names }) => {
+            let locks = app.update_skills(&names)?;
+            for (name, lock) in names.iter().zip(locks.iter()) {
+                println!(
+                    "updated `{name}` from library `{}` main @{}",
+                    lock.library,
+                    lock.rev.as_deref().unwrap_or("?")
+                );
             }
             Ok(())
         }

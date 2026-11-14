@@ -153,6 +153,29 @@ pub fn checkout_rev(repo: &Path, rev: &str) -> Result<()> {
     }
 }
 
+/// Check out Library main tip (after fetch) so Catalog files match remote.
+pub fn checkout_main(repo: &Path) -> Result<()> {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => {
+            let main = git_main_branch(repo)?;
+            // Prefer remote-tracking tip when present.
+            let remote_main = format!("origin/{main}");
+            if run(repo, &["rev-parse", "--verify", &remote_main]).is_ok() {
+                run(repo, &["checkout", "-B", &main, &remote_main])?;
+            } else {
+                run(repo, &["checkout", &main])?;
+            }
+            Ok(())
+        }
+        Some(Vcs::Jj) => {
+            let main = jj_main_bookmark(repo)?;
+            run_jj(repo, &["new", "-r", &format!("bookmarks({main})")])?;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
 /// Fetch from `origin` (or configured remote) so ancestry checks see remote main.
 pub fn fetch_remote(repo: &Path, remote: &str) -> Result<()> {
     match infer_vcs(repo) {

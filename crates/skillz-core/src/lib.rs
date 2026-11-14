@@ -3022,13 +3022,23 @@ impl App {
         vcs_ops::promote_branch_to_main(&record.path, &branch)
     }
 
-    /// After promote, re-Lock to Library main and refresh the Installation.
-    pub fn lock_main(&self, name: &str) -> Result<InstallationLock> {
+    /// Refresh Installation + Lock from Library Catalog main tip (remote-aware).
+    ///
+    /// Distinct from `publish -u` (Project → Library) and `add --attach` (link without refresh).
+    pub fn update_skill(&self, name: &str) -> Result<InstallationLock> {
+        skill::validate_skill_name(name)?;
         let config = self.load_scope_config()?;
         let mut lock = self.load_scope_lock()?;
         let install = lock.installations.get(name).cloned().ok_or_else(|| {
-            SkillzError::Message(format!("skill `{name}` is not locked"))
+            SkillzError::Message(format!(
+                "skill `{name}` is not Library-managed; `update` refreshes from Catalog main (use `add --attach` or `publish` first)"
+            ))
         })?;
+        if install.entry_kind == EntryKind::Local {
+            return Err(SkillzError::Message(format!(
+                "skill `{name}` is Local; `update` only refreshes Library-backed Installations"
+            )));
+        }
         let registry = self.load_registry()?;
         let record = registry.libraries.get(&install.library).ok_or_else(|| {
             SkillzError::Message(format!(
@@ -3036,30 +3046,83 @@ impl App {
                 install.library
             ))
         })?;
+        vcs_ops::fetch_remote(&record.path, "origin")?;
+        vcs_ops::checkout_main(&record.path)?;
         let main_rev = vcs_ops::main_rev(&record.path)?;
-        let owned = record.path.join(crate::library::SKILLS_DIR).join(name);
-        if !owned.is_dir() {
-            return Err(SkillzError::Message(format!(
-                "Owned Entry `{name}` missing on Library main at {}",
-                owned.display()
-            )));
-        }
-        let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
-        skill::copy_skill_tree(&owned, &dest)?;
-        let hash = skill::content_hash(&dest)?;
-        let updated = InstallationLock {
-            library: install.library,
-            entry_kind: install.entry_kind,
-            content_hash: hash,
-            source: install.source,
-            rev: Some(main_rev),
-            branch: None,
-            overlay_from_library: install.overlay_from_library,
-            overlay_from_entry: install.overlay_from_entry,
+
+        let updated = match install.entry_kind {
+            EntryKind::Owned => {
+                let owned = record.path.join(crate::library::SKILLS_DIR).join(name);
+                if !owned.is_dir() {
+                    return Err(SkillzError::Message(format!(
+                        "Owned Entry `{name}` missing on Library `{}` main at {}",
+                        install.library,
+                        owned.display()
+                    )));
+                }
+                let dest = skill::skill_dir(&self.scope_skills_root(&config), name);
+                skill::copy_skill_tree(&owned, &dest)?;
+                let hash = skill::content_hash(&dest)?;
+                InstallationLock {
+                    library: install.library,
+                    entry_kind: EntryKind::Owned,
+                    content_hash: hash,
+                    source: install.source,
+                    rev: Some(main_rev),
+                    branch: None,
+                    overlay_from_library: install.overlay_from_library,
+                    overlay_from_entry: install.overlay_from_entry,
+                }
+            }
+            EntryKind::Upstream => {
+                let meta = LibraryMeta::load(&record.path)?;
+                let entry = meta
+                    .upstream
+                    .iter()
+                    .find(|e| e.name == name)
+                    .ok_or_else(|| {
+                        SkillzError::Message(format!(
+                            "Upstream Entry `{name}` missing from library `{}` catalog on main",
+                            install.library
+                        ))
+                    })?;
+                let catalog = CatalogEntry {
+                    name: name.to_string(),
+                    library: install.library.clone(),
+                    library_path: record.path.clone(),
+                    skill_path: PathBuf::new(),
+                    content_hash: String::new(),
+                    kind: EntryKind::Upstream,
+                    source: Some(entry.source.clone()),
+                    tags: entry.tags.clone(),
+                };
+                let outcome = self.add_upstream_installation(&config, name, &catalog)?;
+                let mut refreshed = outcome.lock().clone();
+                refreshed.branch = None;
+                // Keep Upstream source pin; record Library main tip when no source rev.
+                if refreshed.rev.is_none() {
+                    refreshed.rev = Some(main_rev);
+                }
+                refreshed
+            }
+            EntryKind::Local => unreachable!(),
         };
         lock.installations.insert(name.to_string(), updated.clone());
         self.save_scope_lock(&lock)?;
         Ok(updated)
+    }
+
+    pub fn update_skills(&self, names: &[String]) -> Result<Vec<InstallationLock>> {
+        let mut out = Vec::new();
+        for name in names {
+            out.push(self.update_skill(name)?);
+        }
+        Ok(out)
+    }
+
+    /// After promote, re-Lock to Library main and refresh the Installation.
+    pub fn lock_main(&self, name: &str) -> Result<InstallationLock> {
+        self.update_skill(name)
     }
 
     /// Formalize a fetched Installation as an Upstream Catalog Entry + Lock.
@@ -5461,6 +5524,77 @@ exit 1
         assert_eq!(up.skills[0].kind, EntryKind::Upstream);
         let meta = LibraryMeta::load(&lib).unwrap();
         assert!(meta.upstream.iter().any(|e| e.name == "upskill"));
+    }
+
+    #[test]
+    fn update_refreshes_from_main_tip_after_pending_clears() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal", false).unwrap();
+        vcs_ops::init_git_repo(&lib).unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "add", "."])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "commit", "-m", "skeleton"])
+            .status()
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+        fx.app()
+            .skill_new_with_local("demo", &[], true)
+            .unwrap();
+        // Direct publish to main.
+        let mut meta = LibraryMeta::load(&lib).unwrap();
+        meta.contribution = Contribution::Direct;
+        meta.save(&lib).unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "add", "library.toml"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "commit", "-m", "contribution"])
+            .status()
+            .unwrap();
+        fx.app()
+            .publish_skills(&["demo".into()], "personal", PublishMode::Auto, None)
+            .unwrap();
+
+        // Simulate review-style pending then merge onto main via branch + promote.
+        fs::write(
+            fx.project_dir.join(".agents/skills/demo/SKILL.md"),
+            "---\nname: demo\n---\n# edited\n",
+        )
+        .unwrap();
+        let branch_lock = fx
+            .app()
+            .libcommit_branch("demo", None, Some("tweak"), &[])
+            .unwrap();
+        assert!(branch_lock.branch.is_some());
+        let main_rev = fx.app().promote_skill("demo").unwrap();
+        // update (not lock --main) clears pending and refreshes Installation.
+        let updated = fx.app().update_skill("demo").unwrap();
+        assert_eq!(updated.branch, None);
+        assert_eq!(updated.rev.as_deref(), Some(main_rev.as_str()));
+        assert!(
+            fs::read_to_string(fx.project_dir.join(".agents/skills/demo/SKILL.md"))
+                .unwrap()
+                .contains("edited")
+        );
+        let drift = fx.app().detect_drift().unwrap();
+        assert!(
+            !drift.iter().any(|d| d.name == "demo"),
+            "update should clear pending/hard drift for demo: {drift:?}"
+        );
+
+        // Distinct refusal for Local.
+        fx.app()
+            .skill_new_with_local("local-only", &[], true)
+            .unwrap();
+        let err = fx.app().update_skill("local-only").unwrap_err();
+        assert!(err.to_string().contains("Local"), "{err}");
     }
 
     #[test]
