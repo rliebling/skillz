@@ -300,8 +300,13 @@ enum LibcommitKind {
 enum LibraryCommands {
     /// Create or adopt a Library skeleton and register it
     #[command(after_help = "\
+Notes:
+  library.toml records contribution = \"direct\" (default) or \"review\".
+  direct: publish writes Library main. review: Branch Lock + PR/MR workflow.
+  Legacy files without contribution load as direct.
+
 Examples:
-  # New empty Library (skeleton + machine registry entry)
+  # New empty Library (skeleton + machine registry entry; contribution=direct)
   skillz library init ~/code/personal-skills --name personal
 
   # Adopt an existing skills/*/SKILL.md layout (no filesystem moves)

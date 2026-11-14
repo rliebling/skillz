@@ -16,6 +16,28 @@ fn default_library_version() -> u32 {
     LIBRARY_META_VERSION
 }
 
+/// How Project → Library `publish` lands on this Library.
+///
+/// `direct` writes Library main; `review` uses a Branch Lock + PR/MR workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Contribution {
+    /// Commit straight to Library main (personal Libraries).
+    #[default]
+    Direct,
+    /// Review branch + merge-commit workflow (shared Libraries).
+    Review,
+}
+
+impl Contribution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Review => "review",
+        }
+    }
+}
+
 /// Upstream Catalog Entry recorded in `library.toml` (reference, not Owned tree).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamEntry {
@@ -29,6 +51,7 @@ pub struct UpstreamEntry {
 ///
 /// Registry Binding name is authoritative; `library.toml` does not carry `name`.
 /// Legacy files with `name` and/or missing `version` still load.
+/// Missing `contribution` defaults to [`Contribution::Direct`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryMeta {
     #[serde(default = "default_library_version")]
@@ -36,6 +59,9 @@ pub struct LibraryMeta {
     /// Legacy field from older schemas; accepted on load, never written back.
     #[serde(default, skip_serializing)]
     name: Option<String>,
+    /// How contributions land; omitted on legacy files → [`Contribution::Direct`].
+    #[serde(default)]
+    pub contribution: Contribution,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream: Vec<UpstreamEntry>,
 }
@@ -45,6 +71,7 @@ impl LibraryMeta {
         Self {
             version: LIBRARY_META_VERSION,
             name: None,
+            contribution: Contribution::Direct,
             upstream: Vec::new(),
         }
     }
@@ -76,6 +103,7 @@ impl LibraryMeta {
         let to_write = Self {
             version: LIBRARY_META_VERSION,
             name: None,
+            contribution: self.contribution,
             upstream: self.upstream.clone(),
         };
         let text = toml::to_string_pretty(&to_write).map_err(|e| {
@@ -245,11 +273,12 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn save_writes_version_omits_name() {
+    fn save_writes_version_and_contribution_omits_name() {
         let dir = TempDir::new().unwrap();
         LibraryMeta::new().save(dir.path()).unwrap();
         let text = fs::read_to_string(dir.path().join(LIBRARY_TOML)).unwrap();
         assert!(text.contains("version = 1"));
+        assert!(text.contains("contribution = \"direct\""));
         assert!(!text.contains("name"));
     }
 
@@ -263,11 +292,50 @@ mod tests {
         .unwrap();
         let meta = LibraryMeta::load(dir.path()).unwrap();
         assert_eq!(meta.version, 1);
+        assert_eq!(meta.contribution, Contribution::Direct);
         assert_eq!(meta.upstream.len(), 1);
         meta.save(dir.path()).unwrap();
         let text = fs::read_to_string(dir.path().join(LIBRARY_TOML)).unwrap();
         assert!(text.contains("version = 1"));
+        assert!(text.contains("contribution = \"direct\""));
         assert!(!text.contains("name = \"legacy\""));
+    }
+
+    #[test]
+    fn load_defaults_missing_contribution_to_direct() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(LIBRARY_TOML), "version = 1\n").unwrap();
+        let meta = LibraryMeta::load(dir.path()).unwrap();
+        assert_eq!(meta.contribution, Contribution::Direct);
+    }
+
+    #[test]
+    fn load_accepts_contribution_review() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(LIBRARY_TOML),
+            "version = 1\ncontribution = \"review\"\n",
+        )
+        .unwrap();
+        let meta = LibraryMeta::load(dir.path()).unwrap();
+        assert_eq!(meta.contribution, Contribution::Review);
+    }
+
+    #[test]
+    fn load_rejects_invalid_contribution() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(LIBRARY_TOML),
+            "version = 1\ncontribution = \"push\"\n",
+        )
+        .unwrap();
+        let err = LibraryMeta::load(dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid"), "{msg}");
+        assert!(
+            msg.contains("contribution") || msg.contains("direct") || msg.contains("review"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -276,6 +344,16 @@ mod tests {
         fs::write(dir.path().join(LIBRARY_TOML), "version = 99\n").unwrap();
         let err = LibraryMeta::load(dir.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported library.toml version 99"));
+    }
+
+    #[test]
+    fn init_writes_contribution_direct() {
+        let dir = TempDir::new().unwrap();
+        init_library_skeleton(dir.path(), false).unwrap();
+        let meta = LibraryMeta::load(dir.path()).unwrap();
+        assert_eq!(meta.contribution, Contribution::Direct);
+        let text = fs::read_to_string(dir.path().join(LIBRARY_TOML)).unwrap();
+        assert!(text.contains("contribution = \"direct\""));
     }
 
     #[test]

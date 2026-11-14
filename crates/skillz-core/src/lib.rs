@@ -32,7 +32,9 @@ pub use ui::{
 };
 
 pub use catalog::{Availability, CatalogEntry};
-pub use library::{ensure_library_meta, init_library_skeleton, LibraryMeta};
+pub use library::{
+    ensure_library_meta, init_library_skeleton, Contribution, LibraryMeta,
+};
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
 pub use skill::{
@@ -4416,8 +4418,10 @@ exit 1
 
         let meta = LibraryMeta::load(&lib_path).unwrap();
         assert_eq!(meta.version, 1);
+        assert_eq!(meta.contribution, Contribution::Direct);
         let toml_text = fs::read_to_string(lib_path.join("library.toml")).unwrap();
         assert!(toml_text.contains("version = 1"));
+        assert!(toml_text.contains("contribution = \"direct\""));
         assert!(!toml_text.contains("name"));
 
         let listed = fx.app().library_list().unwrap();
@@ -4428,6 +4432,51 @@ exit 1
         let reg_text = fs::read_to_string(fx.config_dir.join("registry.toml")).unwrap();
         assert!(reg_text.contains("personal"));
         assert!(reg_text.contains("path"));
+    }
+
+    #[test]
+    fn library_meta_contribution_load_default_reject() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fs::create_dir_all(lib.join("skills")).unwrap();
+
+        // Missing contribution → direct (no migrate required).
+        fs::write(lib.join("library.toml"), "version = 1\n").unwrap();
+        let meta = LibraryMeta::load(&lib).unwrap();
+        assert_eq!(meta.contribution, Contribution::Direct);
+
+        // Explicit review loads.
+        fs::write(
+            lib.join("library.toml"),
+            "version = 1\ncontribution = \"review\"\n",
+        )
+        .unwrap();
+        let meta = LibraryMeta::load(&lib).unwrap();
+        assert_eq!(meta.contribution, Contribution::Review);
+
+        // Invalid value fails clearly.
+        fs::write(
+            lib.join("library.toml"),
+            "version = 1\ncontribution = \"push\"\n",
+        )
+        .unwrap();
+        let err = LibraryMeta::load(&lib).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid"), "{msg}");
+        assert!(
+            msg.contains("contribution") || msg.contains("direct") || msg.contains("review"),
+            "{msg}"
+        );
+
+        // library init writes contribution=direct.
+        let init_lib = fx.libs_dir.join("fresh");
+        fx.app()
+            .library_init(&init_lib, "fresh", false)
+            .expect("init");
+        let init_meta = LibraryMeta::load(&init_lib).unwrap();
+        assert_eq!(init_meta.contribution, Contribution::Direct);
+        let text = fs::read_to_string(init_lib.join("library.toml")).unwrap();
+        assert!(text.contains("contribution = \"direct\""));
     }
 
     #[test]
