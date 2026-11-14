@@ -2,9 +2,9 @@
 
 **skillz** manages agent skills across the projects you work in.
 
-Instead of copying `SKILL.md` trees by hand from old repos (and watching those copies diverge), you keep one or more **Libraries** — personal, team, or company catalogs of the skills you actually use — and **Managed Projects** select from them with honest, versioned **Locks**. Day-to-day editing happens in the project (or user-global) skills directory; **`libcommit`** is the step that formalizes a tested skill into the Library workflow.
+Instead of copying `SKILL.md` trees by hand from old repos (and watching those copies diverge), you keep one or more **Libraries** — personal, team, or company catalogs of the skills you actually use — and **Managed Projects** select from them with honest, versioned **Locks**. Day-to-day editing happens in the project (or user-global) skills directory; **`publish`** formalizes a managed skill into the Library.
 
-skillz is a Rust CLI (with optional Ratatui `-i` flows). It replaces Skillfile-style workflows without aiming for Skillfile parity.
+skillz is a Rust CLI (with optional Ratatui `-i` flows).
 
 ## Why it exists
 
@@ -22,9 +22,10 @@ skillz’s model:
 | **Managed Project** | A repo opted in via ordered **Library Bindings**; Installations are committed under `skills_dir` (default `.agents/skills`) |
 | **Lock** | Pin of which Catalog Entry / revision an Installation came from |
 | **Drift** | Installation ≠ Lock (fine while testing; blocked from casual publish by hooks) |
-| **libcommit** | Turn a tested Installation into Library state (new entry, Branch Lock, or Overlay Fork) |
+| **publish** | Project → Library (direct main commit, or review Branch Lock + push/PR) |
+| **update** | Library main tip → Project Installation + Lock |
 
-Upstream identity is a single portable string: `github:owner/repo[/path][@rev]`.
+Upstream identity is a single portable string: `github:owner/repo[/path][@rev]` (or Tool-Provided `cmd:…`).
 
 ## Build
 
@@ -118,50 +119,54 @@ skillz add --tag elixir -i          # optional pre-filter, then multi-select
 
 `list` shows **Availability** (project skills dir, `~/.agents/skills`, `.cursor/skills`, `.claude/skills`, …) so you know what the agent can already load. `add` materializes into the Project `skills_dir` and records a Lock (collaborators get the files on clone).
 
-### 4. Author or fetch, then libcommit
+### 4. Author, stage Upstream, then publish
 
-Project-first: try the skill locally, then formalize.
+Project-first: try the skill locally, then formalize into a Library.
 
 ```bash
 # New Authored skill
-skillz new my-skill --tag process
+skillz new my-skill --tag process --local
 # …test with your agent…
-skillz libcommit my-skill --library personal --as authored
+skillz publish my-skill -l personal
 
-# Upstream from GitHub (path or nested name lookup)
-skillz fetch github:owner/repo/path/to/skill
-skillz fetch github:owner/repo ecto-thinking
-skillz libcommit ecto-thinking --library personal --as upstream
+# Stage Upstream from GitHub or a local path, then publish
+skillz add --source github:owner/repo/path/to/skill@abc1234 --local
+skillz add --source github:owner/repo ecto-thinking --local
+skillz publish ecto-thinking -l personal
 
 # Tool-Provided Upstream (command template; see ADR 0005)
-# Catalog stores cmd:… without @rev; Lock pins observational tool version.
-skillz libcommit rexpad --library personal --as upstream \
-  --source 'cmd:rexpad skill install --dir {dir}'
-# Optional version probe: …|version:rexpad version
+# Catalog stores cmd:…; Lock pins observational tool version.
+skillz add --source 'cmd:rexpad skill install --dir {dir}' rexpad --local
+skillz publish rexpad -l personal
 
 # skillz's own agent skill is Tool-Provided the same way:
 skillz skill show                              # print embedded SKILL.md
 skillz skill install                           # → ~/.agents/skills/skillz/SKILL.md
-skillz libcommit skillz --library personal --as upstream \
-  --source 'cmd:skillz skill install --dir {dir}'
+skillz add --source 'cmd:skillz skill install --dir {dir}' skillz --local
+skillz publish skillz -l personal
 ```
 
-Until `libcommit`, new/fetched skills are **Drift**. Agents working in this repo can load the **`skillz`** skill (`.agents/skills/skillz`) for CLI workflow guidance.
+Without `--local`, staged/scaffolded skills stay **Unlocked** until `migrate`, `--local`, `add --attach`, or `publish` prerequisites are met. Agents working in this repo can load the **`skillz`** skill (`.agents/skills/skillz`) for CLI workflow guidance.
 
-### 5. Edit, Branch Lock, promote
+### 5. Edit and publish again
 
 ```bash
 $EDITOR .agents/skills/grilling/SKILL.md
-skillz libcommit grilling -m "tweak question style"   # Branch Lock (or Overlay Fork if read-only)
-skillz promote grilling                               # Library main line
-skillz lock grilling --main                           # re-Lock Project to main
+skillz publish grilling -l personal -m "tweak question style"
+# contribution = review Libraries: Branch Lock + push/PR by default
+skillz update grilling                            # after merge: take Library main tip
 ```
 
-If the desired Library is read-only, libcommit **Overlay Forks** into a writable Binding and records provenance for a later Promote upstream.
+Link an existing on-disk skill to a Catalog Entry without publishing Project content:
+
+```bash
+skillz add grilling --attach -l personal
+skillz add grilling --attach --from-library -l personal   # also take Catalog files
+```
 
 ## User-global skills
 
-Same Bindings / Lock / add / list / libcommit / drift model for `~/.agents/skills`:
+Same Bindings / Lock / add / list / publish / update / drift model for `~/.agents/skills`:
 
 ```bash
 skillz user init --binding personal
@@ -170,13 +175,14 @@ skillz list --user
 skillz add ecto-thinking --user
 ```
 
-## Migrating from Skillfile
+## Migrating unmanaged skills
 
 ```bash
-skillz project import --dry-run
-skillz project import --from skillfile --library personal
-skillz project import --library personal --adopt-local local-skill=authored
-skillz project import --library personal -i    # per-skill upstream | authored | skip
+skillz migrate --dry-run
+skillz migrate --authored
+skillz migrate -i --authored
+skillz migrate grilling --source github:owner/repo/grilling@abc1234
+skillz migrate --user --authored --dry-run
 ```
 
 ## Drift and publish gates
@@ -192,14 +198,14 @@ skillz hooks install
 
 Default `drift` / `drift -i` stay on the **current scope** (this Managed Project, or `~/.agents/skills` with `--user`). Use `-g/--global` to scan every registered Managed Project plus user-global.
 
-In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→` or `s`/`c`/`p`/`r`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays. Confirming Remove warns (soft) when a retained Installation appears to depend on the skill being dropped.
+In `drift -i`, scroll the list (`j`/`k`), change the planned action (`←`/`→`), confirm removes in the modal, then **Enter** to apply. Press **`?`** in any interactive UI for keybindings. Remove drops the Project Installation + Lock only; the Library entry stays. Confirming Remove warns (soft) when a retained Installation appears to depend on the skill being dropped.
 
 - **git-only:** pre-commit runs `skillz drift --check --project …` on the Managed Project.
 - **jj** (including colocated): repo-local alias `jj push-with-checks` only (drift check, then `jj git push`). No git pre-commit — `jj commit` would not run it. Ordinary `jj git push` stays unwrapped.
 - Escape: `--allow-drift` or `SKILLZ_ALLOW_DRIFT=1`.
 - `hooks show` prints the target file and planned gate text without writing.
 
-Sibling dependency detection is best-effort (`--with-deps` on `add` / `fetch`).
+Sibling dependency detection is best-effort (`--with-deps` / `--no-deps` on `add`).
 
 ## Layout (cheat sheet)
 

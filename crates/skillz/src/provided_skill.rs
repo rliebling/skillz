@@ -66,7 +66,6 @@ mod tests {
         assert!(!SKILL_MD.contains("skillz libcommit"));
         assert!(!SKILL_MD.contains("skillz fetch "));
         assert!(!SKILL_MD.contains("skillz promote "));
-        assert!(SKILL_MD.contains("no") && SKILL_MD.contains("libcommit"));
     }
 
     #[test]

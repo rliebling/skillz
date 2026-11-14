@@ -52,8 +52,6 @@ Clean up Project only?
   skillz remove NAME…   (Catalog Entry stays)
 ```
 
-There is **no** `fetch`, `libcommit`, `promote`, or `lock --main`.
-
 ## Common commands
 
 ```bash

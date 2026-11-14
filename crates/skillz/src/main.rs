@@ -77,9 +77,9 @@ Examples:
     /// Refresh Installation + Lock from Library Catalog main tip
     #[command(after_help = "\
 Notes:
-  Library → Project refresh (remote-aware main tip). Distinct from:
-    publish -u   Project → Library update
-    add --attach link on-disk skill without taking Catalog files as day-to-day refresh
+  Pulls Library → Project (remote-aware main tip).
+  Use `publish -u` to push Project → Library instead.
+  Use `add --attach` to link an on-disk skill without refreshing files from Catalog.
 
 Examples:
   skillz update grilling
@@ -108,7 +108,6 @@ Notes:
   contribution = \"direct\": one main commit. \"review\": one Branch Lock + push/PR by default.
   Unmanaged/Unlocked skills are refused; use --local, migrate, or add --attach first.
   Local + Catalog hit → use add --attach instead.
-  There is no `libcommit` command.
 
 Examples:
   skillz publish grilling -l personal
@@ -218,8 +217,6 @@ Examples:
 
   # Ignore Skillfile origins when classifying
   skillz migrate --ignore-skillfile --authored
-
-  # Replaces `skillz project import` for unmanaged → managed
 ")]
     Migrate {
         /// Optional single skill for `migrate NAME --source`
@@ -266,9 +263,8 @@ Notes:
   If the skill dir already exists, it errors — use --attach or --attach --from-library.
   `add NAME --attach` Locks an on-disk skill to a Catalog Entry (does not publish).
   `add NAME --attach --from-library` replaces Installation files from the Catalog, then Locks.
-  `add --source SOURCE [NAME]` stages github/path/cmd into skills_dir (replaces `fetch`).
+  `add --source SOURCE [NAME]` stages github/path/cmd into skills_dir.
   With `--source --local`, marks Local+source (github:/cmd: only). Without --local, Unlocked.
-  There is no standalone `attach` or `fetch` command.
 
 Examples:
   skillz add grilling
