@@ -26,8 +26,6 @@ Direction of data flow (everyday verbs):
   publish NAME -l LIB      Project → Library (direct main / review Branch Lock)
   update NAME              Library main tip → Project Installation + Lock
   remove NAME              drop Installation + Lock (Catalog unchanged)
-
-There is no fetch / libcommit / promote / lock --main command.
 "
 )]
 struct Cli {
