@@ -57,14 +57,38 @@ pub struct PublishSkillResult {
     pub lock: InstallationLock,
 }
 
-/// Report from [`App::publish_skills`] (direct contribution).
+/// Options for [`App::publish_skills`] / [`App::publish_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct PublishOptions {
+    pub mode: PublishMode,
+    pub message: Option<String>,
+    pub dry_run: bool,
+    /// Review Libraries: skip `git push` / `jj git push` (default: push).
+    pub no_push: bool,
+    /// Review Libraries: skip forge PR/MR create after push (default: open).
+    pub no_pr: bool,
+    /// Test seam: replace real push (`Ok` = pretend pushed, `Err` = soft-fail warning).
+    pub mock_push: Option<std::result::Result<(), String>>,
+    /// Test seam: replace real `gh`/`glab` (`Ok(Some(url))`, `Ok(None)` skipped, `Err` soft-fail).
+    pub mock_pr: Option<std::result::Result<Option<String>, String>>,
+}
+
+/// Report from [`App::publish_skills`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishReport {
     pub library: String,
+    pub contribution: Contribution,
     pub rev: String,
+    /// Review Branch Lock branch (None for direct main publish).
+    pub branch: Option<String>,
     pub skills: Vec<PublishSkillResult>,
     /// Sibling deps referenced by the batch but not included in the publish names.
     pub missing_deps: Vec<String>,
+    pub dry_run: bool,
+    pub pushed: bool,
+    pub pr_url: Option<String>,
+    pub warnings: Vec<String>,
+    pub next_steps: Vec<String>,
 }
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
@@ -2277,16 +2301,31 @@ impl App {
         Ok((dest, pinned))
     }
 
-    /// Publish managed skills to a `contribution = direct` Library (one main commit).
-    ///
-    /// Infers Owned vs Upstream from Project management state — no `--as` / `--source`.
-    /// Refuses Unlocked/unmanaged skills. Local + Catalog hit → error toward `add --attach`.
+    /// Publish managed skills to a Library (direct → main; review → Branch Lock).
     pub fn publish_skills(
         &self,
         names: &[String],
         library_name: &str,
         mode: PublishMode,
         message: Option<&str>,
+    ) -> Result<PublishReport> {
+        self.publish_with_options(
+            names,
+            library_name,
+            &PublishOptions {
+                mode,
+                message: message.map(str::to_string),
+                ..PublishOptions::default()
+            },
+        )
+    }
+
+    /// Publish with review push/PR flags and optional test seams.
+    pub fn publish_with_options(
+        &self,
+        names: &[String],
+        library_name: &str,
+        opts: &PublishOptions,
     ) -> Result<PublishReport> {
         if names.is_empty() {
             return Err(SkillzError::Message(
@@ -2295,12 +2334,7 @@ impl App {
         }
         let (config, lib_path) = self.writable_library_path(library_name)?;
         let meta = LibraryMeta::load(&lib_path)?;
-        if meta.contribution != Contribution::Direct {
-            return Err(SkillzError::Message(format!(
-                "library `{library_name}` has contribution = \"{}\"; direct `publish` requires contribution = \"direct\"",
-                meta.contribution.as_str()
-            )));
-        }
+        let contribution = meta.contribution;
 
         let lock = self.load_scope_lock()?;
         let catalog_names: std::collections::HashSet<String> = self
@@ -2377,7 +2411,7 @@ impl App {
                 plan,
                 Planned::CreateOwned | Planned::CreateUpstream { .. }
             );
-            match mode {
+            match opts.mode {
                 PublishMode::UpdateOnly if creates => {
                     return Err(SkillzError::Message(format!(
                         "publish --update: `{name}` would create a Catalog Entry (not an update)"
@@ -2393,7 +2427,6 @@ impl App {
             plans.push((name.clone(), plan));
         }
 
-        // Sibling deps not in the batch (notify only).
         let batch: std::collections::HashSet<&str> =
             names.iter().map(String::as_str).collect();
         let present = deps::list_skill_names(&self.scope_skills_root(&config))?;
@@ -2405,6 +2438,84 @@ impl App {
                     missing_deps.push(dep);
                 }
             }
+        }
+
+        let review_branch = match contribution {
+            Contribution::Review => Some(review_publish_branch_name(names)),
+            Contribution::Direct => None,
+        };
+        let msg = opts
+            .message
+            .clone()
+            .unwrap_or_else(|| "skillz publish".into());
+
+        if opts.dry_run {
+            let mut next_steps = Vec::new();
+            let mut warnings = Vec::new();
+            match contribution {
+                Contribution::Direct => {
+                    next_steps.push(format!(
+                        "would commit {} skill(s) to library `{library_name}` main",
+                        plans.len()
+                    ));
+                }
+                Contribution::Review => {
+                    let branch = review_branch.as_deref().unwrap();
+                    next_steps.push(format!(
+                        "would create Branch Lock `{branch}` for {} skill(s)",
+                        plans.len()
+                    ));
+                    if opts.no_push {
+                        warnings.push("would skip push (--no-push)".into());
+                    } else {
+                        next_steps.push(format!("would push `{branch}` to Library remote"));
+                        if opts.no_pr {
+                            warnings.push("would skip PR/MR (--no-pr)".into());
+                        } else {
+                            next_steps.push("would open PR/MR via gh/glab (best-effort)".into());
+                        }
+                    }
+                }
+            }
+            let dry_branch = review_branch.clone();
+            return Ok(PublishReport {
+                library: library_name.to_string(),
+                contribution,
+                rev: "(dry-run)".into(),
+                branch: review_branch,
+                skills: plans
+                    .iter()
+                    .map(|(name, plan)| {
+                        let (kind, created) = match plan {
+                            Planned::CreateOwned => (EntryKind::Owned, true),
+                            Planned::UpdateOwned => (EntryKind::Owned, false),
+                            Planned::CreateUpstream { .. } => (EntryKind::Upstream, true),
+                            Planned::UpdateUpstream { .. } => (EntryKind::Upstream, false),
+                        };
+                        PublishSkillResult {
+                            name: name.clone(),
+                            kind,
+                            created,
+                            lock: InstallationLock {
+                                library: library_name.to_string(),
+                                entry_kind: kind,
+                                content_hash: String::new(),
+                                source: None,
+                                rev: None,
+                                branch: dry_branch.clone(),
+                                overlay_from_library: None,
+                                overlay_from_entry: None,
+                            },
+                        }
+                    })
+                    .collect(),
+                missing_deps,
+                dry_run: true,
+                pushed: false,
+                pr_url: None,
+                warnings,
+                next_steps,
+            });
         }
 
         let mut commit_paths: Vec<PathBuf> = Vec::new();
@@ -2423,7 +2534,7 @@ impl App {
                         entry_kind: EntryKind::Owned,
                         content_hash: hash,
                         source: None,
-                        rev: None, // filled after commit
+                        rev: None,
                         branch: None,
                         overlay_from_library: None,
                         overlay_from_entry: None,
@@ -2466,18 +2577,39 @@ impl App {
             }
         }
 
-        // Deduplicate commit paths (library.toml may appear once per upstream).
         commit_paths.sort();
         commit_paths.dedup();
         let path_refs: Vec<&Path> = commit_paths.iter().map(Path::new).collect();
-        let msg = message.unwrap_or("skillz publish");
-        let rev = vcs_ops::commit_on_main(&lib_path, msg, &path_refs)?;
+
+        let (rev, branch_for_lock) = match contribution {
+            Contribution::Direct => {
+                let rev = vcs_ops::commit_on_main(&lib_path, &msg, &path_refs)?;
+                (rev, None)
+            }
+            Contribution::Review => {
+                let branch = review_branch.clone().unwrap();
+                let commit =
+                    vcs_ops::commit_on_branch(&lib_path, &branch, &msg, &path_refs)?;
+                (commit.rev, Some(commit.branch))
+            }
+        };
 
         let mut scope_lock = self.load_scope_lock()?;
         let mut skills = Vec::new();
         for (name, created, kind, mut install) in results {
-            if kind == EntryKind::Owned {
-                install.rev = Some(rev.clone());
+            match contribution {
+                Contribution::Direct => {
+                    // Owned pins Library main tip; Upstream keeps source/@rev pin.
+                    if kind == EntryKind::Owned {
+                        install.rev = Some(rev.clone());
+                    }
+                    install.branch = None;
+                }
+                Contribution::Review => {
+                    // Pending Branch Lock: all skills in the unit share tip + branch.
+                    install.rev = Some(rev.clone());
+                    install.branch = branch_for_lock.clone();
+                }
             }
             scope_lock
                 .installations
@@ -2491,11 +2623,110 @@ impl App {
         }
         self.save_scope_lock(&scope_lock)?;
 
+        let mut warnings = Vec::new();
+        let mut pushed = false;
+        let mut pr_url = None;
+        let mut next_steps = Vec::new();
+
+        match contribution {
+            Contribution::Direct => {
+                next_steps.push(format!(
+                    "Library `{library_name}` main updated @{}",
+                    &rev[..rev.len().min(12)]
+                ));
+                next_steps.push(
+                    "Collaborators: pull Library; run `skillz update` / `skillz status` as needed"
+                        .into(),
+                );
+            }
+            Contribution::Review => {
+                let branch = branch_for_lock.as_deref().unwrap();
+                if opts.no_push {
+                    warnings.push(format!(
+                        "skipped push (--no-push); Branch Lock `{branch}`@{rev} is local-only until pushed"
+                    ));
+                    next_steps.push(format!(
+                        "git -C {} push -u origin {branch}",
+                        lib_path.display()
+                    ));
+                } else {
+                    let push_result = match &opts.mock_push {
+                        Some(r) => r.clone().map_err(SkillzError::Message),
+                        None => vcs_ops::push_branch(&lib_path, branch, "origin"),
+                    };
+                    match push_result {
+                        Ok(()) => {
+                            pushed = true;
+                            next_steps.push(format!("pushed `{branch}` to origin"));
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "push failed ({e}); Branch Lock is local — push before collaborators can use it"
+                            ));
+                            next_steps.push(format!(
+                                "git -C {} push -u origin {branch}",
+                                lib_path.display()
+                            ));
+                        }
+                    }
+                }
+
+                if pushed && !opts.no_pr {
+                    let title = format!("skillz publish: {}", names.join(", "));
+                    let pr_result = match &opts.mock_pr {
+                        Some(r) => r.clone(),
+                        None => vcs_ops::try_open_merge_request(&lib_path, branch, &title),
+                    };
+                    match pr_result {
+                        Ok(Some(url)) => {
+                            pr_url = Some(url.clone());
+                            next_steps.push(format!("view PR/MR: {url}"));
+                        }
+                        Ok(None) => {
+                            warnings.push(
+                                "no gh/glab available to open PR/MR; use copy-paste next steps"
+                                    .into(),
+                            );
+                            next_steps.extend(vcs_ops::copy_paste_open_pr_commands(
+                                &lib_path, branch,
+                            ));
+                        }
+                        Err(msg) => {
+                            warnings.push(format!(
+                                "PR/MR not opened ({msg}); publish succeeded after push"
+                            ));
+                            next_steps.extend(vcs_ops::copy_paste_open_pr_commands(
+                                &lib_path, branch,
+                            ));
+                        }
+                    }
+                } else if opts.no_pr && pushed {
+                    warnings.push("skipped PR/MR (--no-pr)".into());
+                    next_steps.extend(vcs_ops::copy_paste_open_pr_commands(&lib_path, branch));
+                }
+
+                next_steps.push(
+                    "Merge with a merge commit (not squash) so Branch Lock SHAs remain on main"
+                        .into(),
+                );
+                next_steps.push(
+                    "After merge: `skillz update <names…>` and/or `skillz status`".into(),
+                );
+            }
+        }
+
         Ok(PublishReport {
             library: library_name.to_string(),
+            contribution,
             rev,
+            branch: branch_for_lock,
             skills,
             missing_deps,
+            dry_run: false,
+            pushed,
+            pr_url,
+            warnings,
+            next_steps,
         })
     }
 
@@ -3394,6 +3625,18 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+fn review_publish_branch_name(names: &[String]) -> String {
+    if names.len() == 1 {
+        return format!("skillz/{}", names[0]);
+    }
+    let joined = names.join("-");
+    if joined.len() <= 60 {
+        format!("skillz/{joined}")
+    } else {
+        format!("skillz/{}-plus-{}", names[0], names.len() - 1)
+    }
 }
 
 #[cfg(test)]
@@ -5100,6 +5343,113 @@ exit 1
         assert_eq!(up.skills[0].kind, EntryKind::Upstream);
         let meta = LibraryMeta::load(&lib).unwrap();
         assert!(meta.upstream.iter().any(|e| e.name == "upskill"));
+    }
+
+    #[test]
+    fn publish_review_branch_unit_push_pr_dry_run() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("team");
+        fx.app().library_init(&lib, "team", false).unwrap();
+        let mut meta = LibraryMeta::load(&lib).unwrap();
+        meta.contribution = Contribution::Review;
+        meta.save(&lib).unwrap();
+        vcs_ops::init_git_repo(&lib).unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "add", "library.toml", "skills"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "commit", "-m", "skeleton"])
+            .status()
+            .unwrap();
+        fx.app()
+            .project_init(&["team".into()], None)
+            .unwrap();
+
+        fx.app()
+            .skill_new_with_local("one", &[], true)
+            .unwrap();
+        fx.app()
+            .skill_new_with_local("two", &[], true)
+            .unwrap();
+
+        // Dry-run: no Branch Lock files / locks written.
+        let dry = fx
+            .app()
+            .publish_with_options(
+                &["one".into(), "two".into()],
+                "team",
+                &PublishOptions {
+                    dry_run: true,
+                    ..PublishOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.branch.as_deref(), Some("skillz/one-two"));
+        assert!(dry.next_steps.iter().any(|s| s.contains("Branch Lock")));
+        assert!(dry.next_steps.iter().any(|s| s.contains("push")));
+        assert!(!lib.join("skills/one/SKILL.md").is_file());
+        assert!(fx
+            .app()
+            .load_scope_lock()
+            .unwrap()
+            .installations
+            .get("one")
+            .unwrap()
+            .entry_kind
+            == EntryKind::Local);
+
+        // Real publish with mocked push + forge soft-fail.
+        let report = fx
+            .app()
+            .publish_with_options(
+                &["one".into(), "two".into()],
+                "team",
+                &PublishOptions {
+                    mock_push: Some(Ok(())),
+                    mock_pr: Some(Err("gh auth required".into())),
+                    ..PublishOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(report.contribution, Contribution::Review);
+        assert_eq!(report.branch.as_deref(), Some("skillz/one-two"));
+        assert!(report.pushed);
+        assert!(report.pr_url.is_none());
+        assert!(report.warnings.iter().any(|w| w.contains("gh auth")));
+        assert!(report.next_steps.iter().any(|s| s.contains("gh ")));
+        assert!(report.next_steps.iter().any(|s| s.contains("merge commit")));
+        assert_eq!(report.skills.len(), 2);
+        assert_eq!(
+            report.skills[0].lock.rev.as_deref(),
+            report.skills[1].lock.rev.as_deref()
+        );
+        assert_eq!(
+            report.skills[0].lock.branch.as_deref(),
+            Some("skillz/one-two")
+        );
+        assert!(lib.join("skills/one/SKILL.md").is_file());
+
+        // --no-push / --no-pr
+        fx.app()
+            .skill_new_with_local("three", &[], true)
+            .unwrap();
+        let no_net = fx
+            .app()
+            .publish_with_options(
+                &["three".into()],
+                "team",
+                &PublishOptions {
+                    no_push: true,
+                    no_pr: true,
+                    ..PublishOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!no_net.pushed);
+        assert!(no_net.warnings.iter().any(|w| w.contains("--no-push")));
+        assert_eq!(no_net.branch.as_deref(), Some("skillz/three"));
     }
 
     #[test]

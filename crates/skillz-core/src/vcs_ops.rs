@@ -153,6 +153,114 @@ pub fn checkout_rev(repo: &Path, rev: &str) -> Result<()> {
     }
 }
 
+/// Push a local branch to `remote` (best-effort; caller may soft-fail).
+pub fn push_branch(repo: &Path, branch: &str, remote: &str) -> Result<()> {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => run(repo, &["push", "-u", remote, branch]),
+        Some(Vcs::Jj) => run_jj(
+            repo,
+            &["git", "push", "--remote", remote, "--bookmark", branch],
+        ),
+        None => Err(SkillzError::Message(format!(
+            "library at {} has no git/jj metadata; cannot push",
+            repo.display()
+        ))),
+    }
+}
+
+/// Best-effort PR/MR open via `gh` or `glab`. Returns `Ok(None)` if neither CLI exists.
+pub fn try_open_merge_request(
+    repo: &Path,
+    branch: &str,
+    title: &str,
+) -> std::result::Result<Option<String>, String> {
+    if which_bin("gh") {
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "create",
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body",
+                "Created by skillz publish (review Library).",
+            ])
+            .current_dir(repo)
+            .output()
+            .map_err(|e| format!("gh failed to start: {e}"))?;
+        if output.status.success() {
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !url.is_empty() {
+                return Ok(Some(url));
+            }
+            return Ok(Some("(gh pr create succeeded)".into()));
+        }
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("gh pr create exited {}", output.status)
+        } else {
+            err
+        });
+    }
+    if which_bin("glab") {
+        let output = Command::new("glab")
+            .args([
+                "mr",
+                "create",
+                "--source-branch",
+                branch,
+                "--title",
+                title,
+                "--description",
+                "Created by skillz publish (review Library).",
+                "--yes",
+            ])
+            .current_dir(repo)
+            .output()
+            .map_err(|e| format!("glab failed to start: {e}"))?;
+        if output.status.success() {
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !url.is_empty() {
+                return Ok(Some(url));
+            }
+            return Ok(Some("(glab mr create succeeded)".into()));
+        }
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("glab mr create exited {}", output.status)
+        } else {
+            err
+        });
+    }
+    Ok(None)
+}
+
+/// Copy-paste commands when forge CLI is missing or auth failed.
+pub fn copy_paste_open_pr_commands(repo: &Path, branch: &str) -> Vec<String> {
+    vec![
+        format!(
+            "gh -C {} pr create --head {branch} --fill",
+            repo.display()
+        ),
+        format!(
+            "glab -C {} mr create --source-branch {branch} --fill",
+            repo.display()
+        ),
+        format!(
+            "# or open the host compare URL for branch `{branch}` against main"
+        ),
+    ]
+}
+
+fn which_bin(name: &str) -> bool {
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn main_rev(repo: &Path) -> Result<String> {
     match infer_vcs(repo) {
         Some(Vcs::Git) => {

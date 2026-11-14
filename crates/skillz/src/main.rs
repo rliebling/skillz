@@ -9,7 +9,7 @@ use clap_complete::{generate, Shell};
 use skillz_core::{
     default_config_dir, AddOutcome, App, DriftReason, DriftScan, LibraryImportAction,
     LibraryImportConflictResolution, LibraryImportItem, LibraryImportOnConflict, ListRow,
-    MigrateOptions, PublishMode, Scope, SkillzPaths,
+    MigrateOptions, PublishMode, PublishOptions, Scope, SkillzPaths,
 };
 use tui::RatatuiPrompter;
 
@@ -62,17 +62,17 @@ Examples:
     #[command(after_help = "\
 Notes:
   Infers Owned vs Upstream from Project management state — no --as / --source.
-  Requires contribution = \"direct\" on library.toml (review Libraries: later).
+  contribution = \"direct\": one main commit. \"review\": one Branch Lock + push/PR by default.
   Unmanaged/Unlocked skills are refused; use --local, migrate, or add --attach first.
   Local + Catalog hit → use add --attach instead.
-  Multi-name publish is one main commit on direct Libraries.
   There is no `libcommit` command.
 
 Examples:
   skillz publish grilling -l personal
   skillz publish a b c -l personal
-  skillz publish grilling -l personal -u
-  skillz publish grilling -l personal --create-only
+  skillz publish grilling -l team --dry-run
+  skillz publish grilling -l team --no-push
+  skillz publish grilling -l team --no-pr
 ")]
     Publish {
         /// Skill name(s) under the Project skills dir
@@ -87,7 +87,16 @@ Examples:
         /// All names must be new Catalog Entries (fail if any exist)
         #[arg(long = "create-only", conflicts_with = "update")]
         create_only: bool,
-        /// Commit message for the Library main commit
+        /// Plan branch/push/PR without writing or network side effects
+        #[arg(long)]
+        dry_run: bool,
+        /// Review Libraries: do not push the Branch Lock branch
+        #[arg(long)]
+        no_push: bool,
+        /// Review Libraries: do not open a PR/MR after push
+        #[arg(long)]
+        no_pr: bool,
+        /// Commit message for the Library commit
         #[arg(short, long)]
         message: Option<String>,
     },
@@ -888,6 +897,9 @@ fn run() -> skillz_core::Result<()> {
             library,
             update,
             create_only,
+            dry_run,
+            no_push,
+            no_pr,
             message,
         }) => {
             let library = library.ok_or_else(|| {
@@ -900,13 +912,30 @@ fn run() -> skillz_core::Result<()> {
             } else {
                 PublishMode::Auto
             };
-            let report =
-                app.publish_skills(&names, &library, mode, message.as_deref())?;
+            let report = app.publish_with_options(
+                &names,
+                &library,
+                &PublishOptions {
+                    mode,
+                    message,
+                    dry_run,
+                    no_push,
+                    no_pr,
+                    mock_push: None,
+                    mock_pr: None,
+                },
+            )?;
             if !report.missing_deps.is_empty() {
                 eprintln!(
                     "warning: possible sibling dependencies not in this publish batch: {} (consider including them in a follow-up `publish`)",
                     report.missing_deps.join(", ")
                 );
+            }
+            for w in &report.warnings {
+                eprintln!("warning: {w}");
+            }
+            if report.dry_run {
+                println!("dry-run: no writes or network side effects");
             }
             for skill in &report.skills {
                 let kind = match skill.kind {
@@ -920,7 +949,23 @@ fn run() -> skillz_core::Result<()> {
                     skill.name, report.library, skill.lock.content_hash
                 );
             }
-            println!("library `{}` main @{}", report.library, report.rev);
+            if let Some(branch) = &report.branch {
+                println!(
+                    "library `{}` branch `{branch}` @{}",
+                    report.library, report.rev
+                );
+            } else if !report.dry_run {
+                println!("library `{}` main @{}", report.library, report.rev);
+            }
+            if let Some(url) = &report.pr_url {
+                println!("PR/MR: {url}");
+            }
+            if !report.next_steps.is_empty() {
+                println!("Next steps:");
+                for step in &report.next_steps {
+                    println!("  - {step}");
+                }
+            }
             Ok(())
         }
         Some(Commands::Tag {
@@ -1656,12 +1701,18 @@ mod tests {
                 library,
                 update,
                 create_only,
+                dry_run,
+                no_push,
+                no_pr,
                 message,
             }) => {
                 assert_eq!(names, vec!["foo", "bar"]);
                 assert_eq!(library.as_deref(), Some("personal"));
                 assert!(update);
                 assert!(!create_only);
+                assert!(!dry_run);
+                assert!(!no_push);
+                assert!(!no_pr);
                 assert_eq!(message.as_deref(), Some("batch"));
             }
             other => panic!("expected Publish, got {other:?}"),
