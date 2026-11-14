@@ -9,7 +9,7 @@ use clap_complete::{generate, Shell};
 use skillz_core::{
     default_config_dir, AddOutcome, App, DriftReason, DriftScan, LibraryImportAction,
     LibraryImportConflictResolution, LibraryImportItem, LibraryImportOnConflict, ListRow,
-    MigrateOptions, Scope, SkillzPaths,
+    MigrateOptions, PublishMode, Scope, SkillzPaths,
 };
 use tui::RatatuiPrompter;
 
@@ -58,42 +58,36 @@ Examples:
         #[arg(long)]
         local: bool,
     },
-    /// Formalize a tested Installation into a Library Catalog Entry + Lock
+    /// Publish managed skills to a Library Catalog (Project → Library)
     #[command(after_help = "\
-Upstream --source strings (required for `--as upstream` unless a fetch sidecar exists):
+Notes:
+  Infers Owned vs Upstream from Project management state — no --as / --source.
+  Requires contribution = \"direct\" on library.toml (review Libraries: later).
+  Unmanaged/Unlocked skills are refused; use --local, migrate, or add --attach first.
+  Local + Catalog hit → use add --attach instead.
+  Multi-name publish is one main commit on direct Libraries.
+  There is no `libcommit` command.
 
-  github:owner/repo[/path/to/skill][@rev]
-      Catalog may omit @rev; Locks require @rev (commit SHA or tag).
-      Example: github:owner/repo/skills/foo@abc1234
-
-  cmd:<install-template>[|version:<version-cmd>][@tool-version]
-      Tool-Provided install command template. Placeholders:
-        {dir}  Installation directory (required in practice)
-        {name} Skill name
-      Optional |version:<cmd> overrides the default version probe `{argv0} --version`
-      (argv0 = first token of the install template). Catalog stores the template
-      without @tool-version; Locks pin the probed tool version after validation.
-      Examples:
-        cmd:skillz skill install --dir {dir}
-        cmd:rexpad skill install --dir {dir}|version:rexpad version
+Examples:
+  skillz publish grilling -l personal
+  skillz publish a b c -l personal
+  skillz publish grilling -l personal -u
+  skillz publish grilling -l personal --create-only
 ")]
-    Libcommit {
+    Publish {
         /// Skill name(s) under the Project skills dir
         #[arg(value_name = "NAME", required = true)]
         names: Vec<String>,
         /// Target Library Binding name
         #[arg(long)]
         library: Option<String>,
-        /// How to record the Catalog Entry (`authored` / `upstream`); omit for Branch Lock edit path
-        #[arg(long = "as", value_name = "KIND")]
-        as_kind: Option<LibcommitKind>,
-        /// Upstream source: `github:owner/repo[/path][@rev]` or `cmd:<template>[|version:<cmd>]` (see after help)
-        #[arg(long, value_name = "SOURCE")]
-        source: Option<String>,
-        /// Merge tags onto the Catalog Entry (Owned: SKILL.md; Upstream: library.toml)
-        #[arg(short = 't', long = "tag")]
-        tags: Vec<String>,
-        /// Commit message for Branch Lock libcommit
+        /// All names must already exist in the Catalog (fail on create)
+        #[arg(short = 'u', long = "update", conflicts_with = "create_only")]
+        update: bool,
+        /// All names must be new Catalog Entries (fail if any exist)
+        #[arg(long = "create-only", conflicts_with = "update")]
+        create_only: bool,
+        /// Commit message for the Library main commit
         #[arg(short, long)]
         message: Option<String>,
     },
@@ -321,12 +315,6 @@ Examples:
         /// Target shell (script goes to stdout — redirect it; see Examples)
         shell: Shell,
     },
-}
-
-#[derive(Debug, Clone, clap::ValueEnum)]
-enum LibcommitKind {
-    Authored,
-    Upstream,
 }
 
 #[derive(Debug, Subcommand)]
@@ -895,64 +883,44 @@ fn run() -> skillz_core::Result<()> {
             }
             Ok(())
         }
-        Some(Commands::Libcommit {
+        Some(Commands::Publish {
             names,
             library,
-            as_kind,
-            source,
-            tags,
+            update,
+            create_only,
             message,
         }) => {
-            if source.is_some() && names.len() > 1 {
-                return Err(skillz_core::SkillzError::Message(
-                    "`libcommit --source` requires a single skill name (or omit --source to use each skill's fetch sidecar)".into(),
-                ));
+            let library = library.ok_or_else(|| {
+                skillz_core::SkillzError::Message("`publish` requires --library".into())
+            })?;
+            let mode = if update {
+                PublishMode::UpdateOnly
+            } else if create_only {
+                PublishMode::CreateOnly
+            } else {
+                PublishMode::Auto
+            };
+            let report =
+                app.publish_skills(&names, &library, mode, message.as_deref())?;
+            if !report.missing_deps.is_empty() {
+                eprintln!(
+                    "warning: possible sibling dependencies not in this publish batch: {} (consider including them in a follow-up `publish`)",
+                    report.missing_deps.join(", ")
+                );
             }
-            for name in &names {
-                match as_kind {
-                    Some(LibcommitKind::Authored) => {
-                        let library = library.as_ref().ok_or_else(|| {
-                            skillz_core::SkillzError::Message(
-                                "`libcommit --as authored` requires --library".into(),
-                            )
-                        })?;
-                        let lock = app.libcommit_authored(name, library, &tags)?;
-                        println!(
-                            "libcommit `{name}` → library `{library}` as owned ({})",
-                            lock.content_hash
-                        );
-                    }
-                    Some(LibcommitKind::Upstream) => {
-                        let library = library.as_ref().ok_or_else(|| {
-                            skillz_core::SkillzError::Message(
-                                "`libcommit --as upstream` requires --library".into(),
-                            )
-                        })?;
-                        let lock =
-                            app.libcommit_upstream(name, library, source.as_deref(), &tags)?;
-                        println!(
-                            "libcommit `{name}` → library `{library}` as upstream ({})",
-                            lock.content_hash
-                        );
-                        if let Some(src) = &lock.source {
-                            println!("source: {src}");
-                        }
-                    }
-                    None => {
-                        let lock = app.libcommit_branch(
-                            name,
-                            library.as_deref(),
-                            message.as_deref(),
-                            &tags,
-                        )?;
-                        println!(
-                            "libcommit `{name}` Branch Lock on {}@{}",
-                            lock.branch.as_deref().unwrap_or("?"),
-                            lock.rev.as_deref().unwrap_or("?")
-                        );
-                    }
-                }
+            for skill in &report.skills {
+                let kind = match skill.kind {
+                    skillz_core::EntryKind::Owned => "owned",
+                    skillz_core::EntryKind::Upstream => "upstream",
+                    skillz_core::EntryKind::Local => "local",
+                };
+                let action = if skill.created { "created" } else { "updated" };
+                println!(
+                    "publish `{}` → library `{}` {action} as {kind} ({})",
+                    skill.name, report.library, skill.lock.content_hash
+                );
             }
+            println!("library `{}` main @{}", report.library, report.rev);
             Ok(())
         }
         Some(Commands::Tag {
@@ -1669,37 +1637,37 @@ mod tests {
     }
 
     #[test]
-    fn libcommit_parses_multiple_skill_names() {
+    fn publish_parses_multiple_skill_names_and_modes() {
         let cli = Cli::try_parse_from([
             "skillz",
-            "libcommit",
+            "publish",
             "foo",
             "bar",
-            "--as",
-            "authored",
             "--library",
             "personal",
-            "-t",
-            "process",
+            "-u",
+            "-m",
+            "batch",
         ])
         .unwrap();
         match cli.command {
-            Some(Commands::Libcommit {
+            Some(Commands::Publish {
                 names,
                 library,
-                as_kind,
-                source,
-                tags,
-                ..
+                update,
+                create_only,
+                message,
             }) => {
                 assert_eq!(names, vec!["foo", "bar"]);
                 assert_eq!(library.as_deref(), Some("personal"));
-                assert!(matches!(as_kind, Some(LibcommitKind::Authored)));
-                assert!(source.is_none());
-                assert_eq!(tags, vec!["process"]);
+                assert!(update);
+                assert!(!create_only);
+                assert_eq!(message.as_deref(), Some("batch"));
             }
-            other => panic!("expected Libcommit, got {other:?}"),
+            other => panic!("expected Publish, got {other:?}"),
         }
+        let err = Cli::try_parse_from(["skillz", "libcommit", "foo", "-l", "personal"]);
+        assert!(err.is_err(), "libcommit must not be a CLI command");
     }
 
     #[test]

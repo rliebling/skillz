@@ -28,6 +28,40 @@ pub fn commit_on_branch(
     }
 }
 
+/// Commit staged Library paths on main (direct contribution publish unit).
+pub fn commit_on_main(repo: &Path, message: &str, paths: &[&Path]) -> Result<String> {
+    match infer_vcs(repo) {
+        Some(Vcs::Git) => {
+            let main = git_main_branch(repo)?;
+            run(repo, &["checkout", &main])?;
+            for path in paths {
+                let rel = path
+                    .strip_prefix(repo)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                run(repo, &["add", "--", &rel])?;
+            }
+            run(repo, &["commit", "-m", message])?;
+            stdout(repo, &["rev-parse", "HEAD"])
+        }
+        Some(Vcs::Jj) => {
+            let main = jj_main_bookmark(repo)?;
+            for path in paths {
+                let _ = path;
+            }
+            run_jj(repo, &["describe", "-m", message])?;
+            run_jj(repo, &["bookmark", "set", &main, "-r", "@"])?;
+            run_jj(repo, &["new"])?;
+            main_rev(repo)
+        }
+        None => Err(SkillzError::Message(format!(
+            "library at {} has no git/jj metadata; init VCS before `publish`",
+            repo.display()
+        ))),
+    }
+}
+
 fn commit_git(repo: &Path, branch: &str, message: &str, paths: &[&Path]) -> Result<BranchCommit> {
     run(repo, &["checkout", "-B", branch])?;
     for path in paths {

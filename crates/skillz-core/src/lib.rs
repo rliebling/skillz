@@ -35,6 +35,37 @@ pub use catalog::{Availability, CatalogEntry};
 pub use library::{
     ensure_library_meta, init_library_skeleton, Contribution, LibraryMeta,
 };
+
+/// Batch mode for [`App::publish_skills`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublishMode {
+    /// Create from Local when Catalog-missing; update when Library-backed.
+    #[default]
+    Auto,
+    /// Fail if any name would create a Catalog Entry.
+    UpdateOnly,
+    /// Fail if any name already exists in the Catalog.
+    CreateOnly,
+}
+
+/// One skill result from [`App::publish_skills`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishSkillResult {
+    pub name: String,
+    pub kind: EntryKind,
+    pub created: bool,
+    pub lock: InstallationLock,
+}
+
+/// Report from [`App::publish_skills`] (direct contribution).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishReport {
+    pub library: String,
+    pub rev: String,
+    pub skills: Vec<PublishSkillResult>,
+    /// Sibling deps referenced by the batch but not included in the publish names.
+    pub missing_deps: Vec<String>,
+}
 pub use project::{Binding, ProjectConfig, ProjectLock, DEFAULT_SKILLS_DIR};
 pub use registry::{LibraryRecord, Registry};
 pub use skill::{
@@ -2244,6 +2275,254 @@ impl App {
             self.set_local_source(name, provenance)?;
         }
         Ok((dest, pinned))
+    }
+
+    /// Publish managed skills to a `contribution = direct` Library (one main commit).
+    ///
+    /// Infers Owned vs Upstream from Project management state — no `--as` / `--source`.
+    /// Refuses Unlocked/unmanaged skills. Local + Catalog hit → error toward `add --attach`.
+    pub fn publish_skills(
+        &self,
+        names: &[String],
+        library_name: &str,
+        mode: PublishMode,
+        message: Option<&str>,
+    ) -> Result<PublishReport> {
+        if names.is_empty() {
+            return Err(SkillzError::Message(
+                "provide one or more skill names to publish".into(),
+            ));
+        }
+        let (config, lib_path) = self.writable_library_path(library_name)?;
+        let meta = LibraryMeta::load(&lib_path)?;
+        if meta.contribution != Contribution::Direct {
+            return Err(SkillzError::Message(format!(
+                "library `{library_name}` has contribution = \"{}\"; direct `publish` requires contribution = \"direct\"",
+                meta.contribution.as_str()
+            )));
+        }
+
+        let lock = self.load_scope_lock()?;
+        let catalog_names: std::collections::HashSet<String> = self
+            .list_skills(Some(library_name), &[], true, false)?
+            .into_iter()
+            .map(|r| r.entry.name)
+            .collect();
+
+        #[derive(Clone)]
+        enum Planned {
+            CreateOwned,
+            CreateUpstream { source: String },
+            UpdateOwned,
+            UpdateUpstream { source: String },
+        }
+
+        let mut plans: Vec<(String, Planned)> = Vec::new();
+        for name in names {
+            skill::validate_skill_name(name)?;
+            let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
+            if !project_skill.join("SKILL.md").is_file() {
+                return Err(SkillzError::Message(format!(
+                    "skill `{name}` not found under {}",
+                    config.skills_dir
+                )));
+            }
+            let rec = lock.installations.get(name).ok_or_else(|| {
+                SkillzError::Message(format!(
+                    "skill `{name}` is unmanaged (Unlocked); mark Local (`new --local` / `add --source --local`), run `migrate`, or `add {name} --attach` before publish"
+                ))
+            })?;
+
+            let in_catalog = catalog_names.contains(name);
+            let plan = match rec.entry_kind {
+                EntryKind::Local => {
+                    if in_catalog {
+                        return Err(SkillzError::Message(format!(
+                            "skill `{name}` is Local but already exists in library `{library_name}` Catalog; use `skillz add {name} --attach` (or `--attach --from-library`) instead of publish"
+                        )));
+                    }
+                    match &rec.source {
+                        None => Planned::CreateOwned,
+                        Some(src) => Planned::CreateUpstream {
+                            source: src.clone(),
+                        },
+                    }
+                }
+                EntryKind::Owned => {
+                    if rec.library != library_name {
+                        return Err(SkillzError::Message(format!(
+                            "skill `{name}` is Locked to library `{}`, not `{library_name}`",
+                            rec.library
+                        )));
+                    }
+                    Planned::UpdateOwned
+                }
+                EntryKind::Upstream => {
+                    if rec.library != library_name {
+                        return Err(SkillzError::Message(format!(
+                            "skill `{name}` is Locked to library `{}`, not `{library_name}`",
+                            rec.library
+                        )));
+                    }
+                    let source = rec.source.clone().ok_or_else(|| {
+                        SkillzError::Message(format!(
+                            "skill `{name}` Upstream Lock is missing source provenance"
+                        ))
+                    })?;
+                    Planned::UpdateUpstream { source }
+                }
+            };
+
+            let creates = matches!(
+                plan,
+                Planned::CreateOwned | Planned::CreateUpstream { .. }
+            );
+            match mode {
+                PublishMode::UpdateOnly if creates => {
+                    return Err(SkillzError::Message(format!(
+                        "publish --update: `{name}` would create a Catalog Entry (not an update)"
+                    )));
+                }
+                PublishMode::CreateOnly if in_catalog || !creates => {
+                    return Err(SkillzError::Message(format!(
+                        "publish --create-only: `{name}` already exists in the Catalog (or is not a Local create)"
+                    )));
+                }
+                _ => {}
+            }
+            plans.push((name.clone(), plan));
+        }
+
+        // Sibling deps not in the batch (notify only).
+        let batch: std::collections::HashSet<&str> =
+            names.iter().map(String::as_str).collect();
+        let present = deps::list_skill_names(&self.scope_skills_root(&config))?;
+        let mut missing_deps = Vec::new();
+        for name in names {
+            let path = skill::skill_dir(&self.scope_skills_root(&config), name);
+            for dep in self.sibling_dep_warnings(&path, &present, &present)? {
+                if !batch.contains(dep.as_str()) && !missing_deps.iter().any(|d| d == &dep) {
+                    missing_deps.push(dep);
+                }
+            }
+        }
+
+        let mut commit_paths: Vec<PathBuf> = Vec::new();
+        let mut results: Vec<(String, bool, EntryKind, InstallationLock)> = Vec::new();
+
+        for (name, plan) in &plans {
+            let project_skill = skill::skill_dir(&self.scope_skills_root(&config), name);
+            match plan {
+                Planned::CreateOwned | Planned::UpdateOwned => {
+                    let owned = lib_path.join(crate::library::SKILLS_DIR).join(name);
+                    skill::copy_skill_tree(&project_skill, &owned)?;
+                    commit_paths.push(owned);
+                    let hash = skill::content_hash(&project_skill)?;
+                    let install = InstallationLock {
+                        library: library_name.to_string(),
+                        entry_kind: EntryKind::Owned,
+                        content_hash: hash,
+                        source: None,
+                        rev: None, // filled after commit
+                        branch: None,
+                        overlay_from_library: None,
+                        overlay_from_entry: None,
+                    };
+                    let created = matches!(plan, Planned::CreateOwned);
+                    results.push((name.clone(), created, EntryKind::Owned, install));
+                }
+                Planned::CreateUpstream { source }
+                | Planned::UpdateUpstream { source } => {
+                    let (catalog_source, lock_source, lock_rev) =
+                        self.resolve_upstream_publish_source(name, &project_skill, source)?;
+                    let mut meta = LibraryMeta::load(&lib_path)?;
+                    let existing_tags = meta
+                        .upstream
+                        .iter()
+                        .find(|e| e.name == *name)
+                        .map(|e| e.tags.clone())
+                        .unwrap_or_default();
+                    meta.upsert_upstream(crate::library::UpstreamEntry {
+                        name: name.clone(),
+                        source: catalog_source,
+                        tags: existing_tags,
+                    });
+                    meta.save(&lib_path)?;
+                    commit_paths.push(lib_path.join(crate::library::LIBRARY_TOML));
+                    let hash = skill::content_hash(&project_skill)?;
+                    let install = InstallationLock {
+                        library: library_name.to_string(),
+                        entry_kind: EntryKind::Upstream,
+                        content_hash: hash,
+                        source: Some(lock_source),
+                        rev: lock_rev,
+                        branch: None,
+                        overlay_from_library: None,
+                        overlay_from_entry: None,
+                    };
+                    let created = matches!(plan, Planned::CreateUpstream { .. });
+                    results.push((name.clone(), created, EntryKind::Upstream, install));
+                }
+            }
+        }
+
+        // Deduplicate commit paths (library.toml may appear once per upstream).
+        commit_paths.sort();
+        commit_paths.dedup();
+        let path_refs: Vec<&Path> = commit_paths.iter().map(Path::new).collect();
+        let msg = message.unwrap_or("skillz publish");
+        let rev = vcs_ops::commit_on_main(&lib_path, msg, &path_refs)?;
+
+        let mut scope_lock = self.load_scope_lock()?;
+        let mut skills = Vec::new();
+        for (name, created, kind, mut install) in results {
+            if kind == EntryKind::Owned {
+                install.rev = Some(rev.clone());
+            }
+            scope_lock
+                .installations
+                .insert(name.clone(), install.clone());
+            skills.push(PublishSkillResult {
+                name,
+                kind,
+                created,
+                lock: install,
+            });
+        }
+        self.save_scope_lock(&scope_lock)?;
+
+        Ok(PublishReport {
+            library: library_name.to_string(),
+            rev,
+            skills,
+            missing_deps,
+        })
+    }
+
+    fn resolve_upstream_publish_source(
+        &self,
+        name: &str,
+        project_skill: &Path,
+        source: &str,
+    ) -> Result<(String, String, Option<String>)> {
+        if source.starts_with("cmd:") {
+            let mut parsed = source::CmdSource::parse(source)?;
+            let version = parsed.validate_install_and_probe(project_skill, name)?;
+            parsed = parsed.with_rev(version.clone());
+            Ok((parsed.render_catalog(), parsed.render(), Some(version)))
+        } else if source.starts_with("github:") {
+            let parsed = source::GithubSource::parse(source)?;
+            if parsed.rev.is_none() {
+                return Err(SkillzError::Message(format!(
+                    "skill `{name}` Upstream source must include @rev for publish"
+                )));
+            }
+            Ok((source.to_string(), source.to_string(), parsed.rev.clone()))
+        } else {
+            Err(SkillzError::Message(format!(
+                "skill `{name}` has unsupported Upstream source `{source}` (expected github:… or cmd:…)"
+            )))
+        }
     }
 
     /// Formalize a tested Installation into a writable Library as an Owned Entry.
@@ -4663,6 +4942,164 @@ exit 1
             rec.content_hash,
             skill::content_hash(&lib_skill).unwrap()
         );
+    }
+
+    #[test]
+    fn publish_direct_refuses_unmanaged_infers_modes_and_batches() {
+        let fx = Fixture::new();
+        let lib = fx.libs_dir.join("personal");
+        fx.app().library_init(&lib, "personal", false).unwrap();
+        vcs_ops::init_git_repo(&lib).unwrap();
+        // Commit library.toml so main has content before publish.
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "add", "library.toml", "skills"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", lib.to_str().unwrap(), "commit", "-m", "skeleton"])
+            .status()
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        // Unmanaged / Unlocked refused.
+        fx.app().skill_new("orphan", &[]).unwrap();
+        let err = fx
+            .app()
+            .publish_skills(
+                &["orphan".into()],
+                "personal",
+                PublishMode::Auto,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unmanaged"), "{err}");
+        assert!(err.to_string().contains("--attach") || err.to_string().contains("migrate"), "{err}");
+
+        // Local authored create.
+        fx.app()
+            .skill_new_with_local("alpha", &[], true)
+            .unwrap();
+        fx.app()
+            .skill_new_with_local("beta", &[], true)
+            .unwrap();
+        // Sibling dep notify: beta depends on grilling (not in batch).
+        fs::write(
+            fx.project_dir.join(".agents/skills/beta/SKILL.md"),
+            "---\nname: beta\ndepends: [grilling]\n---\n# beta\n",
+        )
+        .unwrap();
+
+        let report = fx
+            .app()
+            .publish_skills(
+                &["alpha".into(), "beta".into()],
+                "personal",
+                PublishMode::Auto,
+                Some("batch create"),
+            )
+            .unwrap();
+        assert_eq!(report.skills.len(), 2);
+        assert!(report.skills.iter().all(|s| s.created));
+        assert!(report.skills.iter().all(|s| s.kind == EntryKind::Owned));
+        assert!(report.missing_deps.iter().any(|d| d == "grilling"));
+        assert!(lib.join("skills/alpha/SKILL.md").is_file());
+        assert!(lib.join("skills/beta/SKILL.md").is_file());
+        // One main commit unit — both locks share the same rev.
+        assert_eq!(
+            report.skills[0].lock.rev.as_deref(),
+            report.skills[1].lock.rev.as_deref()
+        );
+        assert_eq!(report.skills[0].lock.rev.as_deref(), Some(report.rev.as_str()));
+
+        // Local + Catalog hit → attach hint.
+        fx.app()
+            .skill_new_with_local("alpha-local", &[], true)
+            .unwrap();
+        // Rename trick: create Local named alpha while Catalog has alpha — use set_local after removing lock then re-scaffold? Simpler: mark alpha Local again after publish cleared Local.
+        fx.app().set_local_authored("alpha").unwrap();
+        let err = fx
+            .app()
+            .publish_skills(&["alpha".into()], "personal", PublishMode::Auto, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("--attach"), "{err}");
+
+        // Re-lock alpha as Library-backed for update tests.
+        fx.app()
+            .add_skill_with_deps("alpha", Some("personal"), false, true, true)
+            .unwrap();
+        fs::write(
+            fx.project_dir.join(".agents/skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: edited\n---\n# edited\n",
+        )
+        .unwrap();
+
+        // --create-only fails when Catalog exists.
+        let err = fx
+            .app()
+            .publish_skills(
+                &["alpha".into()],
+                "personal",
+                PublishMode::CreateOnly,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("create-only"), "{err}");
+
+        // --update succeeds for Library-backed; fails for Local create.
+        let updated = fx
+            .app()
+            .publish_skills(
+                &["alpha".into()],
+                "personal",
+                PublishMode::UpdateOnly,
+                Some("update alpha"),
+            )
+            .unwrap();
+        assert_eq!(updated.skills.len(), 1);
+        assert!(!updated.skills[0].created);
+        assert!(
+            fs::read_to_string(lib.join("skills/alpha/SKILL.md"))
+                .unwrap()
+                .contains("edited")
+        );
+
+        fx.app()
+            .skill_new_with_local("gamma", &[], true)
+            .unwrap();
+        let err = fx
+            .app()
+            .publish_skills(
+                &["gamma".into()],
+                "personal",
+                PublishMode::UpdateOnly,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("--update"), "{err}");
+
+        // Infer Upstream from Local+source.
+        fx.app().skill_new("upskill", &[]).unwrap();
+        fx.app()
+            .set_local_source(
+                "upskill",
+                "github:acme/skills/skills/upskill@deadbeef",
+            )
+            .unwrap();
+        let up = fx
+            .app()
+            .publish_skills(
+                &["upskill".into()],
+                "personal",
+                PublishMode::CreateOnly,
+                Some("upstream"),
+            )
+            .unwrap();
+        assert!(up.skills[0].created);
+        assert_eq!(up.skills[0].kind, EntryKind::Upstream);
+        let meta = LibraryMeta::load(&lib).unwrap();
+        assert!(meta.upstream.iter().any(|e| e.name == "upskill"));
     }
 
     #[test]
