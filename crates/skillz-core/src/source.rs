@@ -25,24 +25,40 @@ impl GithubSource {
         Self::from_owner_repo_rest(rest)
     }
 
-    /// Accept `github:…` or `https://github.com/owner/repo…` and normalize.
+    /// Whether `raw` looks like a GitHub remote / `github:` source (not a local path).
+    pub fn looks_like_remote(raw: &str) -> bool {
+        let raw = raw.trim();
+        raw.starts_with("github:")
+            || raw.starts_with("https://github.com/")
+            || raw.starts_with("http://github.com/")
+            || raw.starts_with("git@github.com:")
+            || raw.starts_with("ssh://git@github.com/")
+    }
+
+    /// Accept `github:…`, HTTPS, or SSH GitHub remotes and normalize to `github:…`.
     pub fn parse_input(raw: &str) -> Result<Self> {
         let raw = raw.trim();
         if raw.starts_with("github:") {
             return Self::parse(raw);
         }
-        Self::parse_https_url(raw)
-    }
-
-    fn parse_https_url(raw: &str) -> Result<Self> {
-        let rest = raw
+        if let Some(rest) = raw
             .strip_prefix("https://github.com/")
             .or_else(|| raw.strip_prefix("http://github.com/"))
-            .ok_or_else(|| {
-                SkillzError::Message(format!(
-                    "expected github:owner/repo… or https://github.com/owner/repo…, got `{raw}`"
-                ))
-            })?;
+        {
+            return Self::from_https_path_rest(rest, raw);
+        }
+        if let Some(rest) = raw.strip_prefix("git@github.com:") {
+            return Self::from_ssh_owner_repo_rest(rest, raw);
+        }
+        if let Some(rest) = raw.strip_prefix("ssh://git@github.com/") {
+            return Self::from_ssh_owner_repo_rest(rest.trim_start_matches('/'), raw);
+        }
+        Err(SkillzError::Message(format!(
+            "expected github:owner/repo…, https://github.com/owner/repo…, or git@github.com:owner/repo…, got `{raw}`"
+        )))
+    }
+
+    fn from_https_path_rest(rest: &str, raw: &str) -> Result<Self> {
         let rest = rest.trim_start_matches('/');
         // Accept github-style `@rev` on HTTPS URLs too:
         // `https://github.com/o/r@v2.1.0`, `https://github.com/o/r/@v2.1.0`.
@@ -86,6 +102,39 @@ impl GithubSource {
         };
         // Prefer GitHub UI `/tree|blob|commit/REV` when present; else `@rev`.
         let rev = tree_rev.or(at_rev);
+        Ok(Self {
+            owner,
+            repo,
+            path,
+            rev,
+        })
+    }
+
+    /// Parse `owner/repo[.git][/path][@rev]` from an SSH-style GitHub remote.
+    fn from_ssh_owner_repo_rest(rest: &str, raw: &str) -> Result<Self> {
+        let rest = rest.trim();
+        let (path_part, rev) = match rest.rsplit_once('@') {
+            Some((path, rev)) if !rev.is_empty() && !rev.contains('/') => {
+                (path.trim_end_matches('/'), Some(rev.to_string()))
+            }
+            _ => (rest, None),
+        };
+        let mut segments: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.len() < 2 {
+            return Err(SkillzError::Message(format!(
+                "github SSH URL missing owner/repo: `{raw}`"
+            )));
+        }
+        let owner = segments.remove(0).to_string();
+        let mut repo = segments.remove(0).to_string();
+        if let Some(stripped) = repo.strip_suffix(".git") {
+            repo = stripped.to_string();
+        }
+        let path = if segments.is_empty() {
+            None
+        } else {
+            Some(segments.join("/"))
+        };
         Ok(Self {
             owner,
             repo,
@@ -585,6 +634,34 @@ mod tests {
             s.render(),
             "github:Leonxlnx/taste-skill/skills@v2.1.0"
         );
+    }
+
+    #[test]
+    fn normalizes_ssh_and_plain_https_clone_urls() {
+        let s = GithubSource::parse_input("https://github.com/campfireshuffle/rex-teams").unwrap();
+        assert_eq!(s.render(), "github:campfireshuffle/rex-teams");
+        assert!(GithubSource::looks_like_remote(
+            "https://github.com/campfireshuffle/rex-teams"
+        ));
+
+        let s =
+            GithubSource::parse_input("git@github.com:campfireshuffle/rex-teams.git").unwrap();
+        assert_eq!(s.owner, "campfireshuffle");
+        assert_eq!(s.repo, "rex-teams");
+        assert!(s.path.is_none());
+        assert!(s.rev.is_none());
+        assert_eq!(s.render(), "github:campfireshuffle/rex-teams");
+
+        let s = GithubSource::parse_input("git@github.com:campfireshuffle/rex-teams@abc123").unwrap();
+        assert_eq!(s.render(), "github:campfireshuffle/rex-teams@abc123");
+
+        let s =
+            GithubSource::parse_input("ssh://git@github.com/campfireshuffle/rex-teams.git").unwrap();
+        assert_eq!(s.render(), "github:campfireshuffle/rex-teams");
+        assert!(GithubSource::looks_like_remote(
+            "git@github.com:campfireshuffle/rex-teams"
+        ));
+        assert!(!GithubSource::looks_like_remote("./vendor/skills"));
     }
 
     #[test]

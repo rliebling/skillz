@@ -923,7 +923,7 @@ impl App {
             )));
         }
         let source = source.trim();
-        let (canonical, rev) = if source.starts_with("github:") || source.contains("github.com/") {
+        let (canonical, rev) = if source::GithubSource::looks_like_remote(source) {
             let parsed = source::GithubSource::parse_input(source)?;
             if parsed.rev.as_deref().unwrap_or("").is_empty() {
                 return Err(SkillzError::Message(
@@ -941,7 +941,7 @@ impl App {
             (parsed.render(), parsed.rev.clone())
         } else {
             return Err(SkillzError::Message(format!(
-                "Local source must be `github:…` or `cmd:…`, got `{source}`"
+                "Local source must be `github:…` (or https:// / git@ GitHub URL) or `cmd:…`, got `{source}`"
             )));
         };
         let install = InstallationLock {
@@ -2335,8 +2335,8 @@ impl App {
 
     /// Stage an Upstream skill into the Project skills dir (Unlocked until managed).
     ///
-    /// `source` is a filesystem path, `github:owner/repo…`, or `cmd:…`. Optional
-    /// `skill_name` enables nested name lookup / cmd install name
+    /// `source` is a filesystem path, `github:…` / HTTPS / SSH GitHub remote, or
+    /// `cmd:…`. Optional `skill_name` enables nested name lookup / cmd install name
     /// (`skillz add --source github:owner/repo NAME`).
     pub fn fetch_skill(
         &self,
@@ -2371,13 +2371,13 @@ impl App {
             return Ok((dest, Some(pinned)));
         }
 
-        if source.starts_with("github:") {
-            let parsed = source::GithubSource::parse(source)?;
+        if source::GithubSource::looks_like_remote(source) {
+            let parsed = source::GithubSource::parse_input(source)?;
             let cache = self.paths.config_dir.join("cache");
             let (skill_path, pinned) =
                 fetch::resolve_github_skill(&cache, &parsed, skill_name)?;
             let dest = fetch::stage_skill(&skills_root, &skill_path, skill_name)?;
-            // Stash pinned source beside the skill for libcommit (sidecar).
+            // Stash pinned source beside the skill for publish (sidecar).
             let sidecar = dest.join(".skillz-source");
             std::fs::write(&sidecar, pinned.render()).map_err(|e| {
                 SkillzError::Message(format!("failed to write {}: {e}", sidecar.display()))
@@ -2875,14 +2875,15 @@ impl App {
             let version = parsed.validate_install_and_probe(project_skill, name)?;
             parsed = parsed.with_rev(version.clone());
             Ok((parsed.render_catalog(), parsed.render(), Some(version)))
-        } else if source.starts_with("github:") {
-            let parsed = source::GithubSource::parse(source)?;
+        } else if source::GithubSource::looks_like_remote(source) {
+            let parsed = source::GithubSource::parse_input(source)?;
             if parsed.rev.is_none() {
                 return Err(SkillzError::Message(format!(
                     "skill `{name}` Upstream source must include @rev for publish"
                 )));
             }
-            Ok((source.to_string(), source.to_string(), parsed.rev.clone()))
+            let rendered = parsed.render();
+            Ok((rendered.clone(), rendered, parsed.rev.clone()))
         } else {
             Err(SkillzError::Message(format!(
                 "skill `{name}` has unsupported Upstream source `{source}` (expected github:… or cmd:…)"

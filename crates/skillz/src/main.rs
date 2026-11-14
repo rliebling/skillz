@@ -264,6 +264,7 @@ Notes:
   `add NAME --attach` Locks an on-disk skill to a Catalog Entry (does not publish).
   `add NAME --attach --from-library` replaces Installation files from the Catalog, then Locks.
   `add --source SOURCE [NAME]` stages github/path/cmd into skills_dir.
+  GitHub remotes may be `github:…`, `https://github.com/…`, or `git@github.com:…`.
   With `--source --local`, marks Local+source (github:/cmd: only). Without --local, Unlocked.
 
 Examples:
@@ -271,6 +272,8 @@ Examples:
   skillz add grilling --attach -l personal
   skillz add grilling --attach --from-library -l personal
   skillz add --source github:owner/repo/skills/foo@abc1234
+  skillz add --source https://github.com/campfireshuffle/rex-teams
+  skillz add --source git@github.com:campfireshuffle/rex-teams.git
   skillz add --source ./vendor/skills ecto-thinking
   skillz add --source 'cmd:tool skill install --dir {dir}' my-skill --local
 ")]
@@ -284,7 +287,7 @@ Examples:
         /// Add all Catalog Entries matching tags (AND)
         #[arg(short = 't', long = "tag")]
         tags: Vec<String>,
-        /// Stage from filesystem path, `github:…`, or `cmd:…` (not Catalog install)
+        /// Stage from filesystem path, `github:…` / HTTPS / `git@github.com:…`, or `cmd:…`
         #[arg(long, value_name = "SOURCE")]
         source: Option<String>,
         /// With --source: Local+source membership; with catalog add, not applicable
@@ -455,7 +458,7 @@ Examples:
   # Does not install into a Project or --user scope — Catalog Entries only
 ")]
     Import {
-        /// `github:owner/repo[/path][@rev]` or `https://github.com/owner/repo…`
+        /// `github:…`, `https://github.com/…`, or `git@github.com:…`
         source: String,
         /// Target registered Library name (defaults to the Library containing cwd)
         #[arg(short = 'l', long = "library")]
