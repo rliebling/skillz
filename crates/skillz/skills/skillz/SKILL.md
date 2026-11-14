@@ -64,6 +64,7 @@ skillz add NAME
 skillz add NAME --attach -l LIBRARY
 skillz add --source github:owner/repo/path@rev
 skillz add --source 'cmd:tool skill install --dir {dir}' NAME --local
+# skills-root CLIs (create <dir>/<name>/): use {skills_dir} instead of {dir}
 skillz new NAME --local
 skillz publish NAME -l LIBRARY
 skillz publish NAME -l LIBRARY --dry-run
@@ -91,7 +92,7 @@ User-global: `skillz user init --binding LIBRARY`.
 
 - **Owned / Authored**: Local authored → `publish` creates Owned Entry under Library `skills/`.
 - **Upstream github**: Local+source `github:…@rev` → `publish` writes Catalog reference (no Library file mirror).
-- **Tool-Provided**: Local+source `cmd:…` → Catalog stores install template; Locks pin tool version; `add` re-runs the template.
+- **Tool-Provided**: Local+source `cmd:…` → Catalog stores install template; Locks pin tool version; `add` re-runs the template. Placeholders: `{dir}` = Installation path (tool writes `SKILL.md` there); `{skills_dir}` = skills root (tool creates `<skills_dir>/<name>/`); `{name}` = skill name. Nested `{dir}/{name}/` installs are hoisted flat.
 
 ## Edit / Drift flow
 

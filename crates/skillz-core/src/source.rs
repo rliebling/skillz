@@ -1,6 +1,7 @@
 //! Upstream source grammars: `github:…` and Tool-Provided `cmd:…`.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::{Result, SkillzError};
@@ -175,10 +176,19 @@ impl GithubSource {
 /// Tool-Provided Upstream source: command template that materializes a skill.
 ///
 /// Grammar: `cmd:<template>[|version:<version-cmd>][@<tool-version>]`
-/// Placeholders in the template: `{dir}` (Installation path), `{name}` (skill name).
+///
+/// Placeholders in the template:
+/// - `{dir}` — Installation path (`…/skills/<name>`); install-dir tools write
+///   `SKILL.md` here.
+/// - `{skills_dir}` — parent of `{dir}` (the skills root); skills-root tools
+///   create `<skills_dir>/<name>/SKILL.md`.
+/// - `{name}` — skill name.
+///
+/// After the tool runs, [`normalize_cmd_install`] flattens a nested
+/// `{dir}/{name}/` tree into the Installation when present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdSource {
-    /// Install command template (no `cmd:` prefix; may contain `{dir}` / `{name}`).
+    /// Install command template (no `cmd:` prefix; may contain placeholders).
     pub template: String,
     /// Optional version probe command; default is `{argv0} --version`.
     pub version_cmd: Option<String>,
@@ -263,10 +273,23 @@ impl CmdSource {
         self
     }
 
-    fn substitute(&self, dir: &Path, name: &str) -> String {
-        self.template
+    fn substitute(&self, dir: &Path, name: &str) -> Result<String> {
+        let mut rendered = self
+            .template
             .replace("{dir}", &dir.display().to_string())
-            .replace("{name}", name)
+            .replace("{name}", name);
+        if rendered.contains("{skills_dir}") {
+            let skills_dir = dir.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(
+                || {
+                    SkillzError::Message(format!(
+                        "Installation path {} has no parent; cannot expand {{skills_dir}}",
+                        dir.display()
+                    ))
+                },
+            )?;
+            rendered = rendered.replace("{skills_dir}", &skills_dir.display().to_string());
+        }
+        Ok(rendered)
     }
 
     fn version_probe_command(&self) -> Result<String> {
@@ -293,40 +316,129 @@ impl CmdSource {
 
     /// Eagerly validate install + version probe (Library catalog / libcommit).
     ///
-    /// Runs the install template into `dir`, requires `SKILL.md`, then returns the
-    /// probed tool version for the Lock.
+    /// Runs the install template into `dir`, normalizes nested layouts, requires
+    /// `SKILL.md`, then returns the probed tool version for the Lock.
     pub fn validate_install_and_probe(&self, dir: &Path, name: &str) -> Result<String> {
         self.run_install(dir, name)?;
-        if !dir.join("SKILL.md").is_file() {
-            return Err(SkillzError::Message(format!(
-                "cmd: install for `{name}` did not create SKILL.md under {}",
-                dir.display()
-            )));
-        }
         self.probe_version()
     }
 
-    /// Materialize the skill into `dir` by running the install template.
+    /// Materialize the skill into `dir` by running the install template, then
+    /// normalize so `SKILL.md` lands at the Installation root.
     pub fn run_install(&self, dir: &Path, name: &str) -> Result<()> {
         if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            fs::create_dir_all(parent).map_err(|e| {
                 SkillzError::Message(format!(
                     "failed to create {}: {e}",
                     parent.display()
                 ))
             })?;
         }
-        std::fs::create_dir_all(dir).map_err(|e| {
+        fs::create_dir_all(dir).map_err(|e| {
             SkillzError::Message(format!("failed to create {}: {e}", dir.display()))
         })?;
-        let rendered = self.substitute(dir, name);
+        let rendered = self.substitute(dir, name)?;
         let argv = split_argv(&rendered)?;
         let _ = run_argv(
             &argv,
             &format!("cmd: install `{}`", self.template),
         )?;
+        normalize_cmd_install(dir, name)
+    }
+}
+
+/// Ensure `dir/SKILL.md` exists after a `cmd:` install.
+///
+/// Skills-root tools given `{dir}` (or leftovers beside a nested write) produce
+/// `{dir}/{name}/SKILL.md`. When that nest exists it is treated as the tool's
+/// fresh output and hoisted into `dir`.
+pub fn normalize_cmd_install(dir: &Path, name: &str) -> Result<()> {
+    let nest = dir.join(name);
+    let nested_skill = nest.join("SKILL.md");
+    if nested_skill.is_file() {
+        hoist_tree_into(&nest, dir)?;
+        fs::remove_dir_all(&nest).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to remove nested install {}: {e}",
+                nest.display()
+            ))
+        })?;
+    }
+    if !dir.join("SKILL.md").is_file() {
+        return Err(SkillzError::Message(format!(
+            "cmd: install for `{name}` did not create SKILL.md under {} \
+             (also checked {}/{name}/SKILL.md for skills-root layout)",
+            dir.display(),
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Copy every file/dir from `from` into `to` (overwriting), preserving relative paths.
+fn hoist_tree_into(from: &Path, to: &Path) -> Result<()> {
+    let files = list_files_under(from)?;
+    for rel in files {
+        let src = from.join(&rel);
+        let dst = to.join(&rel);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                SkillzError::Message(format!(
+                    "failed to create {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        if dst.exists() {
+            if dst.is_dir() {
+                fs::remove_dir_all(&dst).map_err(|e| {
+                    SkillzError::Message(format!(
+                        "failed to replace {}: {e}",
+                        dst.display()
+                    ))
+                })?;
+            } else {
+                fs::remove_file(&dst).map_err(|e| {
+                    SkillzError::Message(format!(
+                        "failed to replace {}: {e}",
+                        dst.display()
+                    ))
+                })?;
+            }
+        }
+        fs::copy(&src, &dst).map_err(|e| {
+            SkillzError::Message(format!(
+                "failed to hoist {} → {}: {e}",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn list_files_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, prefix: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let entries = fs::read_dir(dir).map_err(|e| {
+            SkillzError::Message(format!("failed to read {}: {e}", dir.display()))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                SkillzError::Message(format!("failed to read dir entry: {e}"))
+            })?;
+            let path = entry.path();
+            let rel = prefix.join(entry.file_name());
+            if path.is_dir() {
+                walk(&path, &rel, out)?;
+            } else {
+                out.push(rel);
+            }
+        }
         Ok(())
     }
+    walk(root, Path::new(""), &mut out)?;
+    Ok(out)
 }
 
 fn split_argv(command: &str) -> Result<Vec<String>> {
@@ -516,5 +628,116 @@ mod tests {
             Some("9.9.9")
         );
         assert_eq!(normalize_tool_version("v2.0.0").as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn substitute_expands_skills_dir() {
+        let s = CmdSource::parse("cmd:tool install --dir {skills_dir} --name {name}").unwrap();
+        let rendered = s
+            .substitute(Path::new("/tmp/skills/demo"), "demo")
+            .unwrap();
+        assert_eq!(rendered, "tool install --dir /tmp/skills --name demo");
+    }
+
+    #[test]
+    fn substitute_skills_dir_requires_parent() {
+        let s = CmdSource::parse("cmd:tool install --dir {skills_dir}").unwrap();
+        let err = s.substitute(Path::new("demo"), "demo").unwrap_err();
+        assert!(
+            err.to_string().contains("{skills_dir}"),
+            "unexpected err: {err}"
+        );
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn install_dir_tool_writes_flat_skill_md() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("install-flat.sh");
+        write_executable(
+            &script,
+            "#!/bin/sh\n# usage: install-flat.sh --dir DIR\ndir=\"$2\"\nprintf '%s\\n' '---' 'name: demo' '---' 'flat' > \"$dir/SKILL.md\"\n",
+        );
+        let install = root.path().join("skills").join("demo");
+        let src = format!(
+            "cmd:{} --dir {{dir}}|version:echo 1.0.0",
+            script.display()
+        );
+        let parsed = CmdSource::parse(&src).unwrap();
+        parsed.run_install(&install, "demo").unwrap();
+        assert_eq!(
+            fs::read_to_string(install.join("SKILL.md")).unwrap().contains("flat"),
+            true
+        );
+        assert!(!install.join("demo").exists());
+    }
+
+    #[test]
+    fn skills_root_tool_with_dir_hoists_nested_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("install-nest.sh");
+        write_executable(
+            &script,
+            "#!/bin/sh\n# skills-root style given Installation path: nest under DIR/NAME\ndir=\"$2\"\nname=\"$4\"\nmkdir -p \"$dir/$name\"\nprintf '%s\\n' '---' \"name: $name\" '---' 'nested' > \"$dir/$name/SKILL.md\"\n",
+        );
+        let install = root.path().join("skills").join("demo");
+        // Pre-existing flat file that would previously mask the nest.
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("SKILL.md"), "stale flat\n").unwrap();
+        let src = format!(
+            "cmd:{} --dir {{dir}} --name {{name}}|version:echo 1.0.0",
+            script.display()
+        );
+        let parsed = CmdSource::parse(&src).unwrap();
+        parsed.run_install(&install, "demo").unwrap();
+        let body = fs::read_to_string(install.join("SKILL.md")).unwrap();
+        assert!(body.contains("nested"), "expected hoisted body, got {body}");
+        assert!(!body.contains("stale"), "stale flat should be overwritten");
+        assert!(
+            !install.join("demo").exists(),
+            "nested directory should be removed"
+        );
+    }
+
+    #[test]
+    fn skills_root_tool_with_skills_dir_writes_flat() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("install-root.sh");
+        write_executable(
+            &script,
+            "#!/bin/sh\n# skills-root style: create DIR/NAME/SKILL.md\nroot=\"$2\"\nname=\"$4\"\nmkdir -p \"$root/$name\"\nprintf '%s\\n' '---' \"name: $name\" '---' 'from-root' > \"$root/$name/SKILL.md\"\n",
+        );
+        let install = root.path().join("skills").join("demo");
+        let src = format!(
+            "cmd:{} --dir {{skills_dir}} --name {{name}}|version:echo 1.0.0",
+            script.display()
+        );
+        let parsed = CmdSource::parse(&src).unwrap();
+        parsed.run_install(&install, "demo").unwrap();
+        let body = fs::read_to_string(install.join("SKILL.md")).unwrap();
+        assert!(body.contains("from-root"), "got {body}");
+        assert!(!install.join("demo").exists());
+    }
+
+    #[test]
+    fn normalize_errors_when_neither_flat_nor_nested() {
+        let root = tempfile::tempdir().unwrap();
+        let install = root.path().join("skills").join("demo");
+        fs::create_dir_all(&install).unwrap();
+        let err = normalize_cmd_install(&install, "demo").unwrap_err();
+        assert!(
+            err.to_string().contains("did not create SKILL.md"),
+            "unexpected err: {err}"
+        );
     }
 }
