@@ -19,6 +19,11 @@ cases, also read [`jujutsu-advanced.md`](jujutsu-advanced.md).
 
 ## Descriptions
 
+**Why over what** (see also SKILL.md **Commit / change descriptions**).
+The description exists so history explains *motivation* — the bug, risk, or
+goal — not a prose restatement of the diff. Lead with why; mention what only
+when it clarifies the why.
+
 Use Conventional Commits unless `AGENTS.md` (or equivalent) explicitly
 states another style.
 
@@ -26,11 +31,12 @@ For ticket work, put the ticket id at the end of the subject in
 parentheses:
 
 ```text
-feat: tighten start-work rules (z-abc)
+feat: tighten start-work rules so agents cannot skip describe (z-abc)
 ```
 
 Refine with `jj describe` as the work evolves; the first description is an
-intent, not a final message.
+intent, not a final message. Before `jj new`, ensure the final description
+still states why the change landed.
 
 ## Start of work
 

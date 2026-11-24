@@ -50,6 +50,23 @@ before edits, when to `jj new`).
 - **Git:** leave the tree uncommitted unless the user asked to commit.
 - **jj:** refine `jj describe` as intent shifts; see [`jujutsu.md`](jujutsu.md).
 
+## Commit / change descriptions
+
+**Why over what.** Git commit messages and `jj describe` text must explain
+*why* the change exists — the problem, risk, or intent a future reader cannot
+get from the diff. Describing *what* changed (files touched, renames, API
+shape) is secondary and often redundant with the patch.
+
+- Lead with motivation in the subject (and body when needed).
+- Prefer: `fix: follow symlink skill dirs so drift sees tool installs`
+  over: `fix: use path.is_dir() instead of file_type().is_dir()`.
+- Still use Conventional Commits (or the repo's stated style). For ticket
+  work, put the ticket id at the end of the subject, e.g.
+  `feat: tighten login throttle to cut lock contention (z-abc)`.
+
+Apply this whenever you write or revise a commit/`jj describe` message —
+including at start of work (intent) and end of work (final description).
+
 ## End of work
 
 ### Git
@@ -58,14 +75,13 @@ Do **not** commit, push, amend, rebase, or rewrite history unless the user
 asked.
 
 When the user asks to commit, follow the repo's commit rules if present
-(e.g. `AGENTS.md`). Otherwise use Conventional Commits. For ticket work,
-put the ticket id at the end of the subject in parentheses, e.g.
-`feat: add login throttle (z-abc)`.
+(e.g. `AGENTS.md`), and the **Commit / change descriptions** rules above.
 
 ### jj
 
 Follow **End of work** in [`jujutsu.md`](jujutsu.md) (final describe, then
-`jj new`). Do not wait for the user to ask to "commit."
+`jj new`). Do not wait for the user to ask to "commit." Final description
+must follow **Commit / change descriptions** (why-first).
 
 Non-trivial jj ops (bookmarks, push/PR, conflicts, recovery): 
 [`jujutsu-advanced.md`](jujutsu-advanced.md).
