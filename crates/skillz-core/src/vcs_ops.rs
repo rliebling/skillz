@@ -572,25 +572,8 @@ fn jj_has_any_remote(repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Run `git` with stdout/stderr captured (same TUI-safety rationale as [`run_jj`]).
 fn run(repo: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
-        .args(["-C"])
-        .arg(repo)
-        .args(args)
-        .status()
-        .map_err(|e| SkillzError::Message(format!("git failed: {e}")))?;
-    if !status.success() {
-        return Err(SkillzError::Message(format!(
-            "git {} failed in {}",
-            args.join(" "),
-            repo.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Like [`run`], but captures stdout/stderr so probe/best-effort calls stay quiet.
-fn run_git_quiet(repo: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git")
         .args(["-C"])
         .arg(repo)
@@ -598,13 +581,18 @@ fn run_git_quiet(repo: &Path, args: &[&str]) -> Result<()> {
         .output()
         .map_err(|e| SkillzError::Message(format!("git failed: {e}")))?;
     if !output.status.success() {
+        let detail = cmd_fail_detail(&output);
         return Err(SkillzError::Message(format!(
-            "git {} failed in {}",
+            "git {} failed in {}: {detail}",
             args.join(" "),
             repo.display()
         )));
     }
     Ok(())
+}
+
+fn run_git_quiet(repo: &Path, args: &[&str]) -> Result<()> {
+    run(repo, args)
 }
 
 fn stdout(repo: &Path, args: &[&str]) -> Result<String> {
@@ -624,25 +612,12 @@ fn stdout(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run `jj` with stdout/stderr captured.
+///
+/// Never inherit the process TTY: `jj new` / `bookmark set` / `status` print
+/// working-copy chatter that corrupts Ratatui boards (`drift -i`) and other
+/// skillz-owned displays.
 fn run_jj(repo: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("jj")
-        .args(["-R"])
-        .arg(repo)
-        .args(args)
-        .status()
-        .map_err(|e| SkillzError::Message(format!("jj failed: {e}")))?;
-    if !status.success() {
-        return Err(SkillzError::Message(format!(
-            "jj {} failed in {}",
-            args.join(" "),
-            repo.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Like [`run_jj`], but captures stdout/stderr so probe/best-effort calls stay quiet.
-fn run_jj_quiet(repo: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("jj")
         .args(["-R"])
         .arg(repo)
@@ -650,13 +625,34 @@ fn run_jj_quiet(repo: &Path, args: &[&str]) -> Result<()> {
         .output()
         .map_err(|e| SkillzError::Message(format!("jj failed: {e}")))?;
     if !output.status.success() {
+        let detail = cmd_fail_detail(&output);
         return Err(SkillzError::Message(format!(
-            "jj {} failed in {}",
+            "jj {} failed in {}: {detail}",
             args.join(" "),
             repo.display()
         )));
     }
     Ok(())
+}
+
+/// Alias kept for call sites that historically meant "best-effort quiet".
+fn run_jj_quiet(repo: &Path, args: &[&str]) -> Result<()> {
+    run_jj(repo, args)
+}
+
+fn cmd_fail_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    if detail.is_empty() {
+        output.status.to_string()
+    } else {
+        detail.to_string()
+    }
 }
 
 fn stdout_jj(repo: &Path, args: &[&str]) -> Result<String> {
@@ -667,8 +663,9 @@ fn stdout_jj(repo: &Path, args: &[&str]) -> Result<String> {
         .output()
         .map_err(|e| SkillzError::Message(format!("jj failed: {e}")))?;
     if !output.status.success() {
+        let detail = cmd_fail_detail(&output);
         return Err(SkillzError::Message(format!(
-            "jj {} failed in {}",
+            "jj {} failed in {}: {detail}",
             args.join(" "),
             repo.display()
         )));
