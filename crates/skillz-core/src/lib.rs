@@ -1618,11 +1618,12 @@ impl App {
                 let entry = entry.map_err(|e| {
                     SkillzError::Message(format!("failed to read {}: {e}", root.display()))
                 })?;
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let path = entry.path();
+                // Follow symlinks: `file_type().is_dir()` is false for symlink→dir.
+                if !skill::resolves_to_dir(&path) {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let path = entry.path();
                 match lock.installations.get(&name) {
                     None => items.push(DriftItem {
                         name,
@@ -4886,6 +4887,43 @@ mod tests {
         let body = fs::read_to_string(&hooks[0]).unwrap();
         assert!(body.contains("skillz drift --check"));
         assert!(body.contains("SKILLZ_ALLOW_DRIFT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drift_reports_unlocked_symlink_skill_tree() {
+        let fx = Fixture::new();
+        fx.app()
+            .library_init(&fx.libs_dir.join("personal"), "personal", false)
+            .unwrap();
+        fx.app()
+            .project_init(&["personal".into()], None)
+            .unwrap();
+
+        let target = fx
+            .project_dir
+            .parent()
+            .unwrap()
+            .join("elsewhere")
+            .join("terminal-browser");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: terminal-browser\n---\n# terminal-browser\n",
+        )
+        .unwrap();
+        let skills = fx.project_dir.join(".agents/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let link = skills.join("terminal-browser");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let drift = fx.app().detect_drift().unwrap();
+        assert!(
+            drift.iter().any(|d| {
+                d.name == "terminal-browser" && d.reason == DriftReason::Unlocked
+            }),
+            "expected Unlocked drift for symlink skill, got {drift:?}"
+        );
     }
 
     #[test]

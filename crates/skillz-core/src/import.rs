@@ -104,9 +104,8 @@ pub fn list_local_skill_names(skills_dir: &Path) -> Result<Vec<String>> {
         let entry = entry.map_err(|e| {
             SkillzError::Message(format!("failed to read {}: {e}", skills_dir.display()))
         })?;
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-            && entry.path().join("SKILL.md").is_file()
-        {
+        let path = entry.path();
+        if crate::skill::resolves_to_dir(&path) && path.join("SKILL.md").is_file() {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -184,5 +183,23 @@ github  skill  owner/repo@abc  path/to/ecto-thinking
         );
         assert_eq!(entries[1].name, "ecto-thinking");
         assert!(entries[1].source.ends_with("@abc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_local_skill_names_includes_symlink_to_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        let target = root.path().join("elsewhere").join("terminal-browser");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: terminal-browser\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(&target, skills.join("terminal-browser")).unwrap();
+        let names = list_local_skill_names(&skills).unwrap();
+        assert_eq!(names, vec!["terminal-browser".to_string()]);
     }
 }

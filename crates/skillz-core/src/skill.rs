@@ -8,6 +8,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{Result, SkillzError};
 
+/// True if `path` resolves to a directory (follows symlinks).
+///
+/// Prefer this over [`std::fs::DirEntry::file_type`] + `is_dir()`, which is
+/// **false** for symlink→dir and silently skips tool-installed skills that are
+/// symlinks into another tree (e.g. `~/.agents/skills/terminal-browser` → …).
+pub fn resolves_to_dir(path: &Path) -> bool {
+    path.is_dir()
+}
+
 /// Recorded Lock for one Installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallationLock {
@@ -336,5 +345,21 @@ mod tests {
         assert!(h1.starts_with("sha256:"));
         fs::write(skill.join("SKILL.md"), "hello!").unwrap();
         assert_ne!(h1, content_hash(&skill).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_to_dir_follows_symlink_to_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("real-skill");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "---\nname: real-skill\n---\n").unwrap();
+        let link = root.path().join("linked-skill");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(resolves_to_dir(&link));
+        assert_eq!(
+            content_hash(&link).unwrap(),
+            content_hash(&target).unwrap()
+        );
     }
 }

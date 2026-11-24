@@ -66,11 +66,12 @@ pub fn list_owned_entries(library_name: &str, library_path: &Path) -> Result<Vec
         let entry = entry.map_err(|e| {
             SkillzError::Message(format!("failed to read {}: {e}", skills.display()))
         })?;
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let skill_path = entry.path();
+        // Follow symlinks: `file_type().is_dir()` is false for symlink→dir.
+        if !crate::skill::resolves_to_dir(&skill_path) {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let skill_path = entry.path();
         if !skill_path.join("SKILL.md").is_file() {
             continue;
         }
@@ -314,5 +315,22 @@ mod tests {
             merge_tags(&["elixir".into()], &["phoenix".into(), "elixir".into()]),
             vec!["elixir".to_string(), "phoenix".to_string()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_owned_entries_includes_symlink_to_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let lib = root.path().join("lib");
+        let skills = lib.join(SKILLS_DIR);
+        let target = root.path().join("real").join("linked");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "---\nname: linked\n---\n").unwrap();
+        fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(&target, skills.join("linked")).unwrap();
+        let entries = list_owned_entries("personal", &lib).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "linked");
+        assert_eq!(entries[0].kind, EntryKind::Owned);
     }
 }

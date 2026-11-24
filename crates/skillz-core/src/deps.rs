@@ -131,9 +131,8 @@ pub fn list_skill_names(skills_root: &Path) -> Result<Vec<String>> {
                 skills_root.display()
             ))
         })?;
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-            && entry.path().join("SKILL.md").is_file()
-        {
+        let path = entry.path();
+        if crate::skill::resolves_to_dir(&path) && path.join("SKILL.md").is_file() {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -144,6 +143,22 @@ pub fn list_skill_names(skills_root: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skill_names_includes_symlink_to_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        let target = root.path().join("pkg").join("demo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(&target, skills.join("demo")).unwrap();
+        assert_eq!(
+            list_skill_names(&skills).unwrap(),
+            vec!["demo".to_string()]
+        );
+    }
 
     #[test]
     fn detects_grill_with_docs_siblings() {
